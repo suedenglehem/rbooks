@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Reference clone of the LlamaIndex monorepo kept locally for API reference.
+# Never part of this project; keep it out of git and out of linters.
+llama_index/
+
+# Local configuration and secrets (never commit real paths or tokens)
+config.yaml
+.env
+
+# Local scratch / data that never belongs in git (PRD §10: durable outputs on SSD)
+state/
+archive/
+artifacts/
+qdrant/
+scratch/
+models/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/

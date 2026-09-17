@@ -1,0 +1,51 @@
+# library-rag configuration (example).
+#
+# Copy to `config.yaml` (or point $LIBRARY_RAG_CONFIG at a file) and fill in the
+# real operator paths. Every path below is a placeholder. Paths are validated at
+# load time: managed roots must be disjoint from each other and from source roots,
+# and a managed root may never be nested inside a read-only source root.
+#
+# Secrets (api_token) are better supplied via the LIBRARY_RAG_API_TOKEN env var.
+
+paths:
+  # Read-only directories scanned for PDF/EPUB. May be a list of several roots.
+  source_roots:
+    - /mnt/models_sas_ssd/books
+
+  # Writable roots. archive_root + artifact_root on the big disk; state_root and
+  # qdrant_root on SSD; scratch_root on SSD (hard-capped at 50 GB by default).
+  archive_root: /mnt/models_sas_ssd/library-rag/archive
+  artifact_root: /mnt/models_sas_ssd/library-rag/artifacts
+  state_root: /mnt/models_sata_ssd/library-rag/state
+  qdrant_root: /mnt/models_sata_ssd/library-rag/qdrant
+  model_root: /mnt/models_sas_ssd/library-rag/models
+  scratch_root: /mnt/models_sata_ssd/library-rag/scratch
+
+services:
+  qdrant_host: 127.0.0.1
+  qdrant_port: 6333
+  # llama.cpp answer-model server (OpenAI-compatible). Operator-configured.
+  answer_host: 127.0.0.1
+  answer_port: 8080
+  # FastAPI app bind. Keep loopback unless the operator opts into LAN exposure
+  # (which then requires api_token).
+  app_host: 127.0.0.1
+  app_port: 8000
+  # api_token: "..."   # or set LIBRARY_RAG_API_TOKEN
+
+# Sentinel files that must exist to prove each mount is present. A missing mount
+# must never cause scans or writes to an empty fallback directory.
+mount_sentinels:
+  books: /mnt/models_sas_ssd/books/.library-rag-sentinel
+
+# GPU assignments by UUID (not by assumed CUDA index). See PRD §11.
+# Example:
+# gpu_profiles:
+#   bulk:
+#     embedding_gpus:
+#       - GPU-0bdf9519-aae5-32f0-9cd6-32d22d6466c2
+#       - GPU-aa23843f-62cb-e34a-a69d-03c36905903d
+#   interactive:
+#     answer_gpu: GPU-4fccb0bc-ead6-3306-6d15-b1d1cb6f8f9c
+#     embedding_gpus: []
+#     rerank_gpu: GPU-4fccb0bc-ead6-3306-6d15-b1d1cb6f8f9c

@@ -1,0 +1,25 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+# CPU-only CI. Integration tests (real Qdrant / GPU) are excluded by default via
+# the pytest marker; they run in the local dev environment, not here.
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: uv sync --extra dev
+      - name: Lint (ruff)
+        run: uv run ruff check .
+      - name: Type check (mypy)
+        run: uv run mypy
+      - name: Unit tests (pytest)
+        run: uv run pytest

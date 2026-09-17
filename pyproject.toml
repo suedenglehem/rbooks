@@ -1,0 +1,88 @@
+[project]
+name = "library-rag"
+version = "0.0.1"
+description = "Local-first RAG research application for a large personal book library (PDF + EPUB)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [{ name = "andrei" }]
+
+# Core runtime dependencies. Kept deliberately minimal for M0 (skeleton + doctor +
+# config + CLI). Heavier dependencies (PyMuPDF, ebooklib, qdrant-client, llama
+# adapters) are added in the milestones that use them, and uv.lock is regenerated
+# at that point so the lockfile only pins what is actually imported.
+dependencies = [
+    "pydantic>=2.7,<3",
+    "PyYAML>=6.0.1",
+    "psutil>=5.9",
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.30",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "ruff>=0.5",
+    "mypy>=1.10",
+    "types-PyYAML>=6",
+    "types-psutil>=5.9",
+]
+
+[project.scripts]
+library-rag = "library_rag.cli:main"
+
+[build-system]
+requires = ["hatchling>=1.22"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/library_rag"]
+
+# --- Tooling ---------------------------------------------------------------
+
+[tool.uv]
+# Nothing special; uv uses the standard [project]/[dependency-groups] layout.
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+    "C4",   # flake8-comprehensions
+    "RUF",  # ruff-specific
+]
+ignore = [
+    "B008",   # FastAPI/typer use callables in argument defaults
+    "E501",   # long lines handled by formatter
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["library_rag"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src", "tests"]
+mypy_path = "src"
+ignore_missing_imports = true
+warn_unreachable = true
+warn_unused_ignores = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+# Integration tests (real Qdrant, GPU) are marked and excluded from the default
+# CPU-only run. They are opt-in via -m integration or --run-integration.
+markers = [
+    "integration: tests requiring external services (Qdrant) or GPU; skipped by default",
+]

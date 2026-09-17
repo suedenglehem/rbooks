@@ -1,0 +1,97 @@
+# library-rag services (PRD §3: one coordinator process spawns bounded worker
+# subprocesses; Qdrant and the optional answer server are separate services).
+#
+# Profiles:
+#   default   -> app + qdrant        (CPU-safe; no GPUs requested)
+#   gpu       -> adds NVIDIA devices to the app container for embedding work
+#   llama     -> adds the operator's llama.cpp answer server (OpenAI-compatible)
+#
+# Usage:
+#   docker compose --profile gpu up app qdrant
+#   docker compose up app qdrant llama
+#
+# GPU selection is done by UUID inside the app config (config.gpu_profiles), NOT
+# by exposing all devices — this host's CUDA ordinals do not match nvidia-smi
+# indices, so per-worker CUDA_VISIBLE_DEVICES is computed from UUIDs at runtime.
+
+name: library-rag
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: library-rag:dev
+    # Default role is the API (serve). Coordinator/worker roles are set via the
+    # command override below or in an operator-specific compose fragment.
+    command: ["library-rag", "serve"]
+    environment:
+      LIBRARY_RAG_CONFIG: /data/config.yaml
+      # Loopback-only by default (PRD §10). Expose beyond 127.0.0.1 only after
+      # the operator sets LIBRARY_RAG_API_TOKEN.
+      LIBRARY_RAG_APP_HOST: 127.0.0.1
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      # Operator mounts storage roots here; config.yaml inside the container must
+      # point its paths at the corresponding /data subpaths.
+      - ${LIBRARY_RAG_DATA:-./data}:/data
+    depends_on:
+      - qdrant
+    # CPU-safe default: no GPUs requested. The `gpu` profile overlays devices.
+    profiles: ["default", "gpu"]
+    deploy:
+      resources:
+        limits:
+          cpus: "32"
+          memory: 32G
+
+  app-gpu:
+    # Overlay that injects NVIDIA devices into the app container. Run with the
+    # `gpu` profile so the plain `app` service stays CPU-only.
+    extends: app
+    profiles: ["gpu"]
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all   # runtime filters by UUID from config
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    restart: unless-stopped
+    environment:
+      QDRANT__SERVICE__GRPC_PORT: "6334"
+    ports:
+      - "127.0.0.1:6333:6333"
+      - "127.0.0.1:6334:6334"
+    volumes:
+      - ${LIBRARY_RAG_DATA:-./data}/qdrant:/qdrant/storage
+
+  llama:
+    # Optional operator-configured answer-model server (OpenAI-compatible).
+    # Image is operator-provided (e.g. a quantized 8B-14B GGUF served via
+    # llama.cpp). Not started by default; enable with --profile llama.
+    image: llama.cpp/llama-cpp-python:latest
+    profiles: ["llama"]
+    command:
+      - server
+      - --model
+      - /models/answer.gguf
+      - --port
+      - "8080"
+    volumes:
+      - ${LIBRARY_RAG_DATA:-./data}/models:/models:ro
+    ports:
+      - "127.0.0.1:8080:8080"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
