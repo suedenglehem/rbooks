@@ -7,11 +7,32 @@ exercised without touching a real book library.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
+from library_rag import crash
 from library_rag.config import Config, Paths, Services
+from library_rag.db import Database, db_path_for
+from library_rag.migrations import migrate
+
+
+@pytest.fixture(autouse=True)
+def _isolate_crash_hooks() -> Iterator[None]:
+    """Guarantee no crash-injection hook leaks between tests (M1 safety)."""
+    crash.clear_hooks()
+    yield
+    crash.clear_hooks()
+
+
+@pytest.fixture
+def state_db(base_config: Config) -> Iterator[Database]:
+    """A migrated state database over the temp state root."""
+    db = Database.connect(db_path_for(base_config.paths.state_root))
+    migrate(db)
+    yield db
+    db.close()
 
 
 @pytest.fixture
