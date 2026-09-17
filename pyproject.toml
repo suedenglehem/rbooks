@@ -7,10 +7,10 @@ requires-python = ">=3.11"
 license = { text = "Proprietary" }
 authors = [{ name = "andrei" }]
 
-# Core runtime dependencies. Kept deliberately minimal for M0 (skeleton + doctor +
-# config + CLI). Heavier dependencies (PyMuPDF, ebooklib, qdrant-client, llama
-# adapters) are added in the milestones that use them, and uv.lock is regenerated
-# at that point so the lockfile only pins what is actually imported.
+# Core runtime dependencies. Heavier dependencies are added in the milestones
+# that use them, and uv.lock is regenerated at that point so the lockfile only
+# pins what is actually imported. M2 adds the source parsers (PyMuPDF for PDF,
+# ebooklib for EPUB); qdrant-client and llama adapters land in M4/M5.
 dependencies = [
     "pydantic>=2.7,<3",
     "PyYAML>=6.0.1",
@@ -18,6 +18,8 @@ dependencies = [
     "fastapi>=0.111",
     "uvicorn[standard]>=0.30",
     "httpx>=0.27",
+    "PyMuPDF>=1.24,<2",
+    "ebooklib>=0.18,<1",
 ]
 
 [project.optional-dependencies]

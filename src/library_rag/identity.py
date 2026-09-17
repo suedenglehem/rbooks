@@ -27,12 +27,16 @@ from pathlib import PurePosixPath
 
 __all__ = [
     "NAMESPACE_DOC",
+    "NAMESPACE_EXTRACT",
     "NAMESPACE_REV",
     "NAMESPACE_TASK",
+    "NAMESPACE_UNIT",
     "document_id",
+    "extraction_key",
     "make_task_key",
     "normalize_path",
     "revision_id",
+    "unit_id_for",
 ]
 
 # Fixed name-registry UUIDs. Chosen once and never changed; changing them would
@@ -40,6 +44,8 @@ __all__ = [
 NAMESPACE_DOC = uuid.UUID("8f3e2a10-0000-4000-8000-0000000000d1")
 NAMESPACE_REV = uuid.UUID("8f3e2a10-0000-4000-8000-0000000000d2")
 NAMESPACE_TASK = uuid.UUID("8f3e2a10-0000-4000-8000-0000000000d3")
+NAMESPACE_EXTRACT = uuid.UUID("8f3e2a10-0000-4000-8000-0000000000d4")
+NAMESPACE_UNIT = uuid.UUID("8f3e2a10-0000-4000-8000-0000000000d5")
 
 
 def normalize_path(path: str | os.PathLike[str]) -> str:
@@ -62,6 +68,32 @@ def document_id(anchor_sha256: str) -> str:
 def revision_id(doc_id: str, sha256: str) -> str:
     """Deterministic revision UUID for a given document and content hash."""
     return str(uuid.uuid5(NAMESPACE_REV, f"{doc_id}:{sha256}"))
+
+
+def extraction_key(rev_sha256: str, parser_version: str, settings_sha: str) -> str:
+    """Deterministic extraction-run UUID.
+
+    Per PRD §6 the extraction key hashes the source bytes hash, the parser
+    version, and the (canonicalized) stage settings. Changing parser or
+    normalization settings yields a *different* key, so a re-extract never
+    clobbers the outputs of the old settings; changing the answer model or
+    embedding model does not appear here, so it never invalidates extraction.
+    """
+    return str(
+        uuid.uuid5(
+            NAMESPACE_EXTRACT, f"extract:{rev_sha256}:{parser_version}:{settings_sha}"
+        )
+    )
+
+
+def unit_id_for(run_id: str, kind: str, position: int) -> str:
+    """Deterministic source-unit UUID within an extraction run.
+
+    *kind* is ``page`` (PDF, zero-based position) or ``section`` (EPUB, zero-based
+    spine order position). The same unit rebuilt from the same run always has
+    the same ID, which is what makes per-unit re-extraction idempotent.
+    """
+    return str(uuid.uuid5(NAMESPACE_UNIT, f"unit:{run_id}:{kind}:{position}"))
 
 
 def make_task_key(

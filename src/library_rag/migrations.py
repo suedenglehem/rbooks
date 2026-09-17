@@ -5,10 +5,11 @@ exactly once and recorded in ``schema_migrations``. M1 introduces the catalog
 (documents, source_revisions, path_aliases), the durable job table (with
 lease/fencing columns), and a small ``meta`` table (used for the pause flag).
 
-Later milestones add the pipeline tables (extraction_runs, source_units,
-chunks, embedding_batches, index_generations, publications) as further
-migrations — the point of the runner is that the schema *evolves*, so M1 stays
-a minimal, independently-testable slice.
+M2 adds the pipeline slice it needs: ``scan_state`` (scan fast-check cache),
+``extraction_runs`` and ``source_units``. Later milestones add the remaining
+pipeline tables (chunks, embedding_batches, index_generations, publications)
+as further migrations — the point of the runner is that the schema *evolves*,
+so each milestone stays a minimal, independently-testable slice.
 """
 
 from __future__ import annotations
@@ -107,8 +108,69 @@ class Migration:
     statements: tuple[str, ...]
 
 
+_MIGRATION_0002: tuple[str, ...] = (
+    # Scan fast-check cache (PRD §8A): size/mtime recorded so a rescan does not
+    # re-hash unchanged files.
+    """
+    CREATE TABLE scan_state (
+        path         TEXT PRIMARY KEY,
+        size_bytes   INTEGER NOT NULL,
+        mtime        REAL NOT NULL,
+        sha256       TEXT,
+        format       TEXT,
+        rev_id       TEXT,
+        last_seen_at REAL NOT NULL
+    )
+    """,
+    # One row per (revision, parser, settings) extraction attempt.
+    """
+    CREATE TABLE extraction_runs (
+        run_id         TEXT PRIMARY KEY,
+        rev_id         TEXT NOT NULL REFERENCES source_revisions(rev_id),
+        doc_id         TEXT NOT NULL REFERENCES documents(doc_id),
+        parser_version TEXT NOT NULL,
+        settings_sha   TEXT NOT NULL,
+        unit_count     INTEGER,
+        state          TEXT NOT NULL CHECK (state IN ('running', 'succeeded', 'failed')),
+        error_category TEXT,
+        error_detail   TEXT,
+        created_at     REAL NOT NULL,
+        updated_at     REAL NOT NULL,
+        UNIQUE (rev_id, parser_version, settings_sha)
+    )
+    """,
+    "CREATE INDEX idx_runs_rev ON extraction_runs(rev_id)",
+    # Source units: one per physical PDF page or EPUB spine item (PRD §6).
+    # Text/geometry live in the compressed JSON artifact; the row carries the
+    # metadata and the artifact pointer so citations can be resolved without
+    # reading the archive.
+    """
+    CREATE TABLE source_units (
+        unit_id          TEXT PRIMARY KEY,
+        run_id           TEXT NOT NULL REFERENCES extraction_runs(run_id),
+        rev_id           TEXT NOT NULL REFERENCES source_revisions(rev_id),
+        kind             TEXT NOT NULL CHECK (kind IN ('page', 'section')),
+        position         INTEGER NOT NULL,
+        ref              TEXT,
+        char_count       INTEGER,
+        rotation         INTEGER,
+        width            REAL,
+        height           REAL,
+        quality_flags    TEXT,
+        artifact_relpath TEXT NOT NULL,
+        artifact_sha256  TEXT NOT NULL,
+        created_at       REAL NOT NULL,
+        UNIQUE (run_id, kind, position)
+    )
+    """,
+    "CREATE INDEX idx_units_rev ON source_units(rev_id)",
+    "CREATE INDEX idx_units_run ON source_units(run_id)",
+)
+
+
 MIGRATIONS: list[Migration] = [
     Migration(1, "catalog_and_jobs", _MIGRATION_0001),
+    Migration(2, "pipeline_tables", _MIGRATION_0002),
 ]
 
 

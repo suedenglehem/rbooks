@@ -15,10 +15,11 @@ def test_migrate_is_idempotent(base_config: Config) -> None:
     path = db_path_for(base_config.paths.state_root)
     db = Database.connect(path)
     try:
-        assert migrate(db) == 1
+        expected = len(MIGRATIONS)  # latest schema version (2 as of M2)
+        assert migrate(db) == expected
         # Running again must not error and must report the same version.
-        assert migrate(db) == 1
-        assert current_version(db) == 1
+        assert migrate(db) == expected
+        assert current_version(db) == expected
     finally:
         db.close()
 
@@ -28,8 +29,18 @@ def test_all_expected_tables_exist(state_db: Database) -> None:
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
     )
     tables = {r["name"] for r in rows}
-    for expected in ("schema_migrations", "documents", "source_revisions", "path_aliases", "jobs"):
-        assert expected in tables
+    expected = (
+        "schema_migrations",
+        "documents",
+        "source_revisions",
+        "path_aliases",
+        "jobs",
+        "scan_state",
+        "extraction_runs",
+        "source_units",
+    )
+    for name in expected:
+        assert name in tables
 
 
 def test_migrations_recorded_in_order(state_db: Database) -> None:

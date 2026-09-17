@@ -128,3 +128,111 @@ CLI smoke (temp dir, real commands): `init` → `status` → `pause` →
   mount-sentinel verification on startup), the extraction stage for PDF
   (PyMuPDF) and EPUB (EbookLib) producing durable extraction artifacts, and
   the worker loop that claims jobs and runs the pipeline stage.
+
+## M2 — Extraction and source reader
+
+**Status: gate passed.** PRD §12 M2 gate, verbatim: "citations open correct
+physical pages/sections on fixtures; no model required; path traversal/XSS/
+ZIP-bomb limits tested." All three groups pass in `tests/test_reader.py`,
+`tests/test_extraction_pdf.py`, `tests/test_extraction_epub.py`, and
+`tests/test_worker.py`; no model or index is required anywhere.
+
+### Delivered
+- `scan.py` — walks the configured source roots for PDF/EPUB, verifies mount
+  sentinels, hashes + archives each file, `register_source`, and enqueues an
+  `extract` job per new revision (durable task key, dedup no-op).
+- `extraction/` package:
+  - `pdf.py` — PyMuPDF, one unit per physical page; zero-based position,
+    one-based `ref`; `char_count` = non-whitespace chars; quality flags
+    `no_text` / `sparse` (below `pdf.sparse_chars`, default 40) /
+    `many_replacement`; page geometry (rotation/width/height) + text blocks in
+    the artifact.
+  - `epub.py` — spine-ordered section units with deterministic paragraph
+    anchors (`a0000`, `a0001`, … in document order; the `<h1>` title is
+    anchored first, title stored in the artifact payload, not the DB);
+    `char_count` = sum of anchored paragraph lengths; flags `bad_html`
+    (unparseable markup: nothing kept) and `no_text`.
+  - `sanitize.py` — strict-XML XHTML sanitization: strips forbidden tags
+    (script/style/link/meta/iframe/object/embed/form/base/template), `on*`
+    attributes, and external/protocol-relative URIs in href/src/action/
+    poster/data; keeps in-document `#fragment` links (anchors need them);
+    raises `ET.ParseError` for unparseable input so callers classify.
+  - `store.py` — `insert_unit` idempotent upsert + artifact commit (verified
+    checksum, committed before the DB row).
+  - `errors.py` — `ExtractionFailure` taxonomy; permanent categories
+    `{encrypted, corrupt, invalid_source, missing_source}`.
+  - `check_epub_safety` — archive-safety limits: not-a-zip, max entries, max
+    uncompressed bytes, compression ratio (zip bomb), absolute paths, `..`
+    traversal → all `invalid_source` (permanent).
+- `worker.py` — claim/run loop: one job at a time, lease heartbeated between
+  units (PDF every 10 pages, EPUB every 20 sections) via the extractor's
+  `on_progress`; `StaleLeaseError` → drop the job and touch nothing;
+  `ExtractionFailure` → `fail` with `transient=not is_permanent(...)` +
+  `fail_run`; graceful SIGTERM (`stop_event`, in-flight work is durable and
+  resumable); unknown stage → permanent failure (counted as terminal).
+- `reader.py` — FastAPI app: revision manifest (`GET /books/{rev}`), ranged
+  original delivery (`GET /books/{rev}/source`, 206/416/410), verified unit
+  artifacts, and `pdfjs_page_for` (zero-based → one-based PDF.js page); EPUB
+  units expose `(section, paragraph anchor)` — never a fabricated page.
+- `config.py` — `ExtractionSettings` with `settings_sha()` (PDF/EPUB limits
+  snapshotted into the deterministic run key).
+- `migrations.py` — `extraction_runs` (state, unit_count, parser version,
+  settings sha, failure info) and `source_units` (UNIQUE(run_id, kind,
+  position), artifact relpath + sha256).
+- `cli.py` — `scan` (discover/register/enqueue, `--json`) and `ingest`
+  (worker loop, `--once`, `--lease-ttl`) implemented; `serve` stays an M5
+  stub (the reader app is testable via `create_app` now).
+- Tests: `test_extraction_pdf.py`, `test_extraction_epub.py`, `test_worker.py`,
+  `test_scan.py`, `test_reader.py`, plus `tests/fixtures.py` (real PyMuPDF
+  PDFs / ebooklib EPUBs built exactly as production consumes them, plus a
+  raw-ZIP builder for the malicious-archive cases).
+
+### Test commands + results
+| Command               | Result                                     |
+| --------------------- | ------------------------------------------ |
+| `uv run ruff check .` | All checks passed!                         |
+| `uv run mypy`         | Success: no issues found in 40 source files |
+| `uv run pytest`       | 97 passed in 6.56s                         |
+
+Gate cases (all passing):
+- citations open correct physical pages → `test_reader.py`
+  (`test_pdfjs_page_mapping`, `test_unit_page_carrys_pdfjs_page`, ranged
+  original delivery 206/416, missing archive 410) + `test_extraction_pdf.py`
+  (one unit per page, refs `"1","2","3"`, geometry in artifact).
+- citations open correct sections → `test_reader.py`
+  (`test_epub_section_unit_and_anchor`: anchor `a0001` → "Hello world.",
+  unknown anchor 404, anchor endpoint on a page unit 409) +
+  `test_extraction_epub.py` (deterministic anchors, title in artifact).
+- path traversal / XSS / ZIP-bomb limits → `test_extraction_epub.py`
+  (`test_epub_safety_rejects_zip_bomb`, `..._path_traversal` for `../` and
+  absolute, `..._too_many_entries`, `..._too_large`, `..._not_a_zip`,
+  `test_sanitize_strips_active_content` for script/onclick/javascript:/
+  external-URI stripping) + `test_scan.py` (unscannable roots, sentinel
+  behavior).
+- no model required → the whole suite runs on PyMuPDF/ebooklib/SQLite only;
+  no embedding/index dependency anywhere in the M2 path.
+
+### Notes / bugs found
+- **Production bug fixed in gate run:** `extraction/epub.py` fed the sanitizer
+  `item.get_content()`, but ebooklib's `EpubHtml.get_content()` re-parses the
+  chapter with lxml's lenient HTML parser and re-serializes it from a
+  template — repairing malformed markup before the security layer could see
+  it, making `bad_html` unreachable. The fix passes the raw archive bytes
+  (`item.content` after `read_epub` is the verbatim zip entry) to `sanitize`.
+- ebooklib prefixes archive entries with the OPF directory (`EPUB/ch1.xhtml`,
+  not `ch1.xhtml`), and normalizes chapter content on *both* read and write —
+  the malformed-chapter fixture must patch raw ZIP bytes after `write_epub`.
+  Note: `write_epub` itself crashes (`Document is empty`) on near-empty
+  chapter bodies, so the fixture gives every chapter a structurally valid
+  full-HTML body before patching.
+- MuPDF clips glyphs beyond the page edge out of `get_text`, so the exact
+  `char_count` fixture is a single 48-char 11pt A4 line (no wrapping, no
+  clipping).
+- Worker: jobs are claimed unfiltered by stage, so unknown-stage jobs are
+  failed as permanent `unknown_stage` and count toward `run_worker`'s
+  terminal-state return.
+
+### Next unfinished task
+- Begin M3: selective OCR and chunking (OCR for scanned/image-only PDF pages
+  flagged by extraction quality, chunking over the extracted units with the
+  page/section anchors preserved for citations).

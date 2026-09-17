@@ -1,11 +1,13 @@
 """Command-line interface.
 
-``doctor`` (M0) and the recovery-foundation commands (M1) are implemented:
-``init``, ``pause``, ``resume``, ``status``, ``retry``, ``reconcile``. The
-remaining commands are registered with their help text and milestone so that
-``library-rag --help`` documents the whole intended surface (PRD §4). Each stub
-prints an explicit "not yet implemented (milestone Mx)" message and returns a
-non-zero exit code rather than pretending to do the work.
+``doctor`` (M0), the recovery-foundation commands (M1: ``init``, ``pause``,
+``resume``, ``status``, ``retry``, ``reconcile``), and the M2 pipeline
+commands ``scan`` (discover + register + enqueue) and ``ingest`` (worker
+loop over the extraction queue) are implemented. The remaining commands are
+registered with their help text and milestone so that ``library-rag --help``
+documents the whole intended surface (PRD §4). Each stub prints an explicit
+"not yet implemented (milestone Mx)" message and returns a non-zero exit code
+rather than pretending to do the work.
 
 Destructive commands require an explicit ``--yes`` non-interactive flag; that
 convention is implemented as each command lands (M1+).
@@ -15,8 +17,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import signal
 import sys
 from collections.abc import Callable
+from dataclasses import asdict
 
 from . import __version__
 from .catalog import source_file_count
@@ -28,6 +32,8 @@ from .jobs import Jobs
 from .log import setup_logging
 from .migrations import current_version, migrate
 from .reconcile import Mount, reconcile_catalog
+from .scan import scan_roots
+from .worker import DEFAULT_LEASE_TTL, run_worker
 
 # Exit codes.
 EXIT_OK = 0
@@ -195,6 +201,63 @@ def _reconcile(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+# --- M2 pipeline commands ----------------------------------------------------
+def _scan(args: argparse.Namespace) -> int:
+    setup_logging(args.log_level, args.log_format)
+    cfg = _require_config(args)
+    db = _open_state(cfg)
+    try:
+        reports = scan_roots(db, cfg, Jobs(db))
+    finally:
+        db.close()
+    if args.json:
+        print(json.dumps([asdict(r) for r in reports], indent=2, sort_keys=True))
+    else:
+        for r in reports:
+            if r.mount_unavailable:
+                print(f"mount unavailable: {r.root} (skipped, nothing deleted)")
+                continue
+            print(
+                f"{r.root}: discovered={r.discovered} unchanged={r.unchanged} "
+                f"new_documents={r.new_documents} new_revisions={r.new_revisions} "
+                f"aliases={r.aliases} jobs={r.jobs_enqueued}"
+            )
+            if r.invalid:
+                print(f"  invalid (content mismatch): {', '.join(r.invalid)}")
+            if r.missing:
+                print(f"  missing (reported, not deleted): {', '.join(r.missing)}")
+            if r.changed_during_scan:
+                print(f"  changed during scan (retried next scan): {', '.join(r.changed_during_scan)}")
+    return EXIT_OK
+
+
+def _ingest(args: argparse.Namespace) -> int:
+    setup_logging(args.log_level, args.log_format)
+    cfg = _require_config(args)
+    db = _open_state(cfg)
+    stop = False
+
+    def _graceful_stop(_signum: int, _frame: object) -> None:
+        nonlocal stop
+        stop = True  # finish the in-flight unit, then stop claiming (PRD §7)
+
+    try:
+        if not args.once:
+            signal.signal(signal.SIGTERM, _graceful_stop)
+            signal.signal(signal.SIGINT, _graceful_stop)
+        try:
+            completed = run_worker(
+                db, cfg, once=args.once, lease_ttl=args.lease_ttl, stop_event=lambda: stop
+            )
+        finally:
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+    finally:
+        db.close()
+    print(f"ingest: {completed} job(s) completed")
+    return EXIT_OK
+
+
 # --- parser ----------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -246,8 +309,29 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile.add_argument("--json", action="store_true", help="emit the report as JSON")
     reconcile.set_defaults(_func=_reconcile)
 
-    _register_stub(sub, "scan", "discover PDFs/EPUBs and register source revisions (M2)")
-    _register_stub(sub, "ingest", "run the extraction->OCR->chunk->embed->publish pipeline (M2-M4)")
+    scan = sub.add_parser(
+        "scan", help="discover PDFs/EPUBs, register source revisions, enqueue extraction (M2)"
+    )
+    scan.add_argument("--config", help="path to config YAML")
+    scan.add_argument("--json", action="store_true", help="emit the scan reports as JSON")
+    scan.set_defaults(_func=_scan)
+
+    ingest = sub.add_parser(
+        "ingest", help="run the worker loop over the pipeline queue (M2-M4)"
+    )
+    ingest.add_argument("--config", help="path to config YAML")
+    ingest.add_argument(
+        "--once",
+        action="store_true",
+        help="drain the queue and exit (default: run until SIGTERM/SIGINT)",
+    )
+    ingest.add_argument(
+        "--lease-ttl",
+        type=float,
+        default=DEFAULT_LEASE_TTL,
+        help=f"lease TTL in seconds (default {DEFAULT_LEASE_TTL:.0f})",
+    )
+    ingest.set_defaults(_func=_ingest)
     _register_stub(sub, "search", "lexical + semantic search over the library (M4)")
     _register_stub(sub, "serve", "run the FastAPI research app + reader (M5)")
     _register_stub(sub, "evaluate", "run retrieval/answer evaluation on a labeled set (M6)")

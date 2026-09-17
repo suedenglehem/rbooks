@@ -10,6 +10,7 @@ section) and bracket the commit with the database-commit crash hooks.
 from __future__ import annotations
 
 import sqlite3
+import threading
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -31,15 +32,22 @@ class Database:
     The connection runs in autocommit mode (``isolation_level=None``) so reads
     do not hold locks; write sections opt in to a single short
     ``BEGIN IMMEDIATE`` transaction via :meth:`transaction`.
+
+    The connection is shared across threads (``check_same_thread=False``):
+    the FastAPI reader runs sync endpoints in a thread pool. A re-entrant lock
+    serializes statements and whole transactions, so a cross-thread interleave
+    can never split one connection's statement sequence (transaction bodies
+    call :meth:`execute`, hence re-entrant, not plain).
     """
 
-    def __init__(self, conn: sqlite3.Connection) -> None:
+    def __init__(self, conn: sqlite3.Connection, lock: threading.RLock | None = None) -> None:
         self._conn = conn
+        self._lock = lock if lock is not None else threading.RLock()
 
     @classmethod
     def connect(cls, path: Path) -> Database:
         path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(path), isolation_level=None)
+        conn = sqlite3.connect(str(path), isolation_level=None, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         # PRAGMA settings are connection-scoped; set them once here.
         conn.execute("PRAGMA journal_mode=WAL;")
@@ -53,13 +61,16 @@ class Database:
         return self._conn
 
     def execute(self, sql: str, params: Sequence[Any] = ()) -> sqlite3.Cursor:
-        return self._conn.execute(sql, tuple(params))
+        with self._lock:
+            return self._conn.execute(sql, tuple(params))
 
     def query(self, sql: str, params: Sequence[Any] = ()) -> list[sqlite3.Row]:
-        return self._conn.execute(sql, tuple(params)).fetchall()
+        with self._lock:
+            return self._conn.execute(sql, tuple(params)).fetchall()
 
     def query_one(self, sql: str, params: Sequence[Any] = ()) -> sqlite3.Row | None:
-        return cast("sqlite3.Row | None", self._conn.execute(sql, tuple(params)).fetchone())
+        with self._lock:
+            return cast("sqlite3.Row | None", self._conn.execute(sql, tuple(params)).fetchone())
 
     @contextmanager
     def transaction(self) -> Iterator[Database]:
@@ -71,18 +82,20 @@ class Database:
         uncommitted transaction is not durable); if an ``AFTER_DB_COMMIT`` hook
         raises, the commit has already landed and the data stays.
         """
-        self._conn.execute("BEGIN IMMEDIATE;")
-        committed = False
-        try:
-            yield self
-            fire(CrashPhase.BEFORE_DB_COMMIT)
-            self._conn.commit()
-            committed = True
-        except BaseException:
-            if not committed:
-                self._conn.execute("ROLLBACK;")
-            raise
-        fire(CrashPhase.AFTER_DB_COMMIT)
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE;")
+            committed = False
+            try:
+                yield self
+                fire(CrashPhase.BEFORE_DB_COMMIT)
+                self._conn.commit()
+                committed = True
+            except BaseException:
+                if not committed:
+                    self._conn.execute("ROLLBACK;")
+                raise
+            fire(CrashPhase.AFTER_DB_COMMIT)
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()

@@ -13,6 +13,8 @@ the overlap rules with temp directories.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -159,11 +161,64 @@ class Services(BaseModel):
         return v
 
 
+class ScanSettings(BaseModel):
+    """Streaming-discovery limits (PRD §8A): ignored names and symlink policy."""
+
+    ignore_dirs: set[str] = Field(
+        default_factory=lambda: {
+            "__pycache__", ".git", ".hg", ".svn", ".cache", ".idea", "node_modules",
+        }
+    )
+    ignore_files: set[str] = Field(default_factory=lambda: {".DS_Store", "Thumbs.db", "desktop.ini"})
+    # Symlinked files/directories are never followed: a link out of the source
+    # tree would escape the read-only boundary (PRD §8A "constrain symlink
+    # traversal").
+    follow_symlinks: bool = False
+
+
+class PdfLimits(BaseModel):
+    """PDF extraction quality-assessment thresholds (PRD §8B).
+
+    M2 records these decisions per page; M3 routes on them (OCR selection).
+    """
+
+    # Fewer non-whitespace characters than this => "sparse" (cover/illustration).
+    sparse_chars: int = 40
+    # Share of replacement characters (U+FFFD) above this => "malformed" layer.
+    max_replacement_ratio: float = 0.05
+
+
+class EpubLimits(BaseModel):
+    """EPUB archive safety limits (PRD §8D): ZIP-bomb / traversal defenses."""
+
+    max_entries: int = 10_000
+    max_uncompressed_bytes: int = 2 * (1024 ** 3)
+    # Uncompressed/Compressed ratio above this is treated as a compression bomb.
+    max_compression_ratio: float = 100.0
+
+
+class ExtractionSettings(BaseModel):
+    """All stage settings that define an extraction run (PRD §6).
+
+    ``settings_sha`` is the canonical hash of this model: any change produces a
+    new extraction key and therefore fresh, non-clobbering outputs.
+    """
+
+    pdf: PdfLimits = Field(default_factory=PdfLimits)
+    epub: EpubLimits = Field(default_factory=EpubLimits)
+
+    def settings_sha(self) -> str:
+        canonical = json.dumps(self.model_dump(mode="json"), sort_keys=True)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 class Config(BaseModel):
     """Top-level application configuration."""
 
     paths: Paths
     services: Services = Field(default_factory=Services)
+    extraction: ExtractionSettings = Field(default_factory=ExtractionSettings)
+    scan: ScanSettings = Field(default_factory=ScanSettings)
 
     # Optional sentinel files that must exist to prove each mount is present.
     # Mapping of a human label to a file path that must exist. An empty value
