@@ -1,8 +1,14 @@
-"""Test source builders: real PDFs and EPUBs for the M2 pipeline.
+"""Test source builders: real PDFs and EPUBs for the pipeline.
 
 These produce *structurally real* files (PyMuPDF PDFs, ebooklib EPUBs) so the
 pipeline is exercised exactly as in production, plus a raw-ZIP builder for the
 malicious-archive (zip-bomb / traversal) cases that ebooklib would never emit.
+
+For M3 the host has no Tesseract (and installing it needs operator approval,
+PRD §1), so ``make_fake_tesseract`` writes a deterministic CLI shim that speaks
+the same interface (``--list-langs``, ``--version``,
+``<image> stdout -l <langs> --psm <n> tsv``) and emits a known word grid per
+page — good enough to test routing, coordinate mapping, retries, and resume.
 """
 
 from __future__ import annotations
@@ -26,14 +32,40 @@ from library_rag.worker import build_ctx
 __all__ = [
     "ctx_for_rev",
     "ingest_and_register",
+    "make_cropped_pdf",
     "make_encrypted_pdf",
     "make_epub",
     "make_epub_zip",
+    "make_fake_tesseract",
+    "make_mixed_pdf",
     "make_pdf",
+    "make_rotated_pdf",
 ]
 
 # A4, the same geometry the smoke test used; text baseline kept clear of edges.
 _PAGE_W, _PAGE_H = 595, 842
+_SAMPLE_SENTENCE = "The quick brown fox jumps over the lazy dog."
+
+
+def _fill_page(page: Any, kind: str) -> None:
+    """Draw one page in the requested shape (see :func:`make_mixed_pdf`)."""
+    if kind == "text":
+        page.insert_text((72, 100), _SAMPLE_SENTENCE, fontsize=11)
+    elif kind == "sparse":
+        page.insert_text((72, 100), "End", fontsize=11)
+    elif kind == "sparse_image":
+        page.insert_text((72, 100), "End", fontsize=11)
+        _insert_gray_image(page)
+    elif kind == "scanned":
+        _insert_gray_image(page)
+
+
+def _insert_gray_image(page: Any) -> None:
+    # A solid gray image over the whole page: get_image_info reports it with
+    # bbox == page.rect, so image_area_ratio is 1.0 (a "scanned" page).
+    pix = pymupdf.Pixmap(pymupdf.csGRAY, pymupdf.IRect(0, 0, 200, 200), 0)  # type: ignore[no-untyped-call]
+    pix.clear_with(128)  # type: ignore[no-untyped-call]
+    page.insert_image(page.rect, pixmap=pix)
 
 
 def ingest_and_register(db: Database, cfg: Config, src: Path, fmt: Format) -> str:
@@ -138,4 +170,104 @@ def make_epub_zip(
         for name, data in entries:
             compress = zipfile.ZIP_DEFLATED if name in deflate else zipfile.ZIP_STORED
             zf.writestr(name, data, compress_type=compress)
+    return path
+
+
+_MIXED_KINDS = ("text", "scanned", "blank", "sparse", "sparse_image")
+
+
+def make_mixed_pdf(path: Path, kinds: list[str]) -> Path:
+    """One A4 page per *kind*: text / scanned (image only) / blank / sparse /
+    sparse_image — the page shapes that exercise every OCR route (PRD §8C)."""
+    unknown = sorted(set(kinds) - set(_MIXED_KINDS))
+    if unknown:
+        raise ValueError(f"unknown page kinds: {unknown}")
+    doc = pymupdf.open()  # type: ignore[no-untyped-call]
+    try:
+        for kind in kinds:
+            page = doc.new_page(width=_PAGE_W, height=_PAGE_H)
+            _fill_page(page, kind)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        doc.save(str(path))  # type: ignore[no-untyped-call]
+    finally:
+        doc.close()  # type: ignore[no-untyped-call]
+    return path
+
+
+def make_rotated_pdf(path: Path, kind: str = "scanned", rotation: int = 90) -> Path:
+    """A single page rotated by *rotation* degrees (the OCR highlight-mapping
+    gate case: raster boxes must map back to the rotation-aware page rect)."""
+    doc = pymupdf.open()  # type: ignore[no-untyped-call]
+    try:
+        page = doc.new_page(width=_PAGE_W, height=_PAGE_H)
+        _fill_page(page, kind)
+        page.set_rotation(rotation)  # type: ignore[no-untyped-call]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        doc.save(str(path))  # type: ignore[no-untyped-call]
+    finally:
+        doc.close()  # type: ignore[no-untyped-call]
+    return path
+
+
+def make_cropped_pdf(path: Path, kind: str = "text") -> Path:
+    """A single page whose cropbox is smaller than the media box (the render
+    size must follow the cropbox, not the media box)."""
+    doc = pymupdf.open()  # type: ignore[no-untyped-call]
+    try:
+        page = doc.new_page(width=_PAGE_W, height=_PAGE_H)
+        _fill_page(page, kind)
+        page.set_cropbox(pymupdf.Rect(50, 50, 500, 500))  # type: ignore[no-untyped-call]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        doc.save(str(path))  # type: ignore[no-untyped-call]
+    finally:
+        doc.close()  # type: ignore[no-untyped-call]
+    return path
+
+
+# The shim is a real executable Python script (tesseract is a CLI, so the fake
+# must be one too). Its behavior is steered by environment variables the tests
+# set per case: FAKE_TESSERACT_LANGS (installed packs), FAKE_TESSERACT_FAIL
+# (non-zero exit), FAKE_TESSERACT_SLEEP (seconds), FAKE_TESSERACT_LOG (append a
+# JSON line per invocation — the kill/resume and no-op tests count calls on it).
+_FAKE_TESSERACT = """\
+#!/usr/bin/env python3
+import json, os, re, sys, time
+
+argv = sys.argv[1:]
+if "--list-langs" in argv:
+    sys.stdout.write(os.environ.get("FAKE_TESSERACT_LANGS", "eng\\nosd") + "\\n")
+    raise SystemExit(0)
+if "--version" in argv:
+    sys.stderr.write("tesseract 5.3.0-fake\\n")
+    raise SystemExit(0)
+if os.environ.get("FAKE_TESSERACT_FAIL") == "1":
+    sys.stderr.write("fake tesseract: forced failure\\n")
+    raise SystemExit(1)
+sleep_s = float(os.environ.get("FAKE_TESSERACT_SLEEP", "0") or 0)
+if sleep_s > 0:
+    time.sleep(sleep_s)
+image = next((a for a in argv if a.endswith(".png")), "")
+m = re.search(r"page-(\\d+)\\.png$", os.path.basename(image))
+page = int(m.group(1)) if m else 0
+log = os.environ.get("FAKE_TESSERACT_LOG")
+if log:
+    with open(log, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"image": image, "page": page, "args": argv}) + "\\n")
+rows = ["level\\tpage_num\\tblock_num\\tpar_num\\tline_num\\tword_num"
+        "\\tleft\\ttop\\twidth\\theight\\tconf\\ttext"]
+rows.append("1\\t1\\t1\\t0\\t0\\t0\\t0\\t0\\t100\\t100\\t0\\t")
+# Three words on distinct lines; the raster boxes are what the mapping tests
+# map back to page coordinates.
+for j in range(3):
+    rows.append("5\\t1\\t1\\t1\\t%d\\t%d\\t%d\\t100\\t200\\t50\\t%.1f\\tw%d-%d"
+                % (j + 1, j + 1, 50 + j * 220, 85.0 + j, page, j))
+sys.stdout.write("\\n".join(rows) + "\\n")
+"""
+
+
+def make_fake_tesseract(path: Path) -> Path:
+    """Write the fake Tesseract executable to *path* (mode 0o755)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_FAKE_TESSERACT, encoding="utf-8")
+    path.chmod(0o755)
     return path

@@ -137,6 +137,13 @@ def _status(args: argparse.Namespace) -> int:
             "documents": _count(db, "SELECT COUNT(*) AS n FROM documents"),
             "revisions": _count(db, "SELECT COUNT(*) AS n FROM source_revisions"),
             "source_files": source_file_count(db),
+            "ocr_state": {
+                r["ocr_state"]: int(r["n"])
+                for r in db.query(
+                    "SELECT ocr_state, COUNT(*) AS n FROM source_units GROUP BY ocr_state"
+                )
+            },
+            "chunks": _count(db, "SELECT COUNT(*) AS n FROM chunks"),
         }
     finally:
         db.close()
@@ -151,6 +158,11 @@ def _status(args: argparse.Namespace) -> int:
             print(f"jobs: {counts}")
         else:
             print("jobs: (none)")
+        ocr_state = data["ocr_state"]
+        if isinstance(ocr_state, dict):
+            ocr_counts = " ".join(f"{k}={v}" for k, v in sorted(ocr_state.items()))
+            print(f"ocr: {ocr_counts}")
+        print(f"chunks={data['chunks']}")
     return EXIT_OK
 
 

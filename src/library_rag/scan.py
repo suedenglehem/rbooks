@@ -33,9 +33,19 @@ from .db import Database
 from .identity import make_task_key, normalize_path
 from .jobs import Jobs
 
-__all__ = ["STAGE_EXTRACT", "ScanReport", "detect_format", "scan_root", "scan_roots"]
+__all__ = [
+    "STAGE_CHUNK",
+    "STAGE_EXTRACT",
+    "STAGE_OCR",
+    "ScanReport",
+    "detect_format",
+    "scan_root",
+    "scan_roots",
+]
 
 STAGE_EXTRACT = "extract"
+STAGE_OCR = "ocr"
+STAGE_CHUNK = "chunk"
 
 _CANDIDATE_SUFFIXES = {".pdf", ".epub"}
 

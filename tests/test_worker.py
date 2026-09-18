@@ -1,5 +1,7 @@
-"""Worker loop (PRD §7): claim durable jobs, run the extract stage, classify
-failures (permanent vs. transient), and heartbeat the lease between units.
+"""Worker loop (PRD §7): claim durable jobs, run the extract/ocr/chunk stages,
+classify failures (permanent vs. transient), and heartbeat the lease between
+units. As of M3, a successful extract enqueues a chunk job, so a full drain of
+one document completes two jobs.
 """
 
 from __future__ import annotations
@@ -32,22 +34,36 @@ def _last_job(db: Database) -> dict[str, Any]:
     return dict(row)
 
 
+def _job(db: Database, stage: str) -> dict[str, Any]:
+    row = db.query_one("SELECT * FROM jobs WHERE stage = ?", (stage,))
+    assert row is not None
+    return dict(row)
+
+
 def test_worker_end_to_end(state_db: Database, base_config: Config, src: Path) -> None:
     make_pdf(src / "A.pdf", ["a page of text " * 5])
     jobs = Jobs(state_db)
     report = scan_roots(state_db, base_config, jobs)[0]
     assert report.new_documents == 1
 
-    assert run_worker(state_db, base_config, once=True, poll_delay=0) == 1
-    assert jobs.counts() == {"succeeded": 1}
+    assert run_worker(state_db, base_config, once=True, poll_delay=0) == 2
+    assert jobs.counts() == {"succeeded": 2}
 
-    run = state_db.query_one("SELECT state, unit_count FROM extraction_runs")
+    run = state_db.query_one(
+        "SELECT state, unit_count, chunk_fingerprint FROM extraction_runs"
+    )
     assert run is not None
     assert run["state"] == "succeeded"
     assert int(run["unit_count"]) == 1
-    manifest = json.loads(_last_job(state_db)["output_manifest"])
-    assert set(manifest) == {"run_id", "units"}
-    assert manifest["units"] == 1
+    extract_manifest = json.loads(_job(state_db, "extract")["output_manifest"])
+    assert set(extract_manifest) == {"run_id", "units"}
+    assert extract_manifest["units"] == 1
+    chunk_manifest = json.loads(_job(state_db, "chunk")["output_manifest"])
+    assert set(chunk_manifest) == {"run_id", "chunks", "fingerprint"}
+    assert chunk_manifest["chunks"] == 1
+    assert run["chunk_fingerprint"] == chunk_manifest["fingerprint"]
+    n_chunks = state_db.query_one("SELECT COUNT(*) AS n FROM chunks")
+    assert n_chunks is not None and int(n_chunks["n"]) == 1
 
 
 def test_worker_corrupt_permanent_failed(state_db: Database, base_config: Config, src: Path) -> None:
@@ -77,10 +93,11 @@ def test_worker_heartbeats_between_units(
         beats.append(job.job_id)
 
     monkeypatch.setattr(Jobs, "heartbeat", fake_heartbeat)
-    assert run_worker(state_db, base_config, once=True, poll_delay=0) == 1
+    # The chunk stage is pure in-memory work and never heartbeats.
+    assert run_worker(state_db, base_config, once=True, poll_delay=0) == 2
 
     assert len(beats) == 2
-    assert jobs.counts() == {"succeeded": 1}
+    assert jobs.counts() == {"succeeded": 2}
 
 
 def test_worker_unknown_stage_permanent(state_db: Database, base_config: Config) -> None:

@@ -35,6 +35,8 @@ __all__ = [
     "finish_run",
     "insert_unit",
     "load_unit_artifact",
+    "refresh_unit_artifact",
+    "set_unit_ocr",
     "start_run",
     "unit_artifact_path",
 ]
@@ -54,6 +56,11 @@ class ExtractorCtx:
     source_path: Path  # the archived original to read
     # Called between units so the worker can heartbeat the lease.
     on_progress: Callable[[], None] | None = None
+    # M3 pipeline hooks (wired by the worker): enqueue the OCR job for a page
+    # unit, and enqueue the chunk job once extraction of the run is complete.
+    # Both are no-ops when None (tests that drive extractors directly).
+    enqueue_ocr: Callable[[int], None] | None = None
+    on_extract_done: Callable[[], None] | None = None
 
 
 def unit_artifact_path(artifact_root: Path, rev_id: str, unit_id: str) -> Path:
@@ -182,6 +189,8 @@ def insert_unit(
     quality_flags: list[str] | None,
     artifact_relpath: str,
     artifact_sha256: str,
+    route: str | None = None,
+    ocr_state: str = "none",
     now: float | None = None,
 ) -> None:
     """Record one unit (idempotent: re-extract of the same unit updates in place)."""
@@ -192,8 +201,9 @@ def insert_unit(
             """
             INSERT INTO source_units
                 (unit_id, run_id, rev_id, kind, position, ref, char_count, rotation,
-                 width, height, quality_flags, artifact_relpath, artifact_sha256, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 width, height, quality_flags, artifact_relpath, artifact_sha256,
+                 route, ocr_state, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(unit_id) DO UPDATE SET
                 ref = excluded.ref,
                 char_count = excluded.char_count,
@@ -202,8 +212,72 @@ def insert_unit(
                 height = excluded.height,
                 quality_flags = excluded.quality_flags,
                 artifact_relpath = excluded.artifact_relpath,
-                artifact_sha256 = excluded.artifact_sha256
+                artifact_sha256 = excluded.artifact_sha256,
+                route = excluded.route,
+                ocr_state = excluded.ocr_state
             """,
             (unit_id, ctx.run_id, ctx.rev["rev_id"], kind, position, ref, char_count,
-             rotation, width, height, flags, artifact_relpath, artifact_sha256, ts),
+             rotation, width, height, flags, artifact_relpath, artifact_sha256,
+             route, ocr_state, ts),
+        )
+
+
+def set_unit_ocr(
+    ctx: ExtractorCtx,
+    *,
+    unit_id: str,
+    artifact_relpath: str,
+    artifact_sha256: str,
+    char_count: int,
+    state: str = "done",
+) -> None:
+    """Record the OCR outcome of a page unit after the new artifact is committed.
+
+    *state* is ``done`` (OCR text now in the artifact) or ``failed`` (the OCR
+    attempt failed permanently; the unit keeps its pre-OCR artifact). The
+    artifact commit happens in the caller, BEFORE this row update — the same
+    artifact-before-row ordering the M1/M2 commit protocol requires.
+    """
+    with ctx.db.transaction():
+        ctx.db.execute(
+            """
+            UPDATE source_units SET artifact_relpath = ?, artifact_sha256 = ?,
+                   char_count = ?, ocr_state = ?
+            WHERE unit_id = ?
+            """,
+            (artifact_relpath, artifact_sha256, char_count, state, unit_id),
+        )
+
+
+def refresh_unit_artifact(
+    ctx: ExtractorCtx,
+    *,
+    unit_id: str,
+    artifact_relpath: str,
+    artifact_sha256: str,
+    char_count: int | None = None,
+) -> None:
+    """Point a unit row at a rewritten artifact (M3 normalization rewrite).
+
+    The chunk pass stores searchable text + span maps inside the unit artifact,
+    which changes the artifact bytes and therefore its checksum; this updates
+    the row so the stored hash matches the committed file. *char_count* is
+    refreshed when the effective (OCR, or native) text length changed.
+    """
+    if char_count is None:
+        ctx.db.execute(
+            """
+            UPDATE source_units SET artifact_relpath = ?, artifact_sha256 = ?
+            WHERE unit_id = ?
+            """,
+            (artifact_relpath, artifact_sha256, unit_id),
+        )
+    else:
+        ctx.db.execute(
+            """
+            UPDATE source_units SET artifact_relpath = ?, artifact_sha256 = ?,
+                   char_count = ?
+            WHERE unit_id = ?
+            """,
+            (artifact_relpath, artifact_sha256, char_count, unit_id),
         )

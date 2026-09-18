@@ -161,6 +161,8 @@ def extract_epub(ctx: ExtractorCtx) -> int:
         raise ExtractionFailure("invalid_source", "EPUB has no spine items")
 
     if not start_run(ctx, parser_version(), ctx.settings.settings_sha()):
+        if ctx.on_extract_done is not None:
+            ctx.on_extract_done()
         row = ctx.db.query_one(
             "SELECT unit_count FROM extraction_runs WHERE run_id = ?", (ctx.run_id,)
         )
@@ -195,4 +197,6 @@ def extract_epub(ctx: ExtractorCtx) -> int:
         if ctx.on_progress is not None and position % _SECTIONS_PER_HEARTBEAT == _SECTIONS_PER_HEARTBEAT - 1:
             ctx.on_progress()
     finish_run(ctx, done)
+    if ctx.on_extract_done is not None:
+        ctx.on_extract_done()
     return done

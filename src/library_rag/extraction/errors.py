@@ -22,7 +22,16 @@ class ExtractionFailure(Exception):
 
 
 # Error categories that cannot be fixed by retrying the same input.
-PERMANENT_CATEGORIES = frozenset({"encrypted", "corrupt", "invalid_source", "missing_source"})
+# OCR: a missing tesseract binary or a missing language pack will not appear
+# from re-running the same job; a subprocess error or timeout might clear
+# (transient: "ocr_error", "ocr_timeout").
+# Pipeline (M3): dangling job inputs (a run or unit that does not exist) and a
+# structurally bad range spec are data inconsistencies, not hiccups.
+PERMANENT_CATEGORIES = frozenset(
+    {"encrypted", "corrupt", "invalid_source", "missing_source",
+     "ocr_unavailable", "ocr_language_missing",
+     "missing_run", "missing_unit", "run_failed", "invalid_range"}
+)
 
 
 def is_permanent(category: str) -> bool:

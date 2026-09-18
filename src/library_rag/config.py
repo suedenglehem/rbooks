@@ -197,6 +197,109 @@ class EpubLimits(BaseModel):
     max_compression_ratio: float = 100.0
 
 
+class OcrSettings(BaseModel):
+    """Selective-OCR engine settings (PRD §8C).
+
+    Only pages routed to OCR by :mod:`library_rag.extraction.routing` are
+    rasterized; the raster is a bounded scratch file, never archived.
+    """
+
+    # Tesseract binary; ``tesseract`` is resolved on PATH.
+    bin: str = "tesseract"
+    # Explicit language pack(s) passed as ``-l``; never rely on the host default.
+    languages: list[str] = Field(default_factory=lambda: ["eng"])
+    # Page segmentation mode (3 = fully automatic, no OSD on plain pages).
+    psm: int = 3
+    # Rasterization DPI; the pixmap is capped by max_side_px regardless.
+    dpi: int = 300
+    # Hard cap on the longest pixmap side in pixels (memory bound, PRD §8C).
+    max_side_px: int = 16_000
+    # Subprocess timeout for one page.
+    timeout_seconds: float = 600.0
+    # A no-text/sparse page is OCR'd only when >= this share of the page area
+    # is covered by embedded images (below it the page is a legit blank or
+    # illustration and OCR would only add noise).
+    image_area_threshold: float = 0.5
+
+    def settings_sha(self) -> str:
+        """Canonical hash of the engine settings, recorded in each OCR artifact
+        so a replay can detect an already-OCR'd unit without re-running the
+        (expensive) engine. Part of the parent :class:`ExtractionSettings` hash
+        too, via the usual field serialization."""
+        canonical = json.dumps(self.model_dump(mode="json"), sort_keys=True)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+class NormalizationSettings(BaseModel):
+    """Searchable-text normalization rules (PRD §8E).
+
+    Normalization is recorded per unit *in the unit artifact* together with
+    character-level source-span mappings, so every searchable character is
+    quotable back to the source text (quotations always come from the source).
+    """
+
+    collapse_whitespace: bool = True
+    # Join words split by a line-end hyphen ("de-\nline") into "de line"→"deline".
+    dehyphenate: bool = True
+    # Remove a repeated first/last line (running header/footer). Only applied
+    # when the line recurs across units of the same book (pages, not sections).
+    remove_repeated_headers: bool = True
+    # A repeated line counts as header/footer only when it occurs on at least
+    # this many units...
+    header_min_pages: int = 2
+    # ...and its stripped length is within this range (filters page-number-only
+    # noise at the low end, full paragraphs at the high end).
+    header_min_chars: int = 3
+    header_max_chars: int = 80
+
+    def settings_sha(self) -> str:
+        """Canonical hash of the normalization rules; feeds the chunk pipeline
+        fingerprint so a rule change re-chunks (and re-normalizes) without
+        re-extracting or re-OCR-ing."""
+        canonical = json.dumps(self.model_dump(mode="json"), sort_keys=True)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+class ChunkingSettings(BaseModel):
+    """Chunking settings (PRD §8E).
+
+    Kept out of :class:`ExtractionSettings` on purpose: chunking re-runs are
+    cheap (no re-parse, no re-OCR) and must not invalidate the whole
+    extraction run. ``settings_sha`` feeds the pipeline fingerprint so a
+    change here re-chunks without re-extracting.
+    """
+
+    target_tokens: int = 600
+    overlap_tokens: int = 100
+    # Absolute hard cap; never exceeded, even for a single enormous token.
+    max_tokens: int = 2_048
+    # "words" is the deterministic development tokenizer; a BPE name (e.g.
+    # "bge-m3") is resolved lazily at chunk time (M4) and a missing model is a
+    # permanent ``tokenizer_missing`` failure, never silent word fallback.
+    tokenizer: str = "words"
+    tokenizer_path: str | None = None
+    # Prefix EPUB section titles onto their first chunk (counted against the
+    # token budget, excluded from the chunk text/spans).
+    title_prefix: bool = True
+
+    def settings_sha(self) -> str:
+        canonical = json.dumps(self.model_dump(mode="json"), sort_keys=True)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @model_validator(mode="after")
+    def _check_ranges(self) -> ChunkingSettings:
+        if self.overlap_tokens < 0 or self.overlap_tokens >= self.target_tokens:
+            raise ValueError(
+                f"overlap_tokens must satisfy 0 <= overlap_tokens < target_tokens "
+                f"({self.overlap_tokens} !< {self.target_tokens})"
+            )
+        if self.target_tokens > self.max_tokens:
+            raise ValueError(
+                f"target_tokens must be <= max_tokens ({self.target_tokens} > {self.max_tokens})"
+            )
+        return self
+
+
 class ExtractionSettings(BaseModel):
     """All stage settings that define an extraction run (PRD §6).
 
@@ -206,6 +309,8 @@ class ExtractionSettings(BaseModel):
 
     pdf: PdfLimits = Field(default_factory=PdfLimits)
     epub: EpubLimits = Field(default_factory=EpubLimits)
+    ocr: OcrSettings = Field(default_factory=OcrSettings)
+    normalization: NormalizationSettings = Field(default_factory=NormalizationSettings)
 
     def settings_sha(self) -> str:
         canonical = json.dumps(self.model_dump(mode="json"), sort_keys=True)
@@ -218,6 +323,7 @@ class Config(BaseModel):
     paths: Paths
     services: Services = Field(default_factory=Services)
     extraction: ExtractionSettings = Field(default_factory=ExtractionSettings)
+    chunking: ChunkingSettings = Field(default_factory=ChunkingSettings)
     scan: ScanSettings = Field(default_factory=ScanSettings)
 
     # Optional sentinel files that must exist to prove each mount is present.

@@ -236,3 +236,108 @@ Gate cases (all passing):
 - Begin M3: selective OCR and chunking (OCR for scanned/image-only PDF pages
   flagged by extraction quality, chunking over the extracted units with the
   page/section anchors preserved for citations).
+
+## M3 — Selective OCR and chunking
+
+**Status: gate passed.** PRD §12 M3 gate, verbatim: "kill after page N resumes
+from unfinished units; rotated OCR highlight mapping tested; no tokenizer
+truncation; originals unchanged." All four groups pass, verified by running the
+named tests this session.
+
+### Delivered
+- `extraction/routing.py` — page-route decision matrix: `assess_page` quality
+  flags (already in M2's pdf.py) + `image_area_ratio` (embedded-image coverage)
+  → `route_page` returns `ocr` / `reuse` / `skip`. Broken text layer is always
+  worth re-reading; clean text is reused no matter the image coverage;
+  no/sparse text is OCR'd only when an embedded image plausibly *is* the page
+  (threshold `OcrSettings.image_area_threshold`, default 0.5).
+- `extraction/ocr.py` — Tesseract TSV parsing (word boxes, `conf`, page/line/
+  word ids; malformed rows dropped), and the render→OCR→map coordinate
+  round-trip: rendered-page px ↔ page points for any rotation (0/90/180/270),
+  crop, and downscale to `max_side_px`. `ocr_page` runs the binary, classifies
+  failures (missing binary → permanent `ocr_unavailable`; timeout/non-zero/
+  empty → retryable), and commits the word layer into the unit artifact under
+  `ocr` (text, words with bboxes in **page points**).
+- `normalization.py` — cross-unit header/footer removal (exact repeated lines,
+  length-bounded, needs ≥2 units, disable-able), dehyphenation of line-end
+  fragments (never across paragraphs or capitals), whitespace collapse — each
+  with span round-trip mapping so surviving text still points at original
+  character ranges. `settings_sha()`.
+- `chunking.py` — word tokenizer (maximal non-whitespace runs), budget/overlap
+  (`target_tokens`/`overlap_tokens`/`max_tokens`), cut only between tokens
+  (no truncation), lookback that prefers line-end/unit-boundary cuts, maximal
+  same-unit span runs with `_union_word_boxes` bboxes for OCR units, title
+  prefix (first chunk only, consumes budget, stored in its own column, excluded
+  from chunk text/spans), deterministic `chunk_id`. `settings_sha()`.
+- `worker.py` — `ocr` and `chunk` stage handlers: OCR renders the page, runs
+  tesseract, commits the artifact, marks `ocr_state=done`, cleans scratch;
+  chunk normalizes all units, recomputes the fingerprint, chunks, and inserts
+  with deterministic ids in one transaction. Worker-start reconciliation
+  re-enqueues chunk jobs for runs whose chunk rows/fingerprint were lost.
+- `identity.py` — `chunk_key`; `migrations.py` — `chunks` table +
+  `source_units.route`/`ocr_state` + `extraction_runs.chunk_fingerprint`;
+  `config.py` — `OcrSettings`, `ChunkingSettings` (both into
+  `ExtractionSettings.settings_sha()`).
+- `tests/fixtures.py` — `make_mixed_pdf` (text/scanned/blank/sparse/
+  sparse_image page shapes via real PyMuPDF) and `make_fake_tesseract` (an
+  env-steered shim emitting 3 words per page; PRD §1: no system installs).
+- Tests: `test_routing.py`, `test_ocr.py`, `test_normalization.py`,
+  `test_chunking.py`, `test_pipeline_m3.py` (full extract→OCR→chunk pipeline
+  over real mixed PDF and real EPUB).
+
+### Test commands + results
+| Command | Result |
+| ------- | ------ |
+| `uv run ruff check .` | All checks passed! |
+| `uv run mypy` | Success: no issues found in 49 source files |
+| `uv run pytest` | 148 passed, 2 warnings in 16.49s |
+| `uv run pytest tests/test_normalization.py tests/test_routing.py tests/test_chunking.py tests/test_worker.py tests/test_ocr.py tests/test_pipeline_m3.py --tb=short` | 56 passed in 10.52s |
+
+(The 2 warnings are a third-party starlette testclient/anyio
+DeprecationWarning, not from this codebase.)
+
+Gate cases (all passing, run this session):
+- kill after page N resumes from unfinished units →
+  `test_ocr.py::test_ocr_kill_after_page_n_resumes`: 5-page scanned PDF,
+  stop signal observed after OCR page 1 commits → first run handles 3 (extract
+  + 2 OCR), resumed run handles 4 (3 OCR + chunk), 7 succeeded total; exactly
+  5 tesseract calls (pages 0–4, no re-OCR of finished pages); one chunk, 5
+  spans, each with bbox `[12.0, 24.0, 165.6, 36.0]`; no scratch files survive.
+- rotated OCR highlight mapping tested →
+  `test_ocr.py::test_coordinate_roundtrip_rotated[90|180|270]` (plus straight
+  and cropped round-trips) mapping TSV word boxes back to page points, and the
+  pipeline tests asserting span bboxes end up in page coordinates.
+- no tokenizer truncation → `test_chunking.py::test_no_token_is_truncated`
+  (cuts land only between whole tokens; every token of every unit appears in
+  exactly the expected chunk).
+- originals unchanged → `test_pipeline_m3.py::test_mixed_pdf_pipeline`: source
+  file and its content-addressed archive copy are bit-for-bit unchanged after
+  the full pipeline, and the run's scratch dir is empty.
+
+### Notes / bugs found
+- **Chunk-job key idempotency fix (`worker.py::_rekey_chunk_job`):** the chunk
+  job's `task_key` embeds the fingerprint of the run's units, computed at
+  *enqueue* time (pre-OCR). OCR then rewrites unit artifacts with new shas, so
+  the post-OCR fingerprint differs; on a later re-extract replay,
+  `on_extract_done` recomputed the post-OCR fp and `INSERT OR IGNORE` missed
+  the settled row, inserting a fresh duplicate chunk job — unbounded job-row
+  growth per replay of any OCR'd book (`test_reextract_is_a_job_noop` failed
+  with 5 jobs instead of 4). Fix: in all three `_run_chunk` success paths the
+  settled job row is re-keyed to the fingerprint of the state it actually
+  chunked, guarded by `NOT EXISTS` so `UNIQUE(task_key)` can never be
+  violated. Replays now hit the settled row; settings changes still produce a
+  new fp → new key → new job; reconcile-after-lost-row still works.
+- Test-expectation corrections (product behavior was correct, M2-pinned):
+  native PDF pages store PyMuPDF's raw text layer verbatim, which keeps the
+  per-line trailing newline (`text == sentence + "\n"`); EPUB `<h1>` headings
+  are block-level paragraphs, so their text is *in* the chunk body and the
+  promoted title is only the extra `title` column (test EPUB chunk: 13 body +
+  2 title = 15 tokens).
+- Deploy note (PRD §6): `OcrSettings` and normalization are now part of
+  `ExtractionSettings.settings_sha()`, so the first M3 deploy re-keys every
+  prior run (one re-extract/re-chunk cycle). Expected and harmless.
+
+### Next unfinished task
+- Begin M4: embeddings + Qdrant indexing (model wiring behind the service
+  config, upsert chunks by deterministic id, delete-on-revision, and the
+  evaluate harness per PRD §9).

@@ -206,6 +206,30 @@ class Jobs:
                 (ts + delay, job.job_id),
             )
 
+    def defer(self, job: Claimed, delay: float = 15.0, now: float | None = None) -> None:
+        """Fenced "wait and retry" for a job whose prerequisites are not ready yet.
+
+        Unlike :meth:`fail`, deferral is *not* an error: it clears any recorded
+        error and does not consume an attempt, so a job can be deferred
+        indefinitely (e.g. a chunk job waiting for the OCR jobs it depends on).
+        The job returns to ``retryable_failed`` — deliberately NOT ``pending`` —
+        because :meth:`claim` ignores ``next_attempt_at`` for pending jobs, and a
+        pending defer would spin the worker in a hot loop.
+        """
+        ts = time.time() if now is None else now
+        cur = self._db.execute(
+            """
+            UPDATE jobs SET state = 'retryable_failed', next_attempt_at = ?,
+                   error_category = NULL, error_detail = NULL,
+                   lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
+                   updated_at = ?
+            WHERE job_id = ? AND lease_token = ?
+            """,
+            (ts + delay, ts, job.job_id, job.token),
+        )
+        if cur.rowcount == 0:
+            raise StaleLeaseError(f"job {job.job_id}: stale token on defer")
+
     # --- pause / resume ----------------------------------------------------
     def pause(self, reason: str = "", now: float | None = None) -> None:
         ts = time.time() if now is None else now

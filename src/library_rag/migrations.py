@@ -168,9 +168,44 @@ _MIGRATION_0002: tuple[str, ...] = (
 )
 
 
+# M3: selective OCR (per-page state on the unit row) and chunks (PRD §8C/§8E).
+_MIGRATION_0003: tuple[str, ...] = (
+    # Which OCR decision was made for a page unit at extraction time.
+    # 'ocr' pages get an ocr job; 'reuse'/'skip' never do. Null for sections.
+    "ALTER TABLE source_units ADD COLUMN route TEXT",
+    # OCR lifecycle of a unit: 'none' (not applicable / not started), 'pending'
+    # (job enqueued), 'done', 'failed'. Tracked on the row so a crashed resume
+    # can tell what still has to happen without reading artifacts.
+    "ALTER TABLE source_units ADD COLUMN ocr_state TEXT NOT NULL DEFAULT 'none'",
+    # Pipeline fingerprint (units + normalization + chunker settings) of the
+    # last completed chunk pass. Equality with the freshly computed value is
+    # the no-op test for chunk jobs.
+    "ALTER TABLE extraction_runs ADD COLUMN chunk_fingerprint TEXT",
+    """
+    CREATE TABLE chunks (
+        chunk_id      TEXT PRIMARY KEY,
+        run_id        TEXT NOT NULL REFERENCES extraction_runs(run_id),
+        rev_id        TEXT NOT NULL REFERENCES source_revisions(rev_id),
+        position      INTEGER NOT NULL,
+        text          TEXT NOT NULL,
+        token_count   INTEGER NOT NULL,
+        title         TEXT,
+        spans         TEXT NOT NULL,
+        prev_chunk_id TEXT,
+        next_chunk_id TEXT,
+        created_at    REAL NOT NULL,
+        UNIQUE (run_id, position)
+    )
+    """,
+    "CREATE INDEX idx_chunks_run ON chunks(run_id)",
+    "CREATE INDEX idx_chunks_rev ON chunks(rev_id)",
+)
+
+
 MIGRATIONS: list[Migration] = [
     Migration(1, "catalog_and_jobs", _MIGRATION_0001),
     Migration(2, "pipeline_tables", _MIGRATION_0002),
+    Migration(3, "ocr_and_chunks", _MIGRATION_0003),
 ]
 
 

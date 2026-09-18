@@ -2,13 +2,20 @@
 
 One source unit per physical page. Text, geometry, and per-span metadata are
 written to a compressed JSON artifact (committed *before* the database row, so
-a crash never leaves a row pointing at a missing artifact). Quality flags are
-recorded now and routed in M3 (OCR selection):
+a crash never leaves a row pointing at a missing artifact). Quality flags
+drive the M3 OCR route (PRD §8C) recorded on the unit row:
 
 * ``no_text`` — page has no extractable text (scanned image; OCR candidate).
 * ``sparse`` — fewer non-whitespace characters than ``pdf.sparse_chars``.
 * ``many_replacement`` — share of U+FFFD above ``pdf.max_replacement_ratio``
   (a broken/mojibake text layer; OCR candidate).
+
+Routing decides ``reuse`` (native text is fine), ``ocr`` (enqueue a durable
+OCR job; the page's ``ocr_state`` becomes ``pending``), or ``skip`` (blank /
+illustration page — no OCR job). Because the enqueue is a durable, idempotent
+job row, extraction completion also re-enqueues any ``route='ocr'`` units
+whose job row might have been lost (crash between the insert and the
+enqueue), closing that window on replay.
 """
 
 from __future__ import annotations
@@ -20,6 +27,7 @@ import pymupdf
 
 from ..identity import unit_id_for
 from .errors import ExtractionFailure
+from .routing import ROUTE_OCR, image_area_ratio, route_page
 from .store import (
     ExtractorCtx,
     commit_unit_artifact,
@@ -43,10 +51,10 @@ def parser_version() -> str:
 def assess_page(text: str, sparse_chars: int, max_replacement_ratio: float) -> list[str]:
     """Return the quality flags for a page's extracted text (PRD §8B)."""
     flags: list[str] = []
-    n_chars = len("".join(text.split()))  # non-whitespace count
-    if n_chars == 0:
+    stripped = text.strip()
+    if not stripped:
         flags.append("no_text")
-    elif n_chars < sparse_chars:
+    elif len(stripped) < sparse_chars:
         flags.append("sparse")
     if text and (text.count("�") / len(text)) > max_replacement_ratio:
         flags.append("many_replacement")
@@ -95,6 +103,24 @@ def _page_payload(ctx: ExtractorCtx, index: int, page: Any) -> dict[str, Any]:
     }
 
 
+def _requeue_ocr_units(ctx: ExtractorCtx) -> None:
+    """Idempotently re-enqueue the OCR jobs of every page unit routed to OCR.
+
+    Closes the two lost-enqueue windows: a crash between ``insert_unit`` and
+    ``enqueue_ocr`` on a fresh extract, and a resume where a previous run
+    inserted a routed row but was killed before enqueuing. Enqueue is
+    INSERT OR IGNORE on the task key, so this is a no-op for healthy jobs.
+    """
+    if ctx.enqueue_ocr is None:
+        return
+    rows = ctx.db.query(
+        "SELECT position FROM source_units WHERE run_id = ? AND route = ?",
+        (ctx.run_id, ROUTE_OCR),
+    )
+    for row in rows:
+        ctx.enqueue_ocr(int(row["position"]))
+
+
 def extract_pdf(ctx: ExtractorCtx) -> int:
     """Extract every page of the archived PDF; return the unit count.
 
@@ -114,37 +140,47 @@ def extract_pdf(ctx: ExtractorCtx) -> int:
     with doc:
         if doc.needs_pass:
             raise ExtractionFailure("encrypted", "PDF requires a password")
-        if not start_run(ctx, parser_version(), ctx.settings.settings_sha()):
-            row = ctx.db.query_one(
-                "SELECT unit_count FROM extraction_runs WHERE run_id = ?", (ctx.run_id,)
-            )
-            return int(row["unit_count"] or 0) if row is not None else 0
-
-        done = 0
-        for index in range(doc.page_count):
-            unit_id = unit_id_for(ctx.run_id, "page", index)
-            if existing_verified_unit(ctx, "page", index, unit_id):
-                done += 1  # completed by a previous (crashed) run
-                continue
-            payload = _page_payload(ctx, index, doc[index])
-            sha = commit_unit_artifact(ctx, unit_id, payload)
-            flags = payload["quality"]["flags"]
-            insert_unit(
-                ctx,
-                unit_id=unit_id,
-                kind="page",
-                position=index,
-                ref=payload["label"],
-                char_count=payload["quality"]["chars"],
-                rotation=payload["rotation"],
-                width=payload["width"],
-                height=payload["height"],
-                quality_flags=flags or None,
-                artifact_relpath=f"extract/{ctx.rev['rev_id']}/{unit_id}.json.gz",
-                artifact_sha256=sha,
-            )
-            done += 1
-            if ctx.on_progress is not None and index % _PAGES_PER_HEARTBEAT == _PAGES_PER_HEARTBEAT - 1:
-                ctx.on_progress()
-        finish_run(ctx, done)
-        return done
+        if start_run(ctx, parser_version(), ctx.settings.settings_sha()):
+            done = 0
+            for index in range(doc.page_count):
+                unit_id = unit_id_for(ctx.run_id, "page", index)
+                if existing_verified_unit(ctx, "page", index, unit_id):
+                    done += 1  # completed by a previous (crashed) run
+                    continue
+                payload = _page_payload(ctx, index, doc[index])
+                sha = commit_unit_artifact(ctx, unit_id, payload)
+                flags = payload["quality"]["flags"]
+                # Selective OCR route (PRD §8C): a missing or broken text
+                # layer with significant image coverage gets an OCR job.
+                route = route_page(flags, image_area_ratio(doc[index]), ctx.settings.ocr)
+                insert_unit(
+                    ctx,
+                    unit_id=unit_id,
+                    kind="page",
+                    position=index,
+                    ref=payload["label"],
+                    char_count=payload["quality"]["chars"],
+                    rotation=payload["rotation"],
+                    width=payload["width"],
+                    height=payload["height"],
+                    quality_flags=flags or None,
+                    artifact_relpath=f"extract/{ctx.rev['rev_id']}/{unit_id}.json.gz",
+                    artifact_sha256=sha,
+                    route=route,
+                    ocr_state="pending" if route == ROUTE_OCR else "none",
+                )
+                if route == ROUTE_OCR and ctx.enqueue_ocr is not None:
+                    ctx.enqueue_ocr(index)
+                done += 1
+                if ctx.on_progress is not None and index % _PAGES_PER_HEARTBEAT == _PAGES_PER_HEARTBEAT - 1:
+                    ctx.on_progress()
+            finish_run(ctx, done)
+        # Run complete (or replay of an already-succeeded run): make sure the
+        # downstream jobs exist. Both enqueues are idempotent no-ops otherwise.
+        _requeue_ocr_units(ctx)
+        if ctx.on_extract_done is not None:
+            ctx.on_extract_done()
+        row = ctx.db.query_one(
+            "SELECT unit_count FROM extraction_runs WHERE run_id = ?", (ctx.run_id,)
+        )
+        return int(row["unit_count"] or 0) if row is not None else 0

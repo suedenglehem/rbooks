@@ -21,22 +21,27 @@ are *derived from* them, not substitutes.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import uuid
 from pathlib import PurePosixPath
 
 __all__ = [
+    "NAMESPACE_CHUNK",
     "NAMESPACE_DOC",
     "NAMESPACE_EXTRACT",
     "NAMESPACE_REV",
     "NAMESPACE_TASK",
     "NAMESPACE_UNIT",
+    "chunk_key",
     "document_id",
     "extraction_key",
     "make_task_key",
     "normalize_path",
     "revision_id",
     "unit_id_for",
+    "units_fingerprint",
 ]
 
 # Fixed name-registry UUIDs. Chosen once and never changed; changing them would
@@ -46,6 +51,7 @@ NAMESPACE_REV = uuid.UUID("8f3e2a10-0000-4000-8000-0000000000d2")
 NAMESPACE_TASK = uuid.UUID("8f3e2a10-0000-4000-8000-0000000000d3")
 NAMESPACE_EXTRACT = uuid.UUID("8f3e2a10-0000-4000-8000-0000000000d4")
 NAMESPACE_UNIT = uuid.UUID("8f3e2a10-0000-4000-8000-0000000000d5")
+NAMESPACE_CHUNK = uuid.UUID("8f3e2a10-0000-4000-8000-0000000000d6")
 
 
 def normalize_path(path: str | os.PathLike[str]) -> str:
@@ -94,6 +100,40 @@ def unit_id_for(run_id: str, kind: str, position: int) -> str:
     the same ID, which is what makes per-unit re-extraction idempotent.
     """
     return str(uuid.uuid5(NAMESPACE_UNIT, f"unit:{run_id}:{kind}:{position}"))
+
+
+def units_fingerprint(rows: list[tuple[int, str]]) -> str:
+    """SHA-256 over the (position, artifact hash) pairs of a run's units.
+
+    *rows* is a list of ``(position, artifact_sha256)`` tuples, any order. The
+    result is the "content of the extraction" as far as downstream stages are
+    concerned: any OCR or normalization rewrite that changes a unit artifact
+    changes the fingerprint, so chunk jobs keyed on it re-run exactly when the
+    inputs to chunking actually changed (PRD §6/§8E).
+    """
+    canonical = json.dumps(sorted(rows), separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def chunk_key(
+    run_id: str,
+    chunker_sha: str,
+    span_signature: str,
+    text_sha: str,
+) -> str:
+    """Deterministic chunk UUID.
+
+    Derived from the run, the chunker settings hash, a hash of the chunk's
+    source-span list, and a hash of its text. The same chunk rebuilt from the
+    same run and settings always has the same ID, which is what makes
+    chunk-job replays idempotent (DELETE-then-INSERT keyed on this identity).
+    """
+    return str(
+        uuid.uuid5(
+            NAMESPACE_CHUNK,
+            f"chunk:{run_id}:{chunker_sha}:{span_signature}:{text_sha}",
+        )
+    )
 
 
 def make_task_key(
