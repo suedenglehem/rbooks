@@ -26,6 +26,7 @@ from fixtures import (
 )
 from library_rag.config import Config, OcrSettings
 from library_rag.db import Database
+from library_rag.embeddings import FakeEmbedder
 from library_rag.extraction.errors import ExtractionFailure, is_permanent
 from library_rag.extraction.ocr import (
     build_transform,
@@ -34,6 +35,7 @@ from library_rag.extraction.ocr import (
     parse_tsv,
     raster_to_page_box,
 )
+from library_rag.indexing import FakeQdrant
 from library_rag.jobs import Claimed, Jobs
 from library_rag.scan import scan_roots
 from library_rag.worker import run_worker
@@ -228,8 +230,8 @@ def src(base_config: Config) -> Path:
     return root
 
 
-def _drain(state_db: Database, cfg: Config) -> int:
-    return run_worker(state_db, cfg, once=True, poll_delay=0)
+def _drain(state_db: Database, cfg: Config, q: FakeQdrant, emb: FakeEmbedder) -> int:
+    return run_worker(state_db, cfg, once=True, poll_delay=0, qdrant=q, embedder=emb)
 
 
 def test_ocr_kill_after_page_n_resumes(
@@ -261,21 +263,28 @@ def test_ocr_kill_after_page_n_resumes(
             if ocr_done[0] >= 2:
                 stop[0] = True
 
+    base_config.embedding.fake = True
+    q = FakeQdrant(base_config.embedding.dimensions)
+    emb = FakeEmbedder(base_config.embedding.dimensions)
+
     monkeypatch.setattr(Jobs, "succeed", stopping_succeed)
     # The "kill": a stop signal that the loop observes at its next check, i.e.
     # right after page 1's OCR job has committed.
-    first = run_worker(state_db, base_config, once=True, poll_delay=0, stop_event=lambda: stop[0])
+    first = run_worker(
+        state_db, base_config, once=True, poll_delay=0,
+        stop_event=lambda: stop[0], qdrant=q, embedder=emb,
+    )
     monkeypatch.setattr(Jobs, "succeed", real_succeed)
 
     # extract + OCR pages 0,1 — then the stop check ends the loop.
     assert first == 3
     assert ocr_done[0] == 2
 
-    # Resume: a fresh worker picks up the three unfinished OCR units and the
-    # chunk job. No page is re-OCR'd.
-    second = _drain(state_db, base_config)
-    assert second == 4
-    assert jobs.counts() == {"succeeded": 7}  # 1 extract + 5 OCR + 1 chunk
+    # Resume: a fresh worker picks up the three unfinished OCR units, the
+    # chunk job, and the M4 embed/publish tail. No page is re-OCR'd.
+    second = _drain(state_db, base_config, q, emb)
+    assert second == 6
+    assert jobs.counts() == {"succeeded": 9}  # extract + 5 OCR + chunk + embed + publish
 
     units = state_db.query(
         "SELECT unit_id, ocr_state, route FROM source_units ORDER BY position"
@@ -325,7 +334,10 @@ def test_ocr_noop_replay_skips_finished_units(
     jobs = Jobs(state_db)
     scan_roots(state_db, base_config, jobs)
 
-    assert _drain(state_db, base_config) == 5  # extract + 3 OCR + chunk
+    base_config.embedding.fake = True
+    q = FakeQdrant(base_config.embedding.dimensions)
+    emb = FakeEmbedder(base_config.embedding.dimensions)
+    assert _drain(state_db, base_config, q, emb) == 7  # extract + 3 OCR + chunk + embed + publish
     assert log.read_text(encoding="utf-8").count("\n") == 3
 
     # A lost/requeued OCR job for an already-finished page is a durable no-op:
@@ -339,7 +351,7 @@ def test_ocr_noop_replay_skips_finished_units(
         (job["job_id"],),
     )
 
-    assert _drain(state_db, base_config) == 1
+    assert _drain(state_db, base_config, q, emb) == 1
     row = state_db.query_one("SELECT * FROM jobs WHERE job_id = ?", (job["job_id"],))
     assert row is not None
     assert row["state"] == "succeeded"
@@ -347,7 +359,7 @@ def test_ocr_noop_replay_skips_finished_units(
     assert manifest["noop"] is True
     # No tesseract call was made on replay.
     assert log.read_text(encoding="utf-8").count("\n") == 3
-    assert jobs.counts() == {"succeeded": 5}
+    assert jobs.counts() == {"succeeded": 7}
 
 
 def test_ocr_transient_failure_retries_then_recovers(
@@ -365,20 +377,25 @@ def test_ocr_transient_failure_retries_then_recovers(
     jobs = Jobs(state_db)
     scan_roots(state_db, base_config, jobs)
 
+    base_config.embedding.fake = True
+    q = FakeQdrant(base_config.embedding.dimensions)
+    emb = FakeEmbedder(base_config.embedding.dimensions)
     # Extract succeeds; both OCR pages fail transiently (retryable_failed);
-    # the chunk job sees open OCR work and defers.
-    assert _drain(state_db, base_config) == 4
+    # the chunk job sees open OCR work and defers (embed is not yet enqueued:
+    # only a successful chunk hands off to embed).
+    assert _drain(state_db, base_config, q, emb) == 4
     counts = jobs.counts()
     assert counts["succeeded"] == 1
     assert counts.get("retryable_failed", 0) == 3
     ocr_jobs = state_db.query("SELECT error_category FROM jobs WHERE stage = 'ocr'")
     assert {r["error_category"] for r in ocr_jobs} == {"ocr_error"}
 
-    # Operator clears the fault and retries: OCR recovers and the chunk runs.
+    # Operator clears the fault and retries: OCR recovers, the chunk runs,
+    # and the M4 embed/publish tail completes the publication.
     monkeypatch.delenv("FAKE_TESSERACT_FAIL")
     assert jobs.retry() >= 3
-    assert _drain(state_db, base_config) == 3  # 2 OCR + 1 chunk
-    assert jobs.counts() == {"succeeded": 4}
+    assert _drain(state_db, base_config, q, emb) == 5  # 2 OCR + chunk + embed + publish
+    assert jobs.counts() == {"succeeded": 6}
     units = state_db.query("SELECT ocr_state FROM source_units")
     assert all(u["ocr_state"] == "done" for u in units)
     row = state_db.query_one("SELECT COUNT(*) AS n FROM chunks")

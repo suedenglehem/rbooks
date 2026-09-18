@@ -15,7 +15,7 @@ def test_migrate_is_idempotent(base_config: Config) -> None:
     path = db_path_for(base_config.paths.state_root)
     db = Database.connect(path)
     try:
-        expected = len(MIGRATIONS)  # latest schema version (3 as of M3)
+        expected = len(MIGRATIONS)  # latest schema version (4 as of M4)
         assert migrate(db) == expected
         # Running again must not error and must report the same version.
         assert migrate(db) == expected
@@ -39,6 +39,10 @@ def test_all_expected_tables_exist(state_db: Database) -> None:
         "extraction_runs",
         "source_units",
         "chunks",
+        "embedding_batches",
+        "index_generations",
+        "sparse_corpus_stats",
+        "publications",
     )
     for name in expected:
         assert name in tables

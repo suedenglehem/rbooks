@@ -20,6 +20,7 @@ dependencies = [
     "httpx>=0.27",
     "PyMuPDF>=1.24,<2",
     "ebooklib>=0.18,<1",
+    "qdrant-client>=1.12,<1.13",
 ]
 
 [project.optional-dependencies]
@@ -44,7 +45,11 @@ packages = ["src/library_rag"]
 # --- Tooling ---------------------------------------------------------------
 
 [tool.uv]
-# Nothing special; uv uses the standard [project]/[dependency-groups] layout.
+# numpy is a transitive dependency of qdrant-client, never imported directly.
+# 2.5.x requires Python >=3.12 and ships 3.12-only stub syntax; pin to the last
+# 2.4.x so the lock resolves 3.11-compatible stubs in every environment
+# (mypy checks the project at 3.11 per requires-python).
+constraint-dependencies = ["numpy>=1.26,<2.5"]
 
 [tool.ruff]
 target-version = "py311"

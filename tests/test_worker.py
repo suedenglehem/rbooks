@@ -1,7 +1,7 @@
-"""Worker loop (PRD §7): claim durable jobs, run the extract/ocr/chunk stages,
-classify failures (permanent vs. transient), and heartbeat the lease between
-units. As of M3, a successful extract enqueues a chunk job, so a full drain of
-one document completes two jobs.
+"""Worker loop (PRD §7): claim durable jobs, run the extract/ocr/chunk/embed/
+publish stages, classify failures (permanent vs. transient), and heartbeat the
+lease between units. As of M4, a full drain of one document completes four
+jobs: extract, chunk, embed, and publish.
 """
 
 from __future__ import annotations
@@ -15,7 +15,9 @@ import pytest
 from fixtures import make_pdf
 from library_rag.config import Config
 from library_rag.db import Database
+from library_rag.embeddings import FakeEmbedder
 from library_rag.identity import make_task_key
+from library_rag.indexing import FakeQdrant
 from library_rag.jobs import Claimed, Jobs
 from library_rag.scan import scan_roots
 from library_rag.worker import run_worker
@@ -46,8 +48,11 @@ def test_worker_end_to_end(state_db: Database, base_config: Config, src: Path) -
     report = scan_roots(state_db, base_config, jobs)[0]
     assert report.new_documents == 1
 
-    assert run_worker(state_db, base_config, once=True, poll_delay=0) == 2
-    assert jobs.counts() == {"succeeded": 2}
+    base_config.embedding.fake = True
+    q = FakeQdrant(base_config.embedding.dimensions)
+    emb = FakeEmbedder(base_config.embedding.dimensions)
+    assert run_worker(state_db, base_config, once=True, poll_delay=0, qdrant=q, embedder=emb) == 4
+    assert jobs.counts() == {"succeeded": 4}
 
     run = state_db.query_one(
         "SELECT state, unit_count, chunk_fingerprint FROM extraction_runs"
@@ -93,16 +98,23 @@ def test_worker_heartbeats_between_units(
         beats.append(job.job_id)
 
     monkeypatch.setattr(Jobs, "heartbeat", fake_heartbeat)
-    # The chunk stage is pure in-memory work and never heartbeats.
-    assert run_worker(state_db, base_config, once=True, poll_delay=0) == 2
+    base_config.embedding.fake = True
+    q = FakeQdrant(base_config.embedding.dimensions)
+    emb = FakeEmbedder(base_config.embedding.dimensions)
+    # The chunk stage is pure in-memory work and never heartbeats; embed
+    # heartbeats once per batch (one chunk => one batch) and publish heartbeats
+    # once, so: 2 extract + 1 embed + 1 publish.
+    assert run_worker(state_db, base_config, once=True, poll_delay=0, qdrant=q, embedder=emb) == 4
 
-    assert len(beats) == 2
-    assert jobs.counts() == {"succeeded": 2}
+    assert len(beats) == 4
+    assert jobs.counts() == {"succeeded": 4}
 
 
 def test_worker_unknown_stage_permanent(state_db: Database, base_config: Config) -> None:
     jobs = Jobs(state_db)
-    jobs.enqueue(make_task_key("embed", "x", "v1"), "embed", input_id="x", input_version="v1")
+    jobs.enqueue(
+        make_task_key("frobnicate", "x", "v1"), "frobnicate", input_id="x", input_version="v1"
+    )
 
     assert run_worker(state_db, base_config, once=True, poll_delay=0) == 1
 

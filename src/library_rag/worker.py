@@ -1,8 +1,11 @@
 """Worker loop: claim durable jobs and run their pipeline stage (PRD §7).
 
-M2 implemented the ``extract`` stage; M3 adds ``ocr`` (the selective Tesseract
-pass over routed pages, PRD §8C) and ``chunk`` (normalization + token-budget
-chunking, PRD §8E). Contract:
+M2 implemented the ``extract`` stage; M3 added ``ocr`` (the selective
+Tesseract pass over routed pages, PRD §8C) and ``chunk`` (normalization +
+token-budget chunking, PRD §8E); M4 adds ``embed`` (checkpointed dense
+encoding with bounded OOM halving, PRD §5/§8F) and ``publish`` (staged
+upsert + verified visibility switch under the publish lock, PRD §8F).
+Contract:
 
 * one job at a time per worker; the lease is heartbeated between units
   (inject :meth:`Jobs.heartbeat` as the stage's ``on_progress``), so a
@@ -19,9 +22,19 @@ chunking, PRD §8E). Contract:
 * OCR is a no-op when the unit already carries OCR output for the current
   engine settings, so a crash between the artifact commit and the job commit
   reclaims a job that skips Tesseract entirely;
+* embeddings are checkpointed batch-by-batch *before* the batch row is
+  committed, so a re-run reuses every surviving batch and a corrupt
+  checkpoint is detected, dropped, and re-encoded rather than replayed;
+* publication is staged: points are upserted inactive and verified, the
+  SQLite row switches under the publish lock, and a crash at any boundary is
+  repaired by :func:`reconcile_publications` (called at worker start and at
+  search start) — never by trusting the Qdrant flags;
 * on worker start, :func:`_reconcile_chunks` re-enqueues the chunk job of any
   succeeded run whose stored fingerprint no longer matches (the M2→M3
-  migration, a lost chunk job row, or a downstream state wipe).
+  migration, a lost chunk job row, or a downstream state wipe) and
+  :func:`_reconcile_index` closes the M4 gaps (a run whose checkpoints are
+  missing for the current embedding configuration gets an embed job; a
+  settled revision with no staged/active publication gets a publish job).
 """
 
 from __future__ import annotations
@@ -31,6 +44,7 @@ import json
 import os
 import time
 from collections.abc import Callable
+from functools import partial
 from typing import Any
 
 import pymupdf
@@ -38,8 +52,22 @@ import pymupdf
 from .archive import archive_path_for
 from .catalog import Format
 from .chunking import UnitInput, chunk_units
-from .config import Config
+from .config import Config, ConfigError
 from .db import Database
+from .embeddings import (
+    CheckpointCorruptError,
+    Embedder,
+    EmbeddingError,
+    EmbeddingOOMError,
+    ModelUnavailableError,
+    checkpoint_path,
+    compute_sparse_stats,
+    embedding_sha,
+    encode_batch_oom,
+    make_embedder,
+    read_checkpoint,
+    write_checkpoint,
+)
 from .extraction import (
     ExtractionFailure,
     ExtractorCtx,
@@ -55,10 +83,20 @@ from .extraction import (
 )
 from .extraction.epub import parser_version as epub_parser_version
 from .extraction.pdf import parser_version as pdf_parser_version
-from .identity import extraction_key, make_task_key, unit_id_for, units_fingerprint
+from .identity import extraction_key, generation_id, make_task_key, unit_id_for, units_fingerprint
+from .indexing import (
+    PublicationError,
+    QdrantOps,
+    RealQdrantOps,
+    acquire_publish_lock,
+    publication_is_current,
+    publish_generation,
+    reconcile_publications,
+    release_publish_lock,
+)
 from .jobs import Claimed, Jobs, StaleLeaseError
 from .normalization import normalize_unit, unit_removed_ranges
-from .scan import STAGE_CHUNK, STAGE_EXTRACT, STAGE_OCR
+from .scan import STAGE_CHUNK, STAGE_EMBED, STAGE_EXTRACT, STAGE_OCR, STAGE_PUBLISH
 
 __all__ = [
     "DEFAULT_LEASE_TTL",
@@ -122,6 +160,21 @@ def _rekey_chunk_job(db: Database, job: Claimed, run_id: str, fingerprint: str) 
         "AND NOT EXISTS (SELECT 1 FROM jobs j2 "
         " WHERE j2.task_key = ? AND j2.job_id != ?)",
         (key, job.job_id, key, key, job.job_id),
+    )
+
+
+def _enqueue_embed_job(jobs: Jobs, run_id: str, fingerprint: str) -> None:
+    """Idempotently enqueue the run's embedding job (the chunk stage's handoff).
+
+    The task key carries the chunk fingerprint, so a re-chunk (new
+    fingerprint) mints a new job and a replay of the same chunk job re-inserts
+    nothing (INSERT OR IGNORE on the task key).
+    """
+    jobs.enqueue(
+        make_task_key(STAGE_EMBED, run_id, fingerprint),
+        STAGE_EMBED,
+        input_id=run_id,
+        input_version=fingerprint,
     )
 
 
@@ -378,6 +431,8 @@ def _run_chunk(db: Database, cfg: Config, jobs: Jobs, job: Claimed, lease_ttl: f
         assert n_chunks is not None and n_units is not None
         if int(n_chunks["n"] or 0) > 0 or int(n_units["n"] or 0) == 0:
             _rekey_chunk_job(db, job, run_id, current)
+            if int(n_chunks["n"] or 0) > 0:
+                _enqueue_embed_job(jobs, run_id, current)
             jobs.succeed(
                 job,
                 json.dumps(
@@ -492,6 +547,8 @@ def _run_chunk(db: Database, cfg: Config, jobs: Jobs, job: Claimed, lease_ttl: f
                 (current, ts, run_id),
             )
         _rekey_chunk_job(db, job, run_id, current)
+        if results:
+            _enqueue_embed_job(jobs, run_id, current)
         jobs.succeed(
             job,
             json.dumps(
@@ -505,6 +562,321 @@ def _run_chunk(db: Database, cfg: Config, jobs: Jobs, job: Claimed, lease_ttl: f
         jobs.fail(job, "worker_error", f"{type(exc).__name__}: {exc}", transient=True)
         return True
     return True
+
+
+def _run_embed(
+    db: Database,
+    cfg: Config,
+    jobs: Jobs,
+    job: Claimed,
+    lease_ttl: float,
+    embedder: Embedder | None = None,
+) -> bool:
+    """Checkpoint the run's dense vectors (PRD §5/§8F), then hand off to publish.
+
+    Vectors are persisted to a non-pickle artifact *before* the batch row is
+    committed, so a crash never leaves a manifest row pointing at missing or
+    unverified bytes; a corrupt artifact (row present, bytes failing
+    validation) deletes the row and re-encodes that batch (PRD §14). GPU OOM
+    halves the batch within the bounded retry policy; an unencodable chunk
+    fails the job explicitly rather than looping forever. On success the
+    publication job is enqueued — the stage that stages, verifies, and
+    activates the index generation (PRD §8F).
+    """
+    run = db.query_one(
+        "SELECT run_id, rev_id, state, chunk_fingerprint FROM extraction_runs WHERE run_id = ?",
+        (job.input_id or "",),
+    )
+    if run is None:
+        jobs.fail(job, "missing_run", f"run {job.input_id} not in catalog", transient=False)
+        return True
+    if run["state"] == "running":
+        jobs.defer(job)
+        return True
+    if run["state"] == "failed":
+        # An open extract job for the same revision will retry; otherwise the
+        # run is terminally failed and embedding it would be wasted work.
+        if db.query_one(
+            "SELECT 1 AS x FROM jobs WHERE stage = ? AND input_id = ? AND state IN "
+            + _OPEN_STATES,
+            (STAGE_EXTRACT, run["rev_id"]),
+        ) is None:
+            jobs.fail(job, "run_failed", "extraction run failed; not embedding", transient=False)
+            return True
+        jobs.defer(job)
+        return True
+    if db.query_one(
+        "SELECT 1 AS x FROM jobs WHERE stage IN (?, ?) AND input_id = ? AND state NOT IN "
+        + _SETTLED_STATES,
+        (STAGE_OCR, STAGE_CHUNK, job.input_id or ""),
+    ) is not None:
+        jobs.defer(job)
+        return True
+    run_id = run["run_id"]
+    rev = db.query_one(
+        "SELECT rev_id, doc_id, is_active FROM source_revisions WHERE rev_id = ?",
+        (run["rev_id"],),
+    )
+    if rev is None:
+        jobs.fail(job, "missing_source", f"revision {run['rev_id']} not in catalog", transient=False)
+        return True
+    if not rev["is_active"]:
+        # The revision was replaced: its vectors must never enter the index.
+        jobs.succeed(
+            job, json.dumps({"run_id": run_id, "chunks": 0, "noop": True}, sort_keys=True)
+        )
+        return True
+    current = chunk_fingerprint_for_run(db, run_id, cfg)
+    if run["chunk_fingerprint"] != current:
+        # Chunks are being rebuilt; the chunk job re-enqueues this stage.
+        jobs.defer(job)
+        return True
+    try:
+        emb = embedder if embedder is not None else make_embedder(cfg)
+        emb_sha = embedding_sha(cfg)
+    except ConfigError as exc:
+        jobs.fail(job, "embedding_not_configured", str(exc), transient=False)
+        return True
+
+    chunk_rows = db.query(
+        "SELECT chunk_id, text FROM chunks WHERE run_id = ? ORDER BY position", (run_id,)
+    )
+    if not chunk_rows:
+        jobs.succeed(
+            job, json.dumps({"run_id": run_id, "chunks": 0, "noop": True}, sort_keys=True)
+        )
+        return True
+
+    batch_size = max(1, cfg.embedding.batch_size)
+    n_batches = (len(chunk_rows) + batch_size - 1) // batch_size
+    try:
+        for i in range(0, len(chunk_rows), batch_size):
+            batch_index = i // batch_size
+            batch = chunk_rows[i : i + batch_size]
+            chunk_ids = [r["chunk_id"] for r in batch]
+            cp = checkpoint_path(cfg.paths.artifact_root, run_id, emb_sha, batch_index)
+            row = db.query_one(
+                "SELECT batch_id FROM embedding_batches "
+                "WHERE run_id = ? AND embedding_sha = ? AND batch_index = ?",
+                (run_id, emb_sha, batch_index),
+            )
+            if row is not None:
+                try:
+                    read_checkpoint(cp, chunk_ids)
+                    continue  # checkpoint verified: this batch is done
+                except CheckpointCorruptError:
+                    # Corrupt artifact: drop the manifest row so the batch
+                    # re-encodes and re-commits (PRD §14 corrupt-artifact case).
+                    db.execute(
+                        "DELETE FROM embedding_batches WHERE batch_id = ?", (row["batch_id"],)
+                    )
+            vectors = encode_batch_oom(
+                emb,
+                [r["text"] for r in batch],
+                start_size=batch_size,
+                max_halvings=cfg.embedding.oom_max_halvings,
+            )
+            if len(vectors) != len(chunk_ids):
+                jobs.fail(
+                    job,
+                    "worker_error",
+                    f"encoder returned {len(vectors)} vectors for {len(chunk_ids)} chunks",
+                    transient=False,
+                )
+                return True
+            vector_sha = write_checkpoint(
+                cp,
+                vectors,
+                emb.dimensions,
+                {
+                    "run_id": run_id,
+                    "embedding_sha": emb_sha,
+                    "model_revision": emb.model_revision,
+                    "batch_index": batch_index,
+                    "chunk_ids": chunk_ids,
+                },
+            )
+            relpath = cp.relative_to(cfg.paths.artifact_root).as_posix()
+            with db.transaction():
+                db.execute(
+                    """
+                    INSERT INTO embedding_batches
+                        (batch_id, run_id, model_revision, embedding_sha, batch_index,
+                         chunk_ids, vector_sha256, artifact_relpath, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(run_id, embedding_sha, batch_index) DO NOTHING
+                    """,
+                    (
+                        f"{run_id}:{emb_sha}:{batch_index:05d}",
+                        run_id,
+                        emb.model_revision,
+                        emb_sha,
+                        batch_index,
+                        json.dumps(chunk_ids),
+                        vector_sha,
+                        relpath,
+                        time.time(),
+                    ),
+                )
+            jobs.heartbeat(job, lease_ttl)
+    except StaleLeaseError:
+        return False
+    except EmbeddingOOMError as exc:
+        jobs.fail(job, "embedding_oom", str(exc), transient=True)
+        return True
+    except ModelUnavailableError as exc:
+        jobs.fail(job, "model_unavailable", str(exc), transient=True)
+        return True
+    except EmbeddingError as exc:
+        jobs.fail(job, "embedding_error", str(exc), transient=False)
+        return True
+    except Exception as exc:
+        jobs.fail(job, "worker_error", f"{type(exc).__name__}: {exc}", transient=True)
+        return True
+
+    stats = compute_sparse_stats(db, cfg, include_rev_id=rev["rev_id"])
+    version = f"{emb_sha}:{stats.stats_sha}"
+    jobs.enqueue(
+        make_task_key(STAGE_PUBLISH, rev["rev_id"], version),
+        STAGE_PUBLISH,
+        input_id=rev["rev_id"],
+        input_version=version,
+    )
+    jobs.succeed(
+        job,
+        json.dumps(
+            {
+                "run_id": run_id,
+                "chunks": len(chunk_rows),
+                "batches": n_batches,
+                "embedding_sha": emb_sha,
+            },
+            sort_keys=True,
+        ),
+    )
+    return True
+
+
+def _run_publish(
+    db: Database,
+    cfg: Config,
+    jobs: Jobs,
+    job: Claimed,
+    lease_ttl: float,
+    qdrant: QdrantOps | None = None,
+) -> bool:
+    """Stage and activate the revision's index generation under the publish
+    lock (PRD §8F).
+
+    ``input_version`` is the ``<embedding_sha>:<stats_sha>`` the enqueue side
+    computed; it is an idempotency key only — the handler recomputes the real
+    statistics epoch (``publication_is_current``), so a job that raced a
+    corpus-stats change simply no-ops if its generation is already current.
+    """
+    rev_id = job.input_id or ""
+    rev = db.query_one(
+        "SELECT rev_id, is_active FROM source_revisions WHERE rev_id = ?", (rev_id,)
+    )
+    if rev is None:
+        jobs.fail(job, "missing_source", f"revision {rev_id} not in catalog", transient=False)
+        return True
+    if not rev["is_active"]:
+        jobs.succeed(job, json.dumps({"rev_id": rev_id, "result": "noop"}, sort_keys=True))
+        return True
+    run = db.query_one(
+        "SELECT run_id FROM extraction_runs WHERE rev_id = ? AND state = 'succeeded' "
+        "ORDER BY created_at DESC",
+        (rev_id,),
+    )
+    if run is None:
+        jobs.defer(job)  # extraction not settled yet
+        return True
+    run_id = run["run_id"]
+    emb_sha_part, _, stats_sha_part = (job.input_version or "").partition(":")
+    if emb_sha_part and stats_sha_part:
+        state = publication_is_current(
+            db, rev_id=rev_id, gen_id=generation_id(run_id, emb_sha_part, stats_sha_part)
+        )
+        if state in ("active", "superseded"):
+            jobs.succeed(job, json.dumps({"rev_id": rev_id, "result": "noop"}, sort_keys=True))
+            return True
+
+    q = qdrant if qdrant is not None else RealQdrantOps(cfg)
+    if not q.ping():
+        jobs.fail(job, "qdrant_unavailable", "Qdrant unreachable; will retry", transient=True)
+        return True
+    owner = f"publish-{os.uname().nodename}-{os.getpid()}"
+    if not acquire_publish_lock(db, owner):
+        jobs.defer(job)  # another publisher is mid-switch
+        return True
+    try:
+        try:
+            result = publish_generation(
+                db,
+                cfg,
+                q,
+                rev_id=rev_id,
+                run_id=run_id,
+                on_progress=lambda: jobs.heartbeat(job, lease_ttl),
+            )
+        except StaleLeaseError:
+            return False
+        except PublicationError as exc:
+            jobs.fail(job, "publication_error", str(exc), transient=True)
+            return True
+        if result == "published":
+            _enqueue_epoch_republishes(db, cfg, jobs, rev_id)
+        jobs.succeed(
+            job, json.dumps({"rev_id": rev_id, "result": result}, sort_keys=True)
+        )
+    finally:
+        release_publish_lock(db, owner)
+    return True
+
+
+def _enqueue_epoch_republishes(db: Database, cfg: Config, jobs: Jobs, rev_id: str) -> None:
+    """Converge the other books onto the new statistics epoch.
+
+    Publishing under a fresh corpus-stats epoch shifts the sparse (BM25) space
+    for *every* publication, so each other active publication must be
+    re-published (re-sparse-encoded) under the new epoch. Only revisions whose
+    generation already carries the current embedding epoch are eligible here;
+    a different model epoch belongs to the re-embedding path, not this one.
+    Task keys are idempotent and the handler recomputes the epoch, so these
+    converge even if the corpus keeps changing.
+    """
+    emb_sha = embedding_sha(cfg)
+    row = db.query_one(
+        """
+        SELECT g.sparse_stats_sha AS stats
+        FROM publications p
+        JOIN index_generations g ON g.gen_id = p.gen_id
+        WHERE p.rev_id = ? AND p.state = 'active'
+        """,
+        (rev_id,),
+    )
+    if row is None:
+        return
+    stats_sha = row["stats"]
+    others = db.query(
+        """
+        SELECT p.rev_id AS rev_id, g.embedding_sha AS emb
+        FROM publications p
+        JOIN index_generations g ON g.gen_id = p.gen_id
+        WHERE p.state = 'active' AND p.rev_id != ? AND g.sparse_stats_sha != ?
+        """,
+        (rev_id, stats_sha),
+    )
+    for other in others:
+        if other["emb"] != emb_sha:
+            continue  # different model epoch: re-embedding path's job
+        version = f"{emb_sha}:{stats_sha}"
+        jobs.enqueue(
+            make_task_key(STAGE_PUBLISH, other["rev_id"], version),
+            STAGE_PUBLISH,
+            input_id=other["rev_id"],
+            input_version=version,
+        )
 
 
 def _reconcile_chunks(db: Database, cfg: Config) -> None:
@@ -546,6 +918,85 @@ def _reconcile_chunks(db: Database, cfg: Config) -> None:
         )
 
 
+def _reconcile_index(db: Database, cfg: Config) -> None:
+    """Close the M4 pipeline gaps on worker start (durable, idempotent).
+
+    Two lost-enqueue windows survive a crash:
+
+    * a run whose embedding checkpoints are incomplete for the *current*
+      embedding configuration (never embedded, or a model/dtype/dimensions
+      change invalidated them) gets its embed job; a batch_size change
+      self-heals the same way — the expected batch count no longer matches;
+    * a settled, active revision that never reached a staged or active
+      publication (a publish job row lost after the embed job succeeded)
+      gets its publish job.
+
+    Runs with an in-flight ocr/chunk/embed job are skipped (their own
+    handoff will re-enqueue), as are replaced revisions — their evidence must
+    not enter the index.
+    """
+    jobs = Jobs(db)
+    try:
+        emb_sha = embedding_sha(cfg)
+    except ConfigError:
+        emb_sha = None
+    stats_sha: str | None = None
+    runs = db.query(
+        "SELECT run_id, rev_id, chunk_fingerprint FROM extraction_runs WHERE state = 'succeeded'"
+    )
+    for row in runs:
+        run_id = row["run_id"]
+        if db.query_one(
+            "SELECT 1 AS x FROM jobs WHERE stage IN (?, ?, ?) AND input_id = ? "
+            "AND state NOT IN " + _SETTLED_STATES,
+            (STAGE_OCR, STAGE_CHUNK, STAGE_EMBED, run_id),
+        ) is not None:
+            continue
+        rev = db.query_one(
+            "SELECT rev_id, is_active FROM source_revisions WHERE rev_id = ?", (row["rev_id"],)
+        )
+        if rev is None or not rev["is_active"]:
+            continue
+        current = chunk_fingerprint_for_run(db, run_id, cfg)
+        if row["chunk_fingerprint"] != current:
+            continue  # the chunk job re-runs and re-enqueues from there
+        n_chunks = db.query_one(
+            "SELECT COUNT(*) AS n FROM chunks WHERE run_id = ?", (run_id,)
+        )
+        assert n_chunks is not None
+        n_chunks_count = int(n_chunks["n"] or 0)
+        if n_chunks_count == 0:
+            continue
+        if emb_sha is not None:
+            batch_size = max(1, cfg.embedding.batch_size)
+            n_batches = db.query_one(
+                "SELECT COUNT(*) AS n FROM embedding_batches "
+                "WHERE run_id = ? AND embedding_sha = ?",
+                (run_id, emb_sha),
+            )
+            assert n_batches is not None
+            expected = (n_chunks_count + batch_size - 1) // batch_size
+            if int(n_batches["n"] or 0) != expected:
+                _enqueue_embed_job(jobs, run_id, current)
+        # Publication gap: no staged/active publication for this revision.
+        if db.query_one(
+            "SELECT 1 AS x FROM publications WHERE rev_id = ? AND state IN ('staged', 'active')",
+            (row["rev_id"],),
+        ) is not None:
+            continue
+        if emb_sha is None:
+            continue  # cannot compute the version until embedding is configured
+        if stats_sha is None:
+            stats_sha = compute_sparse_stats(db, cfg).stats_sha
+        version = f"{emb_sha}:{stats_sha}"
+        jobs.enqueue(
+            make_task_key(STAGE_PUBLISH, row["rev_id"], version),
+            STAGE_PUBLISH,
+            input_id=row["rev_id"],
+            input_version=version,
+        )
+
+
 def run_worker(
     db: Database,
     cfg: Config,
@@ -555,6 +1006,8 @@ def run_worker(
     poll_delay: float = 1.0,
     stop_event: Callable[[], bool] | None = None,
     reconcile_on_start: bool = True,
+    qdrant: QdrantOps | None = None,
+    embedder: Embedder | None = None,
 ) -> int:
     """Claim and run jobs until the queue is drained (*once*) or *stop_event*
     becomes true. Returns the number of jobs brought to a handled state
@@ -563,16 +1016,27 @@ def run_worker(
 
     Stopping mid-loop is graceful by construction: at most the current job's
     current unit is in flight; everything already committed is durable and
-    resumable (PRD §7 SIGTERM).
+    resumable (PRD §7 SIGTERM). *qdrant*/*embedder* are injectable seams for
+    tests (and the CLI); production callers pass None and the worker builds
+    them per job.
     """
     name = worker_name()
     jobs = Jobs(db)
     if reconcile_on_start:
         _reconcile_chunks(db, cfg)
-    handlers = {
+        _reconcile_index(db, cfg)
+        q = qdrant if qdrant is not None else RealQdrantOps(cfg)
+        try:
+            if q.ping():
+                reconcile_publications(db, cfg, q)
+        except Exception:  # best-effort: a broken index must not block the queue
+            pass
+    handlers: dict[str, Callable[..., bool]] = {
         STAGE_EXTRACT: _run_extract,
         STAGE_OCR: _run_ocr,
         STAGE_CHUNK: _run_chunk,
+        STAGE_EMBED: partial(_run_embed, embedder=embedder),
+        STAGE_PUBLISH: partial(_run_publish, qdrant=qdrant),
     }
     completed = 0
     while True:

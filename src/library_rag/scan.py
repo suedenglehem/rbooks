@@ -35,8 +35,10 @@ from .jobs import Jobs
 
 __all__ = [
     "STAGE_CHUNK",
+    "STAGE_EMBED",
     "STAGE_EXTRACT",
     "STAGE_OCR",
+    "STAGE_PUBLISH",
     "ScanReport",
     "detect_format",
     "scan_root",
@@ -46,6 +48,8 @@ __all__ = [
 STAGE_EXTRACT = "extract"
 STAGE_OCR = "ocr"
 STAGE_CHUNK = "chunk"
+STAGE_EMBED = "embed"
+STAGE_PUBLISH = "publish"
 
 _CANDIDATE_SUFFIXES = {".pdf", ".epub"}
 

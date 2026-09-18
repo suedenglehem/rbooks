@@ -1,9 +1,11 @@
 """Command-line interface.
 
 ``doctor`` (M0), the recovery-foundation commands (M1: ``init``, ``pause``,
-``resume``, ``status``, ``retry``, ``reconcile``), and the M2 pipeline
-commands ``scan`` (discover + register + enqueue) and ``ingest`` (worker
-loop over the extraction queue) are implemented. The remaining commands are
+``resume``, ``status``, ``retry``, ``reconcile``), the M2 pipeline commands
+``scan`` (discover + register + enqueue) and ``ingest`` (worker loop over the
+extraction queue), and the M4 ``search`` command (fused dense+sparse search
+over the published index, with sparse-only degraded mode when embedding
+inference is unavailable) are implemented. The remaining commands are
 registered with their help text and milestone so that ``library-rag --help``
 documents the whole intended surface (PRD §4). Each stub prints an explicit
 "not yet implemented (milestone Mx)" message and returns a non-zero exit code
@@ -16,6 +18,7 @@ convention is implemented as each command lands (M1+).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import signal
 import sys
@@ -27,11 +30,14 @@ from .catalog import source_file_count
 from .config import Config, ConfigError, load_config
 from .db import Database, db_path_for
 from .doctor import render_json, render_text, run_doctor
+from .embeddings import make_embedder
 from .identity import normalize_path
+from .indexing import RealQdrantOps, reconcile_publications
 from .jobs import Jobs
 from .log import setup_logging
 from .migrations import current_version, migrate
 from .reconcile import Mount, reconcile_catalog
+from .retrieval import IndexUnavailableError, search
 from .scan import scan_roots
 from .worker import DEFAULT_LEASE_TTL, run_worker
 
@@ -270,6 +276,72 @@ def _ingest(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+# --- M4 search ---------------------------------------------------------------
+def _search(args: argparse.Namespace) -> int:
+    setup_logging(args.log_level, args.log_format)
+    cfg = _require_config(args)
+    db = _open_state(cfg)
+    qdrant = RealQdrantOps(cfg)
+    try:
+        if not qdrant.ping():
+            print("error: Qdrant is unreachable; search is unavailable", file=sys.stderr)
+            return EXIT_ERROR
+        # Best effort: repair partial publication flag changes from a crash
+        # before serving evidence (PRD §8F: reconcile after restart). Search
+        # must survive a failed reconciliation pass.
+        with contextlib.suppress(Exception):
+            reconcile_publications(db, cfg, qdrant)
+        # Embedding inference optional: unconfigured -> sparse-only degraded
+        # mode with an explicit status (PRD §9).
+        embedder = None
+        with contextlib.suppress(ConfigError):
+            embedder = make_embedder(cfg)
+        result = search(
+            db, cfg, qdrant, embedder, args.query, doc_id=args.doc, rev_id=args.rev
+        )
+    except IndexUnavailableError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    finally:
+        db.close()
+    passages = result.passages[: args.limit] if args.limit else result.passages
+    if args.json:
+        print(json.dumps(
+            {
+                "query": result.query,
+                "degraded": result.degraded,
+                "degraded_reason": result.degraded_reason,
+                "counts": result.counts,
+                "passages": [
+                    {
+                        "chunk_id": p.chunk_id,
+                        "doc_id": p.doc_id,
+                        "rev_id": p.rev_id,
+                        "title": p.title,
+                        "text": p.text,
+                        "score": p.score,
+                        "dense_rank": p.dense_rank,
+                        "sparse_rank": p.sparse_rank,
+                        "spans": p.spans,
+                    }
+                    for p in passages
+                ],
+            },
+            indent=2,
+            sort_keys=True,
+        ))
+    else:
+        if result.degraded:
+            print(f"warning: degraded search: {result.degraded_reason}", file=sys.stderr)
+        if not passages:
+            print("no passages found")
+        for i, p in enumerate(passages, start=1):
+            print(f"{i}. {p.title or '(untitled)'}  "
+                  f"[doc={p.doc_id} score={p.score:.4f}]")
+            print(f"   {p.text}")
+    return EXIT_OK
+
+
 # --- parser ----------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -344,7 +416,20 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"lease TTL in seconds (default {DEFAULT_LEASE_TTL:.0f})",
     )
     ingest.set_defaults(_func=_ingest)
-    _register_stub(sub, "search", "lexical + semantic search over the library (M4)")
+
+    search_p = sub.add_parser(
+        "search", help="lexical + semantic search over the published index (M4)"
+    )
+    search_p.add_argument("query", help="the query text")
+    search_p.add_argument("--config", help="path to config YAML")
+    search_p.add_argument("--json", action="store_true", help="emit the result as JSON")
+    search_p.add_argument(
+        "--limit", type=int, default=None, help="at most this many passages (default: all selected)"
+    )
+    search_p.add_argument("--doc", default=None, help="restrict to one document id")
+    search_p.add_argument("--rev", default=None, help="restrict to one revision id")
+    search_p.set_defaults(_func=_search)
+
     _register_stub(sub, "serve", "run the FastAPI research app + reader (M5)")
     _register_stub(sub, "evaluate", "run retrieval/answer evaluation on a labeled set (M6)")
     _register_stub(sub, "backup", "consistent backup of DB, Qdrant, and manifests (M7)")

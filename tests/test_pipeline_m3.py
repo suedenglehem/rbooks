@@ -1,8 +1,8 @@
 """M3 full-pipeline end-to-end (PRD §7/§8C/§8E): the extract -> ocr -> chunk
-stages over a real mixed PDF (fake Tesseract shim, PRD §1) and a real EPUB,
-the "originals unchanged" gate invariant, scratch cleanliness, and the
-worker-start reconciliation that rebuilds vanished chunk rows with their
-deterministic ids.
+-> embed -> publish stages over a real mixed PDF (fake Tesseract shim, PRD
+§1) and a real EPUB, the "originals unchanged" gate invariant, scratch
+cleanliness, and the worker-start reconciliation that rebuilds vanished chunk
+rows with their deterministic ids.
 """
 
 from __future__ import annotations
@@ -24,8 +24,10 @@ from library_rag.archive import archive_path_for
 from library_rag.catalog import Format
 from library_rag.config import Config
 from library_rag.db import Database
+from library_rag.embeddings import FakeEmbedder
 from library_rag.extraction import extract_pdf, load_unit_artifact
 from library_rag.identity import unit_id_for
+from library_rag.indexing import FakeQdrant
 from library_rag.jobs import Jobs
 from library_rag.scan import scan_roots
 from library_rag.worker import chunk_fingerprint_for_run, run_worker
@@ -62,8 +64,13 @@ def _drain_text_pdf(
     # nothing).
     scan_roots(state_db, base_config, Jobs(state_db))
     jobs = Jobs(state_db)
-    assert run_worker(state_db, base_config, once=True, poll_delay=0) == 2  # extract + chunk
-    assert jobs.counts() == {"succeeded": 2}
+    base_config.embedding.fake = True
+    q = FakeQdrant(base_config.embedding.dimensions)
+    emb = FakeEmbedder(base_config.embedding.dimensions)
+    assert (
+        run_worker(state_db, base_config, once=True, poll_delay=0, qdrant=q, embedder=emb) == 4
+    )  # extract + chunk + embed + publish
+    assert jobs.counts() == {"succeeded": 4}
     row = state_db.query_one("SELECT run_id FROM extraction_runs")
     assert row is not None
     return str(row["run_id"])
@@ -81,9 +88,14 @@ def test_mixed_pdf_pipeline(state_db: Database, base_config: Config, src: Path, 
     sha256 = str(rev["sha256"])
 
     jobs = Jobs(state_db)
-    # extract + 2 OCR jobs (pages 1 and 4) + chunk.
-    assert run_worker(state_db, base_config, once=True, poll_delay=0) == 4
-    assert jobs.counts() == {"succeeded": 4}
+    base_config.embedding.fake = True
+    q = FakeQdrant(base_config.embedding.dimensions)
+    emb = FakeEmbedder(base_config.embedding.dimensions)
+    # extract + 2 OCR jobs (pages 1 and 4) + chunk + embed + publish.
+    assert (
+        run_worker(state_db, base_config, once=True, poll_delay=0, qdrant=q, embedder=emb) == 6
+    )
+    assert jobs.counts() == {"succeeded": 6}
 
     run = state_db.query_one("SELECT * FROM extraction_runs")
     assert run is not None
@@ -157,13 +169,18 @@ def test_epub_pipeline(state_db: Database, base_config: Config, src: Path, tmp_p
     scan_roots(state_db, base_config, Jobs(state_db))
 
     jobs = Jobs(state_db)
-    assert run_worker(state_db, base_config, once=True, poll_delay=0) == 2  # extract + chunk
-    assert jobs.counts() == {"succeeded": 2}
+    base_config.embedding.fake = True
+    q = FakeQdrant(base_config.embedding.dimensions)
+    emb = FakeEmbedder(base_config.embedding.dimensions)
+    assert (
+        run_worker(state_db, base_config, once=True, poll_delay=0, qdrant=q, embedder=emb) == 4
+    )  # extract + chunk + embed + publish
+    assert jobs.counts() == {"succeeded": 4}
     stages = {
         r["stage"]: int(r["n"])
         for r in state_db.query("SELECT stage, COUNT(*) AS n FROM jobs GROUP BY stage")
     }
-    assert stages == {"extract": 1, "chunk": 1}  # no OCR stage for EPUB
+    assert stages == {"extract": 1, "chunk": 1, "embed": 1, "publish": 1}  # no OCR for EPUB
 
     row = state_db.query_one("SELECT run_id FROM extraction_runs")
     assert row is not None
@@ -203,13 +220,17 @@ def test_reconcile_requeues_chunk_for_jobless_run(
     assert run["state"] == "succeeded"
     assert run["chunk_fingerprint"] is None
 
-    # Worker-start reconciliation enqueues the missing chunk job.
+    # Worker-start reconciliation enqueues the missing chunk job; the drain
+    # then runs chunk -> embed -> publish (no extract job was ever enqueued:
+    # the extract above was M2-style manual).
     jobs = Jobs(state_db)
-    assert run_worker(state_db, base_config, once=True, poll_delay=0) == 1
-    assert jobs.counts() == {"succeeded": 1}
-    job = state_db.query_one("SELECT * FROM jobs")
+    base_config.embedding.fake = True
+    q = FakeQdrant(base_config.embedding.dimensions)
+    emb = FakeEmbedder(base_config.embedding.dimensions)
+    assert run_worker(state_db, base_config, once=True, poll_delay=0, qdrant=q, embedder=emb) == 3
+    assert jobs.counts() == {"succeeded": 3}
+    job = state_db.query_one("SELECT * FROM jobs WHERE stage = 'chunk'")
     assert job is not None
-    assert job["stage"] == "chunk"
     run_id = str(run["run_id"])
     assert len(_chunk_ids(state_db, run_id)) == 1
     after = state_db.query_one("SELECT chunk_fingerprint FROM extraction_runs WHERE run_id = ?", (run_id,))
@@ -232,10 +253,14 @@ def test_rebuild_after_lost_chunk_job_and_rows(
     )
 
     # Reconciliation re-enqueues (stored fp NULL != current) and rebuilds with
-    # the deterministic ids.
-    assert run_worker(state_db, base_config, once=True, poll_delay=0) == 1
+    # the deterministic ids. The embed/publish handoffs dedupe on the task
+    # key (same fingerprint), so only the one chunk job is processed.
+    base_config.embedding.fake = True
+    q = FakeQdrant(base_config.embedding.dimensions)
+    emb = FakeEmbedder(base_config.embedding.dimensions)
+    assert run_worker(state_db, base_config, once=True, poll_delay=0, qdrant=q, embedder=emb) == 1
     assert _chunk_ids(state_db, run_id) == before
-    assert Jobs(state_db).counts() == {"succeeded": 2}  # extract + the new chunk job
+    assert Jobs(state_db).counts() == {"succeeded": 4}  # extract + chunk + embed + publish
 
 
 def test_rebuild_when_chunks_vanished_but_fingerprint_current(

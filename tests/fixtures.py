@@ -13,6 +13,7 @@ page — good enough to test routing, coordinate mapping, retries, and resume.
 
 from __future__ import annotations
 
+import json
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
@@ -25,12 +26,24 @@ from library_rag.archive import ingest_source
 from library_rag.catalog import Format, RegistrationStatus, register_source
 from library_rag.config import Config
 from library_rag.db import Database
+from library_rag.embeddings import (
+    Embedder,
+    FakeEmbedder,
+    checkpoint_path,
+    embedding_sha,
+    tokenize,
+    write_checkpoint,
+)
 from library_rag.extraction import ExtractorCtx
 from library_rag.identity import normalize_path
-from library_rag.worker import build_ctx
+from library_rag.indexing import QdrantOps, publish_generation
+from library_rag.jobs import Jobs
+from library_rag.scan import scan_roots
+from library_rag.worker import build_ctx, run_worker
 
 __all__ = [
     "ctx_for_rev",
+    "ingest_and_publish",
     "ingest_and_register",
     "make_cropped_pdf",
     "make_encrypted_pdf",
@@ -40,6 +53,7 @@ __all__ = [
     "make_mixed_pdf",
     "make_pdf",
     "make_rotated_pdf",
+    "publish_handbuilt",
 ]
 
 # A4, the same geometry the smoke test used; text baseline kept clear of edges.
@@ -271,3 +285,141 @@ def make_fake_tesseract(path: Path) -> Path:
     path.write_text(_FAKE_TESSERACT, encoding="utf-8")
     path.chmod(0o755)
     return path
+
+
+# --- M4 pipeline drivers ----------------------------------------------------------
+
+
+def ingest_and_publish(
+    db: Database,
+    cfg: Config,
+    src: Path,
+    *,
+    qdrant: QdrantOps,
+    embedder: Embedder | None = None,
+) -> tuple[str, str]:
+    """Scan *src* into the queue and drain the pipeline to an active publication.
+
+    Drives the real scan + worker loop (the M4 end-to-end path); callers
+    configure ``cfg.embedding`` (e.g. ``fake = True``) beforehand. Returns
+    ``(rev_id, pub_id)`` and asserts exactly one publication is active.
+    """
+    scan_roots(db, cfg, Jobs(db))
+    run_worker(db, cfg, once=True, poll_delay=0, qdrant=qdrant, embedder=embedder)
+    pubs = db.query("SELECT pub_id, rev_id FROM publications WHERE state = 'active'")
+    assert len(pubs) == 1, f"expected exactly one active publication, got {pubs}"
+    return pubs[0]["rev_id"], pubs[0]["pub_id"]
+
+
+def publish_handbuilt(
+    db: Database,
+    cfg: Config,
+    qdrant: QdrantOps,
+    *,
+    doc_id: str,
+    rev_id: str,
+    run_id: str,
+    texts: list[str],
+    title: str | None = None,
+    pub_state: str = "active",
+    rev_active: int = 1,
+) -> tuple[str, str, list[str]]:
+    """Register one document/revision/chunk set *without* the pipeline, then publish it.
+
+    The retrieval tests need valid ``chunks`` rows plus real checkpoint
+    artifacts, not archives or extraction; this inserts the catalog/run/chunk
+    rows and writes genuine ``batch_*.bin`` checkpoints (the worker's exact
+    conventions), then runs the real :func:`publish_generation`. Returns
+    ``(gen_id, pub_id, chunk_ids)``.
+
+    *pub_state*/*rev_active* rewind the committed state afterwards, so a test
+    can simulate a crash between publication boundaries.
+    """
+    assert cfg.embedding.is_configured, "configure cfg.embedding before publish_handbuilt"
+    emb_sha = embedding_sha(cfg)
+    emb = FakeEmbedder(dimensions=cfg.embedding.dimensions)
+    ts = 0.0
+    db.execute(
+        "INSERT INTO documents (doc_id, anchor_sha256, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?)",
+        (doc_id, "a" * 64, ts, ts),
+    )
+    db.execute(
+        """
+        INSERT INTO source_revisions (
+            rev_id, doc_id, sha256, size_bytes, format, archive_relpath, first_path,
+            is_active, created_at
+        ) VALUES (?, ?, ?, ?, 'pdf', ?, ?, ?, ?)
+        """,
+        (rev_id, doc_id, "b" * 64, len("\n".join(texts)),
+         f"{rev_id}.pdf", f"/books/{rev_id}.pdf", rev_active, ts),
+    )
+    db.execute(
+        """
+        INSERT INTO extraction_runs (
+            run_id, rev_id, doc_id, parser_version, settings_sha, unit_count, state,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, 'pdf/1', 's1', ?, 'succeeded', ?, ?)
+        """,
+        (run_id, rev_id, doc_id, len(texts), ts, ts),
+    )
+    chunk_ids = [f"{run_id}:chunk-{i}" for i in range(len(texts))]
+    for position, (cid, text) in enumerate(zip(chunk_ids, texts, strict=True)):
+        db.execute(
+            """
+            INSERT INTO chunks (
+                chunk_id, run_id, rev_id, position, text, token_count, title, spans,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, '[]', ?)
+            """,
+            (cid, run_id, rev_id, position, text, len(tokenize(text)), title, ts),
+        )
+    batch_size = max(1, cfg.embedding.batch_size)
+    for i in range(0, len(texts), batch_size):
+        batch_index = i // batch_size
+        batch = texts[i : i + batch_size]
+        cids = chunk_ids[i : i + batch_size]
+        cp = checkpoint_path(cfg.paths.artifact_root, run_id, emb_sha, batch_index)
+        vector_sha = write_checkpoint(
+            cp,
+            emb.encode_documents(batch),
+            emb.dimensions,
+            {
+                "run_id": run_id,
+                "embedding_sha": emb_sha,
+                "model_revision": emb.model_revision,
+                "batch_index": batch_index,
+                "chunk_ids": cids,
+            },
+        )
+        db.execute(
+            """
+            INSERT INTO embedding_batches (
+                batch_id, run_id, model_revision, embedding_sha, batch_index,
+                chunk_ids, vector_sha256, artifact_relpath, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                f"{run_id}:{emb_sha}:{batch_index:05d}",
+                run_id,
+                emb.model_revision,
+                emb_sha,
+                batch_index,
+                json.dumps(cids),
+                vector_sha,
+                cp.relative_to(cfg.paths.artifact_root).as_posix(),
+                ts,
+            ),
+        )
+    publish_generation(db, cfg, qdrant, rev_id=rev_id, run_id=run_id, on_progress=lambda: None)
+    row = db.query_one(
+        "SELECT pub_id, gen_id FROM publications WHERE rev_id = ? AND state = 'active'",
+        (rev_id,),
+    )
+    assert row is not None, f"publish_generation did not activate a publication for {rev_id}"
+    if pub_state != "active":
+        db.execute(
+            "UPDATE publications SET state = ?, activated_at = NULL WHERE pub_id = ?",
+            (pub_state, row["pub_id"]),
+        )
+    return row["gen_id"], row["pub_id"], chunk_ids

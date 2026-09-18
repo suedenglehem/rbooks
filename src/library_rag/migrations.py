@@ -6,10 +6,10 @@ exactly once and recorded in ``schema_migrations``. M1 introduces the catalog
 lease/fencing columns), and a small ``meta`` table (used for the pause flag).
 
 M2 adds the pipeline slice it needs: ``scan_state`` (scan fast-check cache),
-``extraction_runs`` and ``source_units``. Later milestones add the remaining
-pipeline tables (chunks, embedding_batches, index_generations, publications)
-as further migrations — the point of the runner is that the schema *evolves*,
-so each milestone stays a minimal, independently-testable slice.
+``extraction_runs`` and ``source_units``; M3 adds ``chunks``; M4 adds
+``embedding_batches``, ``index_generations``, ``sparse_corpus_stats`` and
+``publications``. The point of the runner is that the schema *evolves*, so each
+milestone stays a minimal, independently-testable slice.
 """
 
 from __future__ import annotations
@@ -202,10 +202,89 @@ _MIGRATION_0003: tuple[str, ...] = (
 )
 
 
+# M4: embeddings, index generations, and publications (PRD §6/§8F).
+_MIGRATION_0004: tuple[str, ...] = (
+    # Checkpointed dense-vector batches: non-pickle numeric file + chunk manifest
+    # (PRD §5). Keyed on (run, encoding, batch index) so a replay reuses the
+    # file instead of re-embedding, and a model/encoding change mints new keys.
+    """
+    CREATE TABLE embedding_batches (
+        batch_id         TEXT PRIMARY KEY,
+        run_id           TEXT NOT NULL REFERENCES extraction_runs(run_id),
+        model_revision   TEXT NOT NULL,
+        embedding_sha    TEXT NOT NULL,
+        batch_index      INTEGER NOT NULL,
+        chunk_ids        TEXT NOT NULL,
+        vector_sha256    TEXT NOT NULL,
+        artifact_relpath TEXT NOT NULL,
+        created_at       REAL NOT NULL,
+        UNIQUE (run_id, embedding_sha, batch_index)
+    )
+    """,
+    "CREATE INDEX idx_emb_batches_run ON embedding_batches(run_id)",
+    # One row per (run, encoding, corpus-statistics epoch) point set. Carries the
+    # persisted model/dtype/dimension/normalization settings (PRD §8F).
+    """
+    CREATE TABLE index_generations (
+        gen_id           TEXT PRIMARY KEY,
+        run_id           TEXT NOT NULL REFERENCES extraction_runs(run_id),
+        rev_id           TEXT NOT NULL REFERENCES source_revisions(rev_id),
+        model_revision   TEXT NOT NULL,
+        embedding_sha    TEXT NOT NULL,
+        sparse_stats_sha TEXT NOT NULL,
+        dimensions       INTEGER NOT NULL,
+        dtype            TEXT NOT NULL,
+        normalized       INTEGER NOT NULL,
+        point_count      INTEGER,
+        state            TEXT NOT NULL CHECK (state IN ('ready', 'abandoned')),
+        created_at       REAL NOT NULL,
+        updated_at       REAL NOT NULL,
+        UNIQUE (run_id, embedding_sha, sparse_stats_sha)
+    )
+    """,
+    "CREATE INDEX idx_gen_rev ON index_generations(rev_id)",
+    # Corpus-wide BM25 statistics, one row per statistics epoch (PRD §8F IDF).
+    # The query path loads the stats of the generation epoch it searches; the
+    # canonical df map is stored so any process can re-encode without state.
+    """
+    CREATE TABLE sparse_corpus_stats (
+        stats_sha   TEXT PRIMARY KEY,
+        doc_count   INTEGER NOT NULL,
+        avg_doc_len REAL NOT NULL,
+        df_json     TEXT NOT NULL,
+        created_at  REAL NOT NULL
+    )
+    """,
+    # A publication makes one generation the visible evidence for its revision.
+    # At most one row per rev is ever 'active' (enforced in the switch
+    # transaction); 'staged' means points are upserted inactive and verified,
+    # awaiting the activate/reconcile step. The SQLite row, not the Qdrant
+    # flags, is the source of truth (PRD §8F).
+    """
+    CREATE TABLE publications (
+        pub_id          TEXT PRIMARY KEY,
+        rev_id          TEXT NOT NULL REFERENCES source_revisions(rev_id),
+        doc_id          TEXT NOT NULL REFERENCES documents(doc_id),
+        gen_id          TEXT NOT NULL REFERENCES index_generations(gen_id),
+        run_id          TEXT NOT NULL,
+        expected_points INTEGER NOT NULL,
+        state           TEXT NOT NULL CHECK (state IN ('staged', 'active', 'superseded')),
+        created_at      REAL NOT NULL,
+        activated_at    REAL,
+        UNIQUE (rev_id, gen_id)
+    )
+    """,
+    "CREATE INDEX idx_pubs_rev ON publications(rev_id)",
+    "CREATE INDEX idx_pubs_doc ON publications(doc_id)",
+    "CREATE INDEX idx_pubs_state ON publications(state)",
+)
+
+
 MIGRATIONS: list[Migration] = [
     Migration(1, "catalog_and_jobs", _MIGRATION_0001),
     Migration(2, "pipeline_tables", _MIGRATION_0002),
     Migration(3, "ocr_and_chunks", _MIGRATION_0003),
+    Migration(4, "embeddings_and_publication", _MIGRATION_0004),
 ]
 
 

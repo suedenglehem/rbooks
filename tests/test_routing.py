@@ -16,6 +16,7 @@ import pytest
 from fixtures import make_fake_tesseract, make_mixed_pdf
 from library_rag.config import Config, OcrSettings
 from library_rag.db import Database
+from library_rag.embeddings import FakeEmbedder
 from library_rag.extraction.pdf import assess_page, extract_pdf
 from library_rag.extraction.routing import (
     ROUTE_OCR,
@@ -24,6 +25,7 @@ from library_rag.extraction.routing import (
     image_area_ratio,
     route_page,
 )
+from library_rag.indexing import FakeQdrant
 from library_rag.jobs import Jobs
 from library_rag.scan import scan_roots
 from library_rag.worker import build_ctx, run_worker
@@ -100,9 +102,12 @@ def test_extract_assigns_routes_and_ocr_states(
     jobs = Jobs(state_db)
     scan_roots(state_db, base_config, jobs)
 
-    # extract + OCR of the 2 scanned pages + chunk.
-    assert run_worker(state_db, base_config, once=True, poll_delay=0) == 4
-    assert jobs.counts() == {"succeeded": 4}
+    base_config.embedding.fake = True
+    q = FakeQdrant(base_config.embedding.dimensions)
+    emb = FakeEmbedder(base_config.embedding.dimensions)
+    # extract + OCR of the 2 scanned pages + chunk + embed + publish.
+    assert run_worker(state_db, base_config, once=True, poll_delay=0, qdrant=q, embedder=emb) == 6
+    assert jobs.counts() == {"succeeded": 6}
 
     rows = state_db.query("SELECT route, ocr_state FROM source_units ORDER BY position")
     assert [(r["route"], r["ocr_state"]) for r in rows] == [
@@ -125,11 +130,14 @@ def test_reextract_is_a_job_noop(
     make_mixed_pdf(src / "m.pdf", ["text", "scanned", "blank", "sparse", "sparse_image"])
     jobs = Jobs(state_db)
     scan_roots(state_db, base_config, jobs)
-    run_worker(state_db, base_config, once=True, poll_delay=0)
+    base_config.embedding.fake = True
+    q = FakeQdrant(base_config.embedding.dimensions)
+    emb = FakeEmbedder(base_config.embedding.dimensions)
+    run_worker(state_db, base_config, once=True, poll_delay=0, qdrant=q, embedder=emb)
     row = state_db.query_one("SELECT COUNT(*) AS n FROM jobs")
     assert row is not None
     n_jobs = int(row["n"])
-    assert n_jobs == 4
+    assert n_jobs == 6
 
     # Re-run extraction on the same (source, parser, settings) key: the run
     # already succeeded, so no units are re-inserted and the idempotent

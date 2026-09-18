@@ -31,14 +31,20 @@ __all__ = [
     "NAMESPACE_CHUNK",
     "NAMESPACE_DOC",
     "NAMESPACE_EXTRACT",
+    "NAMESPACE_GEN",
+    "NAMESPACE_POINT",
     "NAMESPACE_REV",
     "NAMESPACE_TASK",
     "NAMESPACE_UNIT",
     "chunk_key",
     "document_id",
+    "embedding_key",
     "extraction_key",
+    "generation_id",
     "make_task_key",
     "normalize_path",
+    "point_id",
+    "publication_id",
     "revision_id",
     "unit_id_for",
     "units_fingerprint",
@@ -52,6 +58,8 @@ NAMESPACE_TASK = uuid.UUID("8f3e2a10-0000-4000-8000-0000000000d3")
 NAMESPACE_EXTRACT = uuid.UUID("8f3e2a10-0000-4000-8000-0000000000d4")
 NAMESPACE_UNIT = uuid.UUID("8f3e2a10-0000-4000-8000-0000000000d5")
 NAMESPACE_CHUNK = uuid.UUID("8f3e2a10-0000-4000-8000-0000000000d6")
+NAMESPACE_GEN = uuid.UUID("8f3e2a10-0000-4000-8000-0000000000d7")
+NAMESPACE_POINT = uuid.UUID("8f3e2a10-0000-4000-8000-0000000000d8")
 
 
 def normalize_path(path: str | os.PathLike[str]) -> str:
@@ -149,3 +157,53 @@ def make_task_key(
     idempotent effects, PRD §7).
     """
     return str(uuid.uuid5(NAMESPACE_TASK, f"{stage}:{input_id}:{input_version}:{range_spec}"))
+
+
+def embedding_key(run_id: str, model_revision: str, settings_sha: str, chunk_id: str) -> str:
+    """Deterministic embedding identity for one chunk (PRD §6).
+
+    Hashes the chunk key, the model revision, and the canonical encoding
+    configuration. Changing the embedding model never invalidates extraction
+    or chunking; changing the chunk (new run/chunker) or the encoding config
+    yields new keys, so checkpoints never clobber each other.
+    """
+    return str(
+        uuid.uuid5(NAMESPACE_EXTRACT, f"embed:{run_id}:{model_revision}:{settings_sha}:{chunk_id}")
+    )
+
+
+def generation_id(run_id: str, embedding_sha: str, sparse_stats_sha: str) -> str:
+    """Deterministic index-generation UUID.
+
+    A generation is the set of Qdrant points published for one extraction run
+    under one encoding and one corpus-wide sparse-statistics epoch. The dense
+    side depends only on *embedding_sha* (model revision + encoding config);
+    the sparse side on *sparse_stats_sha* (BM25 corpus statistics, PRD §8F).
+    Adding or re-chunking a book changes the corpus statistics and therefore
+    the generation of *every* run, which is what forces the cheap re-upsert
+    (dense vectors are read back from checkpoints, never re-embedded) that
+    keeps BM25 IDF correct as the corpus grows.
+    """
+    return str(uuid.uuid5(NAMESPACE_GEN, f"gen:{run_id}:{embedding_sha}:{sparse_stats_sha}"))
+
+
+def point_id(chunk_id: str, gen_id: str) -> str:
+    """Deterministic Qdrant point ID (UUID format, as the server requires).
+
+    Includes the generation on purpose: staging a new generation mints fresh
+    point IDs, so activating replacement points can never overwrite (and thus
+    destroy) the still-active points of the generation being replaced.
+    Re-upserting the *same* generation hits the same IDs and is a pure
+    idempotent overwrite (M4 gate).
+    """
+    return str(uuid.uuid5(NAMESPACE_POINT, f"point:{chunk_id}:{gen_id}"))
+
+
+def publication_id(rev_id: str, gen_id: str) -> str:
+    """Deterministic publication UUID for a generation of a revision.
+
+    A publication is the act of making one generation's points the visible
+    evidence for its revision. Deterministic, so replaying a publish job (or
+    reconciling after a crash) resolves to the same row, never a duplicate.
+    """
+    return str(uuid.uuid5(NAMESPACE_GEN, f"pub:{rev_id}:{gen_id}"))

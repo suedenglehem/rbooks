@@ -317,6 +317,120 @@ class ExtractionSettings(BaseModel):
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+class EmbeddingSettings(BaseModel):
+    """Embedding model + encoding settings (PRD §6/§8F).
+
+    ``settings_sha()`` is the "encoding configuration" of the embedding key:
+    any change here (model revision, dimensions, dtype, normalization, batch
+    policy) produces a new embedding key and therefore fresh checkpoints —
+    while extraction and chunking stay valid.
+
+    The deterministic fake embedder is for tests only: ``fake`` defaults to
+    False and production configs must never set it; when it is set, the
+    resolved model revision is the explicit label ``fake-v1`` so any artifact
+    it touches is identifiable as non-real.
+    """
+
+    fake: bool = False
+    # Required unless ``fake``: the exact model + revision, e.g.
+    # "bge-m3@561cab6a4299" — never a bare family name.
+    model_revision: str | None = None
+    # The server-side "model" field for /v1/embeddings (llama.cpp usually accepts
+    # the loaded model's name/alias). Defaults to model_revision. Distinct
+    # servers/models produce distinct values, so it is part of the embedding key.
+    model_name: str | None = None
+    dimensions: int = 1024
+    dtype: str = "float32"
+    # L2-normalize vectors (BGE-M3 expects normalized cosine inputs).
+    normalize: bool = True
+    # Bounded batch for encoding; OOM policy halves it (PRD §8F).
+    batch_size: int = 8
+    oom_max_halvings: int = 4
+
+    def settings_sha(self) -> str:
+        canonical = json.dumps(self.model_dump(mode="json"), sort_keys=True)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @model_validator(mode="after")
+    def _check_model(self) -> EmbeddingSettings:
+        if self.dimensions <= 0 or self.batch_size <= 0:
+            raise ConfigError("embedding dimensions and batch_size must be positive")
+        if self.oom_max_halvings < 0:
+            raise ConfigError("embedding.oom_max_halvings must be >= 0")
+        return self
+
+    @property
+    def is_configured(self) -> bool:
+        """True when an embedder can be constructed.
+
+        Staged rollouts are a first-class case: an operator runs scan/extract/
+        chunk before the embedding model is installed, so the *config* stays
+        valid with no model. What is forbidden by default is the fake embedder
+        (``fake`` defaults to False); commands that need a model (search, the
+        embed stage) raise an explicit :class:`ConfigError` when this is False.
+        """
+        return self.fake or self.model_revision is not None
+
+    @property
+    def effective_revision(self) -> str:
+        """The revision persisted on checkpoints/generations (labeled for fake).
+
+        Raises :class:`ConfigError` when no real model is configured — callers
+        must check :attr:`is_configured` before reaching for this.
+        """
+        if self.fake:
+            return "fake-v1"
+        if self.model_revision is None:
+            raise ConfigError(
+                "embedding.model_revision is not set; configure the embedding "
+                "model (or embedding.fake: true in tests only) before embedding"
+            )
+        return self.model_revision
+
+
+class Bm25Settings(BaseModel):
+    """Client-side BM25 parameters for the sparse vectors (PRD §8F/§9)."""
+
+    k1: float = 1.5
+    b: float = 0.75
+
+    def settings_sha(self) -> str:
+        canonical = json.dumps(self.model_dump(mode="json"), sort_keys=True)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+class RetrievalSettings(BaseModel):
+    """Search-shape settings (PRD §9). Every count is configurable there."""
+
+    dense_top: int = 60
+    sparse_top: int = 60
+    rrf_k: int = 60
+    # Rerank up to this many fused candidates.
+    rerank_max: int = 80
+    # Select 8-12 passages under the token budget.
+    min_passages: int = 8
+    max_passages: int = 12
+    passage_token_budget: int = 6_000
+    # Diversify across books by default (ignored when a book filter is given).
+    max_per_book: int = 4
+    # Postvalidation top-up: when validation drops hits, refetch with a larger
+    # limit, at most this many rounds and never above the cap (PRD §9).
+    topup_max_rounds: int = 3
+    topup_limit_cap: int = 240
+    bm25: Bm25Settings = Field(default_factory=Bm25Settings)
+
+    @model_validator(mode="after")
+    def _check_counts(self) -> RetrievalSettings:
+        for name in ("dense_top", "sparse_top", "rerank_max", "min_passages", "max_passages"):
+            if getattr(self, name) <= 0:
+                raise ConfigError(f"retrieval.{name} must be positive")
+        if self.min_passages > self.max_passages:
+            raise ConfigError("retrieval.min_passages must be <= max_passages")
+        if self.topup_limit_cap < max(self.dense_top, self.sparse_top):
+            raise ConfigError("retrieval.topup_limit_cap must cover the base limits")
+        return self
+
+
 class Config(BaseModel):
     """Top-level application configuration."""
 
@@ -325,6 +439,8 @@ class Config(BaseModel):
     extraction: ExtractionSettings = Field(default_factory=ExtractionSettings)
     chunking: ChunkingSettings = Field(default_factory=ChunkingSettings)
     scan: ScanSettings = Field(default_factory=ScanSettings)
+    embedding: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
+    retrieval: RetrievalSettings = Field(default_factory=RetrievalSettings)
 
     # Optional sentinel files that must exist to prove each mount is present.
     # Mapping of a human label to a file path that must exist. An empty value

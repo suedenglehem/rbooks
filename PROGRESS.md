@@ -341,3 +341,158 @@ Gate cases (all passing, run this session):
 - Begin M4: embeddings + Qdrant indexing (model wiring behind the service
   config, upsert chunks by deterministic id, delete-on-revision, and the
   evaluate harness per PRD §9).
+
+## M4 — Index and search
+
+**Status: gate passed.** PRD §12 M4 gate, verbatim: "crash at each
+publication boundary never returns uncommitted or obsolete evidence;
+re-upsert is idempotent; search works after restart; sparse degraded mode
+works." All four clauses verified by running the named tests this session.
+
+### Delivered
+- `embeddings.py` — `Embedder` protocol (`encode_documents` /
+  `encode_query`); `FakeEmbedder` (deterministic, hash-derived, revision
+  label `fake-v1` — allowed for tests, refused by `make_embedder` when
+  production config is otherwise active); `LlamaCppEmbedder` (real model
+  adapter, gated behind `EmbeddingSettings.model_revision`); `embedding_sha`
+  (canonical encoding key from model + dims + dtype + normalize + settings);
+  per-batch durable checkpoints (`write_checkpoint` / `read_checkpoint`,
+  magic `LBEM`, payload-hash verification → corrupt checkpoint re-encodes);
+  `encode_batch_oom` (bounded halving loop, `oom_max_halvings`); BM25 side —
+  `tokenize` / `term_id` / `bm25_weights` (client-side sparse vectors) and
+  `SparseStats` + `compute_sparse_stats` / `load_sparse_stats` /
+  `stats_sha` / `stats_row_upsert` (corpus statistics per statistics epoch,
+  keyed by sha); error taxonomy `EmbeddingError` (non-transient),
+  `ModelUnavailableError`, `EmbeddingOOMError`, `CheckpointCorruptError`.
+- `indexing.py` — `QdrantOps` protocol + `RealQdrantOps` (thin qdrant-client
+  wrapper; collection `library_chunks`) and `FakeQdrant` (in-memory: idempotent
+  upsert by point id, `set_active` merges *only* the `active` flag, dense
+  search ordered `(-score, point_id)`, sparse search skips zero-overlap,
+  unfiltered delete rejected); `FieldCond` / `IndexFilter` (pure-Python
+  `matches` evaluator that agrees with the `to_qdrant()` shape for eq/ne/in);
+  `build_point` payload contract (ids, gen, pub, model revision, embedding
+  sha, stats sha — deliberately no raw text, no `active`); `point_id` =
+  `chunk_id:gen_id`; `publish_generation` (deterministic pub/gen ids,
+  transaction boundaries B1 staged row → B2 upsert + flag points → B3 flag new
+  active / clear superseded → B4 promote + supersede; full point-set
+  verification *before* B1; returns `"published"` / `"noop"`);
+  `reconcile_publications` (promote staged publication whose points are
+  complete and whose job is open; delete orphaned staged; leave incomplete
+  alone); publish lock with TTL (`acquire_publish_lock` /
+  `release_publish_lock`); `visible_pub_ids` (active publications whose
+  revision is active — the SQLite source of truth for search).
+- `retrieval.py` — `search(db, cfg, qdrant, embedder, query, *, doc_id, rev_id,
+  reranker)`: blank-query rejection before any IO; ping guard →
+  `IndexUnavailableError` (never fabricates results); dense + per-epoch BM25
+  sparse retrieval fused by RRF (`rrf_k`); **SQLite postvalidation**
+  (`_validate`: chunk row must exist, rev_id must match, pub must be visible,
+  revision must be active — the point payload is treated as a cache, identity
+  is re-materialized from SQLite); degraded sparse-only mode with explicit
+  `degraded_reason` when no embedder is configured or query inference raises
+  `ModelUnavailableError`; per-book diversification (`min/max_passages`,
+  top-up rounds, disabled by doc/rev filters); `Reranker` protocol +
+  `PassthroughReranker`; `SearchResult` with the exact counts contract
+  {dense, sparse, fused, validated, postvalidation_removed, reranked,
+  selected, topup_rounds}.
+- `worker.py` — new stages in the pipeline: `embed` (checkpoint resume,
+  OOM-halving loop, handoff: version = `emb_sha:stats_sha` → enqueues publish,
+  deduped by task key) and `publish` (ping → retryable `qdrant_unavailable`;
+  `publish_generation`; no-op manifest for inactive revisions). Failure
+  taxonomy: `embedding_oom` / `model_unavailable` retryable, `embedding_error`
+  permanent, `embedding_not_configured` permanent (a full drain requires an
+  embedder; no fabricated publish). Worker-start `_reconcile_index`: lost
+  chunk jobs, publication gaps, and statistics-epoch convergence (a new book's
+  stats epoch republishes all active publications against it).
+- `identity.py` — `point_id` + publish/embed task keys; `migrations.py` — M4
+  tables `embedding_batches`, `index_generations`, `sparse_corpus_stats`,
+  `publications` (staged → active → superseded lifecycle, one active
+  publication per revision); `config.py` — `EmbeddingSettings`
+  (model_revision/fake, dimensions, dtype, normalize, batch_size,
+  oom_max_halvings, into `settings_sha()`), `Bm25Settings` (k1, b),
+  `RetrievalSettings` (dense_top, sparse_top, rrf_k, rerank_max,
+  min/max_passages); `cli.py` — `search` command (clean EXIT_ERROR +
+  diagnostic when the index is unreachable; human-readable passages).
+- `tests/fixtures.py` — `ingest_and_publish` (full scan→worker drain) and
+  `publish_handbuilt` (hand-built chunk rows + points for publication-state
+  tests). New test files: `test_embeddings.py`, `test_indexing.py`,
+  `test_publication_crash.py`, `test_worker_m4.py`, `test_retrieval.py`,
+  `test_cli_search.py` (88 tests total). M3-era pipeline tests
+  (`test_worker.py`, `test_routing.py`, `test_ocr.py`,
+  `test_pipeline_m3.py`) adapted to the 4-stage pipeline: they inject
+  `FakeEmbedder` + `FakeQdrant` and assert extract/chunk/embed/publish counts
+  (no-OCR drain = 4 jobs; +2 OCR = 6; +3 = 7; +5 = 9).
+
+### Test commands + results
+| Command | Result |
+| ------- | ------ |
+| `uv run ruff check .` | All checks passed! |
+| `uv run mypy` | Success: no issues found in 58 source files |
+| `uv run pytest` | 236 passed, 2 warnings in 28.15s |
+| `uv run pytest tests/test_embeddings.py tests/test_indexing.py tests/test_publication_crash.py tests/test_worker_m4.py tests/test_retrieval.py tests/test_cli_search.py` | 88 passed in 10.24s |
+
+(The 2 warnings are a third-party starlette testclient/anyio
+DeprecationWarning, not from this codebase. 88 = 236 − 148, i.e. every new
+test is in the six M4 files.)
+
+Gate cases (all passing, run this session):
+- crash at each publication boundary never returns uncommitted or obsolete
+  evidence → `test_publication_crash.py::test_crash_at_boundary_never_returns_
+  bad_evidence[pre-b1-0 | b1-0 | b2-1 | b3-1 | b4-0]`: a two-revision book,
+  crashed at every transaction boundary (trailing number = promotions
+  reconcile performs: 0, 0, 1, 1, 0). Pre-reconcile search shows only the
+  evidence the boundary allows; after `reconcile_publications` the surviving
+  evidence is either fully v1 (pre-b1/b1: the staged v2 publication is deleted
+  as an orphan) or fully v2 (b2–b4) — never a mix, never v2 before promotion.
+  Plus `test_revision_replacement_supersedes_old_evidence` (an exact-term
+  query cannot resurrect superseded points) and
+  `test_publish_noop_for_inactive_revision`.
+- re-upsert is idempotent → `test_indexing.py::test_fake_qdrant_upsert_is_
+  idempotent` and `test_publish_generation_publishes_and_is_idempotent`
+  (direct re-run of a generation returns `"noop"`; deleting the publication
+  row and republishing recreates the *same* deterministic pub id with the same
+  active point set).
+- search works after restart → `test_publication_crash.py::
+  test_search_works_after_restart`: fresh `Database.connect` on the same file,
+  worker drain is a no-op, identical passages.
+- sparse degraded mode works → `test_retrieval.py::
+  test_degraded_without_embedder_is_sparse_only` (no embedder configured →
+  `degraded=True`, reason "embedding model not configured; sparse-only
+  search", sparse ranks only) and
+  `test_degraded_when_query_inference_is_down` (embedder up but query
+  inference raises → degraded, still returns passages).
+
+### Notes / bugs found
+- **`_load_run_vectors` id mismatch (source bug, fixed in `indexing.py`):**
+  the post-upsert verification compared Qdrant *point* ids against *chunk*
+  ids — point ids are `chunk_id:gen_id`, so any run with ≥1 chunk would have
+  failed verification. The call site now passes the run's chunk ids and the
+  parameter is `expected_chunk_ids`.
+- **`retrieval.py::_validate` missing column (source bug, fixed):** the
+  postvalidation SELECT took `doc_id` from the `chunks` table, which has no
+  such column → `sqlite3.OperationalError` on every search. Fixed by
+  `JOIN source_revisions r ON r.rev_id = c.rev_id`.
+- **Evidence-gap semantics at pre-b1/b1 (by design, PRD §12):** after
+  v2 registration the old revision is `is_active=0`, so when the staged v2
+  publication is deleted as an orphan the document has *no* active
+  publication — search returns an evidence gap rather than the obsolete v1.
+  A gap is the only safe outcome; obsolete or uncommitted evidence is never
+  served. Recovery happens when the publish job is retried (reconcile path).
+- M3-test adaptations (product behavior correct, expectations pinned to
+  3-stage M3 pipeline): every full-drain pipeline test now injects
+  `FakeEmbedder` + `FakeQdrant`; a full no-OCR drain completes 4 jobs
+  (extract/chunk/embed/publish). `test_worker_heartbeats_between_units`
+  corrected to 4 beats for a 25-page book — publish heartbeats once
+  (`worker.py` publish `on_progress`); chunk is pure in-memory work and never
+  heartbeats. Beats = extract ×2 (pages 10/20) + embed ×1 (per batch) +
+  publish ×1.
+- The `qdrant-client` stubs type `Filter` fields as wide unions; the filter-
+  shape test in `test_indexing.py` inspects the concrete shape via `Any`
+  (commented in-test).
+
+### Next unfinished task
+- Begin M5 (PRD §12 "Cited answering and UI"): evidence manifests, local LLM
+  adapter, bounded timeouts, citation validation, answer persistence, and the
+  research UI; gate: unknown evidence IDs rejected; saved citations survive
+  reindexing; unsupported/no-evidence cases abstain; search continues if the
+  model server stops. The `evaluate` CLI command (PRD §9/§13) is also still
+  unimplemented and belongs with the M5 evaluation work.
