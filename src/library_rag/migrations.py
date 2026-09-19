@@ -8,7 +8,8 @@ lease/fencing columns), and a small ``meta`` table (used for the pause flag).
 M2 adds the pipeline slice it needs: ``scan_state`` (scan fast-check cache),
 ``extraction_runs`` and ``source_units``; M3 adds ``chunks``; M4 adds
 ``embedding_batches``, ``index_generations``, ``sparse_corpus_stats`` and
-``publications``. The point of the runner is that the schema *evolves*, so each
+``publications``; M5 adds ``answers`` (cited answers with frozen evidence
+manifests). The point of the runner is that the schema *evolves*, so each
 milestone stays a minimal, independently-testable slice.
 """
 
@@ -280,11 +281,43 @@ _MIGRATION_0004: tuple[str, ...] = (
 )
 
 
+# M5 adds the answers table. The load-bearing column is ``evidence_manifest``:
+# a frozen snapshot (schema 1) of every cited passage — text, unit locations,
+# page/section geometry, quality flags — captured at answer time. Citations
+# resolve from this snapshot, so re-chunking or re-publishing the library
+# cannot change what a saved answer points at (PRD §12).
+_MIGRATION_0005: tuple[str, ...] = (
+    """
+    CREATE TABLE answers (
+        answer_id         TEXT PRIMARY KEY,
+        created_at        REAL NOT NULL,
+        query             TEXT NOT NULL,
+        doc_id            TEXT,
+        rev_id            TEXT,
+        status            TEXT NOT NULL CHECK (status IN ('answered', 'abstained', 'failed')),
+        model_revision    TEXT,
+        prompt_version    TEXT NOT NULL,
+        evidence_manifest TEXT NOT NULL,
+        answer_text       TEXT,
+        abstain_reason    TEXT,
+        failure_reason    TEXT,
+        citations         TEXT NOT NULL,
+        search_counts     TEXT,
+        retrieval_ms      REAL,
+        model_ms          REAL
+    )
+    """,
+    "CREATE INDEX idx_answers_created ON answers(created_at DESC)",
+    "CREATE INDEX idx_answers_status ON answers(status)",
+)
+
+
 MIGRATIONS: list[Migration] = [
     Migration(1, "catalog_and_jobs", _MIGRATION_0001),
     Migration(2, "pipeline_tables", _MIGRATION_0002),
     Migration(3, "ocr_and_chunks", _MIGRATION_0003),
     Migration(4, "embeddings_and_publication", _MIGRATION_0004),
+    Migration(5, "answers", _MIGRATION_0005),
 ]
 
 

@@ -24,14 +24,36 @@ paths:
 services:
   qdrant_host: 127.0.0.1
   qdrant_port: 6333
-  # llama.cpp answer-model server (OpenAI-compatible). Operator-configured.
+  # llama.cpp answer-model server (OpenAI-compatible /v1/chat/completions).
+  # One model per server, so the embedding model has its own endpoint.
   answer_host: 127.0.0.1
   answer_port: 8080
+  # llama.cpp embedding-model server (OpenAI-compatible /v1/embeddings).
+  embed_host: 127.0.0.1
+  embed_port: 8081
   # FastAPI app bind. Keep loopback unless the operator opts into LAN exposure
   # (which then requires api_token).
   app_host: 127.0.0.1
   app_port: 8000
   # api_token: "..."   # or set LIBRARY_RAG_API_TOKEN
+
+# Embedding model (PRD §6/§8F). The exact model + revision — never a bare
+# family name. Changing this value changes the embedding key and forces fresh
+# checkpoints, but not re-extraction. embedding.fake is for tests only.
+embedding:
+  model_revision: bge-m3@561cab6a4299   # e.g. the exact GGUF + hash you loaded
+  # model_name: bge-m3                  # server-side "model" field, optional
+  dimensions: 1024
+
+# Answer model for cited answering (PRD §12). The exact model + revision.
+# A server that is down at answer time fails the answer explicitly; search
+# keeps working. answer.fake is for tests only.
+answer:
+  model_revision: qwen2.5-7b-instruct@<sha>
+  # model_name: qwen2.5-7b-instruct     # server-side "model" field, optional
+  max_tokens: 1024
+  temperature: 0.1
+  timeout_seconds: 60
 
 # Sentinel files that must exist to prove each mount is present. A missing mount
 # must never cause scans or writes to an empty fallback directory.

@@ -61,6 +61,7 @@ __all__ = [
     "RetrievalError",
     "SearchResult",
     "search",
+    "search_candidates",
 ]
 
 
@@ -88,7 +89,9 @@ class Passage:
     pub_id: str
     title: str | None
     text: str
-    spans: tuple[list[int], ...]
+    # Chunk spans as stored in ``chunks.spans``: one dict per source-interval
+    # ({"unit_id", "source_start", "source_end", "bbox"} — see worker._spans_json).
+    spans: tuple[dict[str, object], ...]
     score: float
     dense_rank: int | None
     sparse_rank: int | None
@@ -261,6 +264,78 @@ def search(
         topup_rounds=topup_rounds,
     )
     return SearchResult(query, degraded, degraded_reason, tuple(passages), counts)
+
+
+def search_candidates(
+    db: Database,
+    cfg: Config,
+    qdrant: QdrantOps,
+    embedder: Embedder | None,
+    query: str,
+    *,
+    limit: int = 20,
+    doc_id: str | None = None,
+    rev_id: str | None = None,
+) -> tuple[list[Passage], dict[str, int]]:
+    """Fused top-*limit* candidates, SQLite-validated (for evaluation).
+
+    Unlike :func:`search` there is no rerank, no token-budget selection, and no
+    diversification cap — the eval harness needs the raw ranked candidate list
+    (PRD §13 recall@K). A single fused fetch is used (no top-up loop), so the
+    returned list is exactly the fused ranking truncated to *limit* survivors.
+    """
+    if not query.strip():
+        raise ValueError("query must be non-empty")
+    if not qdrant.ping():
+        raise IndexUnavailableError(
+            "Qdrant is unreachable; search is unavailable (refusing to fabricate results)"
+        )
+    degraded = False
+    query_vector: list[float] | None = None
+    if embedder is None:
+        degraded = True
+    else:
+        try:
+            query_vector = embedder.encode_query(query)
+        except ModelUnavailableError:
+            degraded = True
+
+    visible = visible_pub_ids(db)
+    extra_conds: tuple[FieldCond, ...] = ()
+    if doc_id is not None:
+        extra_conds += (FieldCond("doc_id", "eq", doc_id),)
+    if rev_id is not None:
+        extra_conds += (FieldCond("rev_id", "eq", rev_id),)
+
+    if not visible or not qdrant.collection_exists():
+        return [], _empty_counts()
+    epochs = _stats_epochs(db)
+    if not epochs:
+        return [], _empty_counts()
+
+    candidates, dense_count, sparse_count = _fuse(
+        db,
+        cfg,
+        qdrant,
+        query,
+        visible=visible,
+        extra_conds=extra_conds,
+        epochs=epochs,
+        query_vector=query_vector,
+        limit=limit,
+    )
+    valid = _validate(db, candidates, visible)
+    counts = _empty_counts()
+    counts.update(
+        dense=dense_count,
+        sparse=sparse_count,
+        fused=len(candidates),
+        validated=len(valid),
+        postvalidation_removed=len(candidates) - len(valid),
+    )
+    if degraded:
+        counts["degraded"] = 1
+    return valid[:limit], counts
 
 
 # --- Fetch and fusion ----------------------------------------------------------

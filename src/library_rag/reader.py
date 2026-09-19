@@ -95,7 +95,8 @@ def create_app(cfg: Config, db: Database) -> FastAPI:
             raise HTTPException(409, "revision not extracted yet")
         units = db.query(
             """
-            SELECT position, kind, ref, char_count, quality_flags, route, ocr_state
+            SELECT unit_id, position, kind, ref, char_count, quality_flags,
+                   route, ocr_state
             FROM source_units WHERE run_id = ? ORDER BY position
             """,
             (run["run_id"],),

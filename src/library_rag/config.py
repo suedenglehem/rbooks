@@ -144,16 +144,20 @@ class Services(BaseModel):
 
     qdrant_host: str = "127.0.0.1"
     qdrant_port: int = 6333
-    # llama.cpp answer-model server (OpenAI-compatible).
+    # llama.cpp answer-model server (OpenAI-compatible /v1/chat/completions).
+    # One model per server, so the embedding model has its own endpoint.
     answer_host: str = "127.0.0.1"
     answer_port: int = 8080
+    # llama.cpp embedding-model server (OpenAI-compatible /v1/embeddings).
+    embed_host: str = "127.0.0.1"
+    embed_port: int = 8081
     # FastAPI app bind address. Must stay loopback unless the operator opts in.
     app_host: str = "127.0.0.1"
     app_port: int = 8000
     # Optional bearer token required before any non-loopback exposure.
     api_token: str | None = None
 
-    @field_validator("app_host", "qdrant_host", "answer_host")
+    @field_validator("app_host", "qdrant_host", "answer_host", "embed_host")
     @classmethod
     def _warn_public(cls, v: str) -> str:
         # We do not refuse a public bind (an operator may proxy), but this is the
@@ -431,6 +435,48 @@ class RetrievalSettings(BaseModel):
         return self
 
 
+class AnswerSettings(BaseModel):
+    """Answer-model (LLM) settings for cited answering (PRD §12).
+
+    Deliberately separate from :class:`EmbeddingSettings`: the answer model
+    never participates in the embedding key, so swapping it must not
+    invalidate checkpoints or the index. ``fake`` is for tests only, mirroring
+    the embedding convention (default False; a production config must name a
+    real model revision).
+    """
+
+    fake: bool = False
+    # The exact model + revision, e.g. "qwen2.5-7b-instruct@<sha>" — required
+    # unless ``fake``.
+    model_revision: str | None = None
+    # The server-side "model" field for /v1/chat/completions (llama.cpp usually
+    # accepts the loaded model's name/alias). Defaults to model_revision.
+    model_name: str | None = None
+    # Bounded generation: the answer must finish within these limits or the
+    # request fails explicitly (PRD §12: bounded timeouts, no open-ended runs).
+    max_tokens: int = 1024
+    temperature: float = 0.1
+    timeout_seconds: float = 60.0
+    # The prompt contract version; persisted with every answer so a saved
+    # answer can be explained (and re-repaired) under the same rules.
+    prompt_version: str = "m5-v1"
+
+    @model_validator(mode="after")
+    def _check_answer(self) -> AnswerSettings:
+        if self.max_tokens <= 0:
+            raise ConfigError("answer.max_tokens must be positive")
+        if not 0.0 <= self.temperature < 2.0:
+            raise ConfigError("answer.temperature must be in [0, 2)")
+        if self.timeout_seconds <= 0:
+            raise ConfigError("answer.timeout_seconds must be positive")
+        return self
+
+    @property
+    def is_configured(self) -> bool:
+        """True when an answer model can be constructed (mirrors embedding)."""
+        return self.fake or self.model_revision is not None
+
+
 class Config(BaseModel):
     """Top-level application configuration."""
 
@@ -441,6 +487,7 @@ class Config(BaseModel):
     scan: ScanSettings = Field(default_factory=ScanSettings)
     embedding: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
     retrieval: RetrievalSettings = Field(default_factory=RetrievalSettings)
+    answer: AnswerSettings = Field(default_factory=AnswerSettings)
 
     # Optional sentinel files that must exist to prove each mount is present.
     # Mapping of a human label to a file path that must exist. An empty value

@@ -128,8 +128,8 @@ def make_embedder(cfg: Config) -> Embedder:
     if emb.fake:
         return FakeEmbedder(dimensions=emb.dimensions)
     return LlamaCppEmbedder(
-        host=cfg.services.answer_host,
-        port=cfg.services.answer_port,
+        host=cfg.services.embed_host,
+        port=cfg.services.embed_port,
         model_revision=emb.effective_revision,
         model_name=emb.model_name or emb.effective_revision,
         dimensions=emb.dimensions,

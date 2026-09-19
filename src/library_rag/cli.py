@@ -3,13 +3,16 @@
 ``doctor`` (M0), the recovery-foundation commands (M1: ``init``, ``pause``,
 ``resume``, ``status``, ``retry``, ``reconcile``), the M2 pipeline commands
 ``scan`` (discover + register + enqueue) and ``ingest`` (worker loop over the
-extraction queue), and the M4 ``search`` command (fused dense+sparse search
-over the published index, with sparse-only degraded mode when embedding
-inference is unavailable) are implemented. The remaining commands are
-registered with their help text and milestone so that ``library-rag --help``
-documents the whole intended surface (PRD §4). Each stub prints an explicit
-"not yet implemented (milestone Mx)" message and returns a non-zero exit code
-rather than pretending to do the work.
+extraction queue), the M4 ``search`` command (fused dense+sparse search over
+the published index, with sparse-only degraded mode when embedding inference
+is unavailable), and the M5 commands ``answer`` (cited answering with the
+persisted frozen evidence manifest), ``serve`` (the FastAPI research app),
+and ``evaluate`` (labeled retrieval/answer metrics, PRD §13) are
+implemented. The remaining commands are registered with their help text and
+milestone so that ``library-rag --help`` documents the whole intended surface
+(PRD §4). Each stub prints an explicit "not yet implemented (milestone Mx)"
+message and returns a non-zero exit code rather than pretending to do the
+work.
 
 Destructive commands require an explicit ``--yes`` non-interactive flag; that
 convention is implemented as each command lands (M1+).
@@ -19,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import ipaddress
 import json
 import signal
 import sys
@@ -26,14 +30,18 @@ from collections.abc import Callable
 from dataclasses import asdict
 
 from . import __version__
+from .answers import answer_query, get_answer
+from .api import create_app
 from .catalog import source_file_count
 from .config import Config, ConfigError, load_config
 from .db import Database, db_path_for
 from .doctor import render_json, render_text, run_doctor
-from .embeddings import make_embedder
+from .embeddings import Embedder, make_embedder
+from .evaluate import evaluate, format_report, load_dataset
 from .identity import normalize_path
-from .indexing import RealQdrantOps, reconcile_publications
+from .indexing import QdrantOps, RealQdrantOps, reconcile_publications
 from .jobs import Jobs
+from .llm import AnswerModel, make_answer_model
 from .log import setup_logging
 from .migrations import current_version, migrate
 from .reconcile import Mount, reconcile_catalog
@@ -342,6 +350,142 @@ def _search(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+# --- M5 answer / serve / evaluate -------------------------------------------
+def _index_and_models(
+    cfg: Config, db: Database
+) -> tuple[QdrantOps, Embedder | None, AnswerModel | None]:
+    """Qdrant + optional embedder/answer-model wiring shared by answer & co.
+
+    Returns ``(qdrant, embedder, model)``; raises
+    :class:`IndexUnavailableError` when Qdrant is unreachable.
+    """
+    qdrant = RealQdrantOps(cfg)
+    if not qdrant.ping():
+        raise IndexUnavailableError("Qdrant is unreachable")
+    # Best effort: repair partial publication flag changes from a crash
+    # before serving evidence (PRD §8F: reconcile after restart).
+    with contextlib.suppress(Exception):
+        reconcile_publications(db, cfg, qdrant)
+    # Embedding inference optional: unconfigured -> sparse-only degraded
+    # mode with an explicit status (PRD §9).
+    embedder = None
+    with contextlib.suppress(ConfigError):
+        embedder = make_embedder(cfg)
+    model = make_answer_model(cfg)  # optional; never raises
+    return qdrant, embedder, model
+
+
+def _answer(args: argparse.Namespace) -> int:
+    setup_logging(args.log_level, args.log_format)
+    cfg = _require_config(args)
+    db = _open_state(cfg)
+    data: dict[str, object] | None = None
+    try:
+        qdrant, embedder, model = _index_and_models(cfg, db)
+        result = answer_query(
+            db, cfg, qdrant, embedder, model, args.query,
+            doc_id=args.doc, rev_id=args.rev,
+        )
+        # Serve the persisted row: what history and citation resolution show.
+        data = get_answer(db, result.answer_id)
+    except IndexUnavailableError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    finally:
+        db.close()
+    if data is None:  # pragma: no cover - the row was written above
+        print("error: persisted answer row missing", file=sys.stderr)
+        return EXIT_ERROR
+    if args.json:
+        print(json.dumps(data, indent=2, sort_keys=True))
+    else:
+        print(f"status: {data['status']}  (answer {data['answer_id']})")
+        if data["abstain_reason"]:
+            print(f"abstained: {data['abstain_reason']}")
+        if data["failure_reason"]:
+            print(f"failed: {data['failure_reason']}")
+        if data["answer_text"]:
+            print(data["answer_text"])
+        citations = data.get("citations")
+        if isinstance(citations, list) and citations:
+            print("citations: " + " ".join(str(c) for c in citations))
+        evidence = data.get("evidence")
+        if isinstance(evidence, list):
+            for e in evidence:
+                if not isinstance(e, dict):
+                    continue
+                loc = e.get("location")
+                if isinstance(loc, dict):
+                    kind = str(loc.get("kind"))
+                    where = (
+                        f"page {loc.get('page')}"
+                        if kind == "page"
+                        else f"section {loc.get('ref')}" if kind == "section"
+                        else "location unknown"
+                    )
+                else:
+                    where = "location unknown"
+                print(f"  {e['evidence_id']}: {e['source_title']} ({where})")
+    return EXIT_OK if data["status"] in ("answered", "abstained") else EXIT_ERROR
+
+
+def _is_loopback(host: str) -> bool:
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host.strip("[]").lower() in {"localhost", "::1"}
+
+
+def _serve(args: argparse.Namespace) -> int:
+    setup_logging(args.log_level, args.log_format)
+    cfg = _require_config(args)
+    host, port = cfg.services.app_host, cfg.services.app_port
+    if not _is_loopback(host) and not cfg.services.api_token:
+        print(
+            "error: binding to a non-loopback address requires services.api_token "
+            "(PRD §12: bearer auth before any network exposure)",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+    db = _open_state(cfg)
+    try:
+        qdrant, embedder, model = _index_and_models(cfg, db)
+        app = create_app(cfg, db, qdrant=qdrant, embedder=embedder, model=model)
+    except IndexUnavailableError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        db.close()
+        return EXIT_ERROR
+    import uvicorn  # local import: keeps the other commands import-light
+
+    uvicorn.run(app, host=host, port=port, log_level=args.log_level.lower())
+    db.close()
+    return EXIT_OK
+
+
+def _evaluate(args: argparse.Namespace) -> int:
+    setup_logging(args.log_level, args.log_format)
+    cfg = _require_config(args)
+    try:
+        dataset = load_dataset(args.dataset)
+    except (OSError, ValueError) as exc:
+        print(f"dataset error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    db = _open_state(cfg)
+    try:
+        qdrant, embedder, model = _index_and_models(cfg, db)
+        report = evaluate(db, cfg, qdrant, embedder, model, dataset, k=args.k)
+    except IndexUnavailableError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    finally:
+        db.close()
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print(format_report(report))
+    return EXIT_OK
+
+
 # --- parser ----------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -430,8 +574,31 @@ def build_parser() -> argparse.ArgumentParser:
     search_p.add_argument("--rev", default=None, help="restrict to one revision id")
     search_p.set_defaults(_func=_search)
 
-    _register_stub(sub, "serve", "run the FastAPI research app + reader (M5)")
-    _register_stub(sub, "evaluate", "run retrieval/answer evaluation on a labeled set (M6)")
+    answer_p = sub.add_parser(
+        "answer", help="cited answering over the published index (M5)"
+    )
+    answer_p.add_argument("query", help="the question to answer")
+    answer_p.add_argument("--config", help="path to config YAML")
+    answer_p.add_argument("--json", action="store_true", help="emit the answer as JSON")
+    answer_p.add_argument("--doc", default=None, help="restrict to one document id")
+    answer_p.add_argument("--rev", default=None, help="restrict to one revision id")
+    answer_p.set_defaults(_func=_answer)
+
+    serve = sub.add_parser(
+        "serve", help="run the FastAPI research app + reader (M5)"
+    )
+    serve.add_argument("--config", help="path to config YAML")
+    serve.set_defaults(_func=_serve)
+
+    evaluate_p = sub.add_parser(
+        "evaluate", help="run retrieval/answer evaluation on a labeled set (M5, PRD §13)"
+    )
+    evaluate_p.add_argument("--dataset", required=True, help="path to the labeled dataset JSON")
+    evaluate_p.add_argument("--config", help="path to config YAML")
+    evaluate_p.add_argument("--json", action="store_true", help="emit the report as JSON")
+    evaluate_p.add_argument("--k", type=int, default=20, help="candidates per question (default 20)")
+    evaluate_p.set_defaults(_func=_evaluate)
+
     _register_stub(sub, "backup", "consistent backup of DB, Qdrant, and manifests (M7)")
     _register_stub(sub, "restore", "restore a backup into an isolated directory (M7)")
     _register_stub(sub, "verify", "verify source links and search after restore (M7)")

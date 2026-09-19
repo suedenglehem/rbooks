@@ -496,3 +496,164 @@ Gate cases (all passing, run this session):
   reindexing; unsupported/no-evidence cases abstain; search continues if the
   model server stops. The `evaluate` CLI command (PRD §9/§13) is also still
   unimplemented and belongs with the M5 evaluation work.
+
+## M5 — Cited answering and UI
+
+**Status: gate passed.** PRD §12 M5 gate, verbatim: "unknown evidence IDs
+rejected; saved citations survive reindexing; unsupported/no-evidence cases
+abstain; search continues if model server stops." All four clauses pass in
+`tests/test_answers.py` (named below), plus 67 new test functions across seven
+new files; `uv run pytest tests/` → 312 passed.
+
+### Delivered
+- `llm.py` — local answer-model adapter mirroring the embedding adapter:
+  `AnswerModel` protocol; `LlamaCppAnswerModel` (OpenAI-compatible
+  `/v1/chat/completions`, bounded timeouts on connect and read);
+  `FakeAnswerModel` (scripted pops-then-fallback, records every call for
+  assertions). Error taxonomy: server unavailable (dead port, HTTP error,
+  timeout) → `ModelUnavailableError` (transient — search and other commands
+  must keep working); malformed body → permanent `ModelError`.
+  `make_answer_model` (unconfigured → `None`, `fake`, llama.cpp). The model is
+  a pure text transducer — all trust rules live in `citations.py`/`answers.py`.
+- `citations.py` — evidence manifests: the *only* vocabulary the model may
+  cite is numbered `E1..En`, built from validated passages with location
+  metadata taken from trusted sources (`source_revisions`/`chunks`/
+  `source_units` rows + checksum-verified unit artifacts — the model's output
+  is never trusted for location data). `parse_citations` (first-appearance
+  order, dedup, out-of-contract ids rejected), `unknown_citations` (flags
+  out-of-vocabulary ids), `parse_abstention` (`ABSTAIN` + reason). Frozen
+  manifest snapshots (`schema 1`, `to_json`/`from_json`, rejects unknown
+  schemas and bad evidence fields) are persisted with every answer.
+- `answers.py` — cited-answering orchestration: fused search → evidence
+  manifest → prompt (document text is untrusted data) → completion → citation
+  validation. Rules: unknown/missing citation ids are rejected with exactly
+  ONE bounded repair attempt, after which the answer persists as `failed`
+  with the evidence still shown — never a fabricated fallback; abstention is a
+  first-class persisted outcome; with no evidence at all the pipeline abstains
+  *without calling the model*; every outcome (answered/abstained/failed)
+  persists the frozen manifest. Citation resolution reads the snapshot, so
+  re-chunking/re-publishing cannot move what a saved answer points at; the
+  only live check is that the source revision is still registered and its
+  archive readable (missing archive → explicit unavailable, never a substitute
+  edition).
+- `evaluate.py` — retrieval/answering harness (PRD §13): labeled JSON dataset
+  (`expected_chunks`, `answerable`), `recall@k` over top-k candidates,
+  abstention share for `answerable: false` questions, report formatting;
+  nothing is invented — unlabeled metrics report `None`. Qdrant down →
+  explicit unavailable error.
+- `api.py` — FastAPI research app: `/health`, `/ready` (qdrant/embedding/
+  answer booleans), `/library`, `/search` (503 IndexUnavailable / 400 blank /
+  422 bad-shape split, degraded sparse-only surfaced in the payload),
+  `/answer`, `/answers` (history), `/answers/{id}`, `/answers/{id}/citations/
+  {evidence_id}` (snapshot resolution + reader location), ingestion controls
+  (`/ingest/status`, `/scan`, `/ingest/pause`, `/ingest/resume`,
+  `/ingest/retry`). Strict CSP on every response (`default-src 'self'`,
+  `worker-src 'self'`, no `unsafe-eval`); bearer-token auth when configured
+  with open liveness paths (`/health`, `/`, `/index.html`); static mount of
+  `web/dist` at `/` via `find_web_dist()` (`$LIBRARY_RAG_WEB_DIST` override,
+  repo `web/dist`, graceful API-only degradation when unbuilt).
+- `reader.py` — book-manifest units now expose `unit_id` (additive change so
+  the UI can fetch a unit directly; UUIDv5, not client-derivable).
+- `migrations.py` — M5 `answers` table (CHECK `answered|abstained|failed`,
+  frozen `evidence_manifest` JSON, `citations`, search counts,
+  retrieval/model timings) + indexes; migration 0005.
+- `cli.py` — `answer` (`--json`/`--doc`/`--rev`), `serve` (runs the FastAPI
+  research app + reader), `evaluate` (`--dataset`/`--json`/`--k`) implemented;
+  `backup`/`restore`/`verify` remain M7 stubs.
+- `web/` — the research UI (PRD §10): TypeScript (strict) + Vite, no
+  framework, pdfjs-dist bundled locally (no CDN; the worker ships as a
+  same-origin asset, satisfying the server CSP). Two-pane research layout
+  (query | reader) that collapses to Query/Reader tabs below 980px. Features:
+  readiness dots (30s poll), book filter, Answer vs Search-only modes, answer
+  cards with citation chips and per-evidence Locate/Excerpt, ranked passages
+  with dense/sparse ranks and per-span Locate, persisted answer history,
+  ingestion dashboard (status cards, job table, scan/pause/resume/retry, last
+  scan report), 401 → token prompt (clears manifest caches), authed original
+  download. Reader: PDF navigates by *physical* page — fitz bboxes (page
+  points, bottom-left origin, unrotated space) converted to a top-left rect
+  and through `convertToViewportRectangle` so zoom and page rotation are both
+  accounted for; EPUB sections render only the server-sanitized HTML through a
+  second client-side sanitize pass with deterministic paragraph anchors
+  re-attached by mirroring `extraction.parse_blocks` (document order, block
+  tags, non-empty text); a missing archived original (410) or any failure
+  shows an explicit unavailable message — never a different edition.
+  `web/dist` is built and committed (self-hosted gate); `web/node_modules`
+  gitignored. `tests/test_web_dist.py` guards the bundle: present and
+  discoverable, index.html references only local relative assets, no external
+  resource-load patterns in the bundle, worker shipped and referenced.
+
+### Test commands + results
+| Command | Result |
+| ------- | ------ |
+| `uv run ruff check .` | All checks passed! |
+| `uv run mypy` | Success: no issues found in 70 source files |
+| `uv run pytest tests/` | 312 passed, 2 warnings in 42.60s |
+| `cd web && npm run build` | tsc clean; vite 7.3.6 built (index 443.52 kB, pdf.worker 1,232.30 kB, css 8.43 kB) |
+
+(The 2 warnings are a third-party starlette testclient/anyio
+DeprecationWarning, not from this codebase. 67 new test functions:
+`test_llm.py` 10, `test_citations.py` 15, `test_answers.py` 11,
+`test_evaluate.py` 7, `test_api.py` 16, `test_cli_answer.py` 4,
+`test_web_dist.py` 4.)
+
+Gate cases (all passing, run this session):
+- unknown evidence IDs rejected →
+  `test_answers.py::test_unknown_citation_ids_fail_after_one_bounded_repair`
+  (model cites `E9` out of a 3-entry manifest → one repair turn → `failed`,
+  no fabricated citation) and `test_missing_citations_fail_after_one_repair`;
+  `test_repair_success_is_answered` (repair turn cites valid ids → answered).
+- saved citations survive reindexing →
+  `test_answers.py::test_saved_citations_survive_reindexing` (answer saved,
+  library re-chunked/re-published with new chunk ids, citation still resolves
+  to the same frozen text via the persisted snapshot).
+- unsupported/no-evidence cases abstain →
+  `test_answers.py::test_no_evidence_abstains_without_model_call` (empty
+  retrieval → abstained with zero model calls) and
+  `test_scripted_abstention_is_persisted_with_reason`.
+- search continues if the model server stops →
+  `test_answers.py::test_down_model_server_fails_answer_but_search_keeps_
+  working` (answer fails with an explicit model-unavailable reason while
+  search still returns passages); `test_llm.py` covers dead-port/HTTP-error →
+  `ModelUnavailableError` and malformed body → permanent error.
+
+### Notes / bugs found
+- pdfjs-dist 5.7.284 API drift from the widely-published examples:
+  `PDFPageProxy.getLabel()` no longer exists — page labels come from the
+  doc-level `getPageLabels()` (0-based array, empty string = unlabeled);
+  `RenderParameters.canvas` is required (passing only `canvasContext` no
+  longer type-checks). pdf.js does *not* resize a passed canvas
+  (`beginDrawing` uses the existing canvas size and applies the viewport
+  transform), so the client pre-sizes the canvas at `viewport × dpr` and sets
+  the CSS size to `viewport`, then draws evidence boxes on the same canvas
+  after the render promise resolves.
+- `#canvasInUse` WeakSet in `InternalRenderTask` throws if the same canvas
+  is handed to two concurrent renders; sequential re-renders are safe because
+  `cancel()` releases the guard, which is what the reader does before each
+  new render.
+- pdf.js's internal Range requests cannot carry an `Authorization` header, so
+  the authed client fetches the original bytes itself and hands the
+  `ArrayBuffer` to `getDocument`.
+- EPUB evidence carries no boxes (XHTML has no bboxes): "locate" resolves the
+  section via `location.ref` → manifest unit (`kind=section`, matching `ref`)
+  and scrolls the deterministic paragraph anchor instead.
+- The client anchor re-attachment must mirror `extraction.parse_blocks`
+  exactly (document-order walk, the same block-tag set, non-empty text) or
+  anchors drift; a mismatch is logged (best-effort) but never fatal.
+- `npm install` warns that esbuild's postinstall is not allow-listed; the
+  platform binary resolves from the optional dependency and the build works —
+  no system packages installed (PRD §1: no system installs).
+- Unit tests still run without Docker/GPU: the web guard tests only inspect
+  the committed `web/dist` files, and all M5 backend tests use
+  `FakeEmbedder`/`FakeQdrant`/`FakeAnswerModel`.
+
+### Next unfinished task
+- Begin M6 (PRD §12 "Pilot and capacity report"): reproducible stratified
+  sample manifest for 200–500 books with configurable page cap (all
+  format/OCR/language groups); measure extracted tokens/pages, chunk count,
+  extraction/OCR/embedding throughput, SSD bytes per chunk, peak RAM/VRAM,
+  p50/p95 latency with ingestion on/off; prepare 100–200 manually labeled
+  questions (exact terms, conceptual, OCR, EPUB, conflicts, unanswerable) with
+  annotation/evaluation tools — do not invent human labels; deliver the pilot
+  report (measured results, uncertainty, full-run ETA by bottleneck, storage
+  estimate with rebuild headroom, recommended frozen config). **Operator
+  approval is required before full ingestion.**

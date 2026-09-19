@@ -5,6 +5,10 @@ __pycache__/
 .venv/
 venv/
 
+# Frontend (web/): dependencies are never committed; the built bundle (web/dist)
+# IS committed because the server serves it and the M5 gate wants a self-hosted UI.
+web/node_modules/
+
 # Test / tooling caches
 .pytest_cache/
 .mypy_cache/
@@ -21,6 +25,7 @@ config.yaml
 .env
 
 # Local scratch / data that never belongs in git (PRD §10: durable outputs on SSD)
+.resume
 state/
 archive/
 artifacts/
