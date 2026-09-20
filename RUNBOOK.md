@@ -175,7 +175,13 @@ the Qdrant local lock is held.
 Safe with the worker running (WAL; read-only or append-only):
 `status`, `coverage`, `search`, `doctor`, `scan` (drop new books into
 the source root, then scan — the fast check skips everything unchanged,
-so existing books are not recomputed), `retry`.
+so existing books are not recomputed), `retry`, and `discover`
+(the same scan repeated on an interval as a *second* detached
+process, so new books land without re-running `scan` by hand —
+`nohup uv run library-rag discover --config config.yaml
+>> /mnt/models_sata_ssd/library-rag/scratch/discover.log 2>&1 &` —
+SIGTERM stops it after the in-flight pass, like the worker; it
+never deletes catalog content, a vanished file is only reported).
 
 Requires the worker stopped first (SIGTERM, then run, then resume):
 `backup` (→ `restore`/`verify` into an isolated directory), `gc`

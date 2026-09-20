@@ -1483,14 +1483,56 @@ ships green during the full-run window.
 - Drain snapshot 2026-09-21 (while writing the runbook): OCR
   5279/6176 (~85%), 0 failed, worker 72176 alive.
 
+### Slice 6 — scheduled discovery (PRD lines 15/83/181)
+- [DONE 2026-09-21] **Committed 119d796, pushed to origin/master.**
+  New `src/library_rag/discover.py` (+ tests/test_discover.py, 6
+  tests; CLI `discover` subcommand):
+  - `run_discovery(db, cfg, jobs, *, interval_seconds=3600.0,
+    stop_event=None, on_pass=None) -> int`: one scan pass
+    immediately, then a fixed interval between passes until the
+    stop signal. Each pass is the same streaming discovery as
+    `scan` (PRD §8A: no tree in memory, ignore dirs, magic-byte
+    validation, size+mtime fast check → unchanged books are not
+    re-hashed; INSERT-OR-IGNORE enqueueing → no double jobs).
+  - Stop semantics mirror `run_worker` (PRD §7): the flag is
+    checked at the top of the loop and during an interruptible
+    sleep (0.05 s ticks), so a pass never starts interrupted and
+    an in-flight pass runs to completion — a read-only walk with
+    idempotent per-file upserts, so even an interrupted pass is
+    safe to repeat.
+  - Adds-or-revises only: a file that disappeared since the last
+    pass is *reported* in `ScanReport.missing`, never deleted
+    (its alias rows stay; the coverage report flags it as
+    orphaned). A scheduled pass therefore can only add or revise.
+  - CLI `library-rag discover --config X [--interval SECONDS]`
+    (default 3600 s — one full pass over the 34k-file library is
+    ~5–7 min of I/O, so an hourly cadence keeps discovery
+    overhead under ~10% while new books land within the hour).
+    SIGTERM/SIGINT finish the in-flight pass, then exit 0 like
+    `ingest` ("discover: N pass(es) completed"). A single pass
+    is just `scan`; there is deliberately no `--once`.
+  - Scans continue while paused: enqueueing is harmless — pause
+    gates claiming, not enqueueing (jobs.py).
+- **Gate (2026-09-21, real output):** ruff "All checks passed!",
+  mypy "Success: no issues found in 86 source files", pytest
+  **440 passed in 55.01s** (434 baseline + 6 new).
+- What the tests pin: immediate stop (0 passes, nothing
+  touched); one pass registers and enqueues exactly one extract
+  job; a second pass is `unchanged` with no re-hash (boom on a
+  monkeypatched `stream_hash`) and no double enqueue; a book
+  dropped in mid-run is picked up on the next pass; the
+  between-pass sleep is interruptible (stop at 0.15 s of a 10 s
+  sleep → elapsed < 1 s, passes == 1); a deleted file is
+  reported missing while its alias row stays.
+- Drain snapshot 2026-09-21 (while writing slice 6): OCR
+  5673/6176 (~92%), 503 pending, 0 failed; jobs 792 pending /
+  1 running / 6269 succeeded; 81070 chunks, 0 embedding batches
+  committed yet; 0 published docs; worker 72176 alive.
+
 ### Next unfinished task
-1. [DONE 2026-09-21] Slice 5 runbook (RUNBOOK.md) committed + pushed.
-2. **Slice 6: scheduled discovery** — periodic re-scan of source
-   roots (new books picked up without a full reprocess; PRD §1
-   "add books").
-3. Slice 7: safe revision replacement + generation migration
+1. [DONE 2026-09-21] Slice 6 scheduled discovery (discover.py +
+   CLI + 6 tests) committed 119d796, pushed.
+2. Slice 7: safe revision replacement + generation migration
    (PRD §14).
-4. Parallel track: batch-2 drain → full-library launch (see M6
-   next-task item 1-2); M7 work proceeds during the run window.
-4. Parallel track: batch-2 drain → full-library launch (see M6
+3. Parallel track: batch-2 drain → full-library launch (see M6
    next-task item 1-2); M7 work proceeds during the run window.
