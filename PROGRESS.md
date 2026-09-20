@@ -1315,15 +1315,69 @@ ships green during the full-run window.
   3349/6176, chunk 287/300, embed 282 pending, 0 failed, worker
   72176 alive.
 
+### Slice 3 — explicit removal (PRD §14)
+- [DONE 2026-09-21] **Committed 45e06ee, pushed to origin/master.**
+  New `src/library_rag/removal.py` (+ tests/test_removal.py, 9
+  tests; CLI `remove <path-or-doc-id> [--execute] [--json]`):
+  - `resolve_target`: UUID-shaped target → `documents` lookup
+    (case-insensitive), otherwise `normalize_path` →
+    `path_aliases`; unknown → `RemovalError("no document …")`.
+    Path and doc_id resolve to the same deterministic identity, so
+    removal is repeatable (second run reports "not found").
+  - `remove_document(db, cfg, qdrant, doc_id, *, execute=False)`:
+    *Points first* (all generations, active and superseded, via
+    `doc_id` filter) with a leftover-count check BEFORE the catalog
+    is touched — a crash there leaves the catalog intact and the
+    removal simply re-runs. Then one FK-safe catalog transaction
+    (children before parents): `scan_state` (so a re-scan of a
+    re-added file registers fresh), `path_aliases`, `publications`
+    (FK to `gen_id`), `index_generations`, `chunks`,
+    `source_units`, `embedding_batches`, `extraction_runs`,
+    `source_revisions`, `documents`; open jobs
+    (pending / retryable_failed) for the document's rev/run ids
+    are cancelled in the same transaction. Last, the revision's
+    archive object is unlinked only if a `source_revisions`
+    recount for its SHA shows no reference beyond the document's
+    own rows (dry-run `own_refs=1`, post-transaction `own_refs=0`).
+  - Safety: refuses while any job is `running` (same guard as
+    `gc`); refuses when the document has points but Qdrant cannot
+    be opened (worker holds the local storage lock) — catalog-only
+    removal allowed when the document has no points. Dry-run is
+    the default (before-counts + the archive plan). `execute`
+    then *verifies*: every catalog table filtered to the document
+    must be empty and the point count zero, else
+    `RemovalError` with the leftovers named.
+  - Deliberately untouched: source files (re-scan re-registers
+    deterministically), artifact files (unreferenced → `gc`
+    reclaims with its grace window), `answers` (frozen evidence
+    manifests are self-contained, PRD §12 — `answers.doc_id` /
+    `rev_id` are plain columns with no FK), `sparse_corpus_stats`
+    (next publish self-heals).
+- **Gate (2026-09-21, real output):** ruff "All checks passed!",
+  mypy "Success: no issues found in 82 source files", pytest
+  **423 passed in 51.76s** (414 baseline + 9 new).
+- Bugs found en route (both FK-ordering, both hit by the real
+  embedded-Qdrant tests): `DELETE FROM extraction_runs` before
+  `embedding_batches` (FK `embedding_batches.run_id` →
+  `extraction_runs`), and `DELETE FROM index_generations` before
+  `publications` (FK `publications.gen_id` →
+  `index_generations` — migrations.py:269). Fixed by reordering
+  to the topologically verified sequence above; the full
+  15-`REFERENCES` schema audit confirmed nothing else (jobs,
+  answers, sparse_corpus_stats, meta) blocks it. Also: ambiguous
+  `doc_id` in a test JOIN (aliased), ruff RUF022 `__all__`
+  sort.
+- Drain snapshot 2026-09-21 (while writing slice 3): OCR
+  4619/6176, chunk 291/300, embed 286 pending, 0 failed, worker
+  72176 alive.
+
 ### Next unfinished task
-1. [DONE 2026-09-21] Slice 2 committed (33e6eb9) + pushed.
-2. **Slice 3: explicit removal** — `library-rag remove <book>`:
-   deactivate revision, delete its points from Qdrant, then the
-   archive object if no other revision references the SHA, with
-   verification (counts before/after).
-3. Slices 4–7 (order): coverage report (corpus stats vs source
-   root: missing / stale / orphaned), runbook (full-library
-   launch command + stop/resume, documented), scheduled
-   discovery, safe revision replacement + generation migration.
+1. [DONE 2026-09-21] Slice 3 committed (45e06ee) + pushed.
+2. **Slice 4: coverage report** — corpus stats vs source root:
+   which sources are missing / stale / orphaned in the index
+   (`library-rag coverage`).
+3. Slices 5–7 (order): runbook (full-library launch command +
+   stop/resume, documented), scheduled discovery, safe revision
+   replacement + generation migration.
 4. Parallel track: batch-2 drain → full-library launch (see M6
    next-task item 1-2); M7 work proceeds during the run window.
