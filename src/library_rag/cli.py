@@ -45,6 +45,7 @@ from .db import Database, db_path_for
 from .doctor import render_json, render_text, run_doctor
 from .embeddings import Embedder, make_embedder
 from .evaluate import evaluate, format_report, load_dataset
+from .gc import GcError, run_gc
 from .identity import normalize_path
 from .indexing import QdrantOps, RealQdrantOps, reconcile_publications
 from .jobs import Jobs
@@ -614,6 +615,46 @@ def _verify(args: argparse.Namespace) -> int:
     return EXIT_OK if all(r.ok for r in results) else EXIT_ERROR
 
 
+def _gc(args: argparse.Namespace) -> int:
+    setup_logging(args.log_level, args.log_format)
+    cfg = _require_config(args)
+    db = _open_state(cfg)
+    try:
+        report = run_gc(db, cfg, execute=args.execute, grace_seconds=args.grace_seconds)
+    except GcError as exc:
+        print(f"gc error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    finally:
+        db.close()
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+    else:
+        total = sum(c.size_bytes for c in report.candidates)
+        mode = "execute" if report.executed else "dry-run"
+        print(f"gc ({mode}): {len(report.candidates)} candidate(s), {total / 2**20:.1f} MiB")
+        by_kind: dict[str, int] = {}
+        for c in report.candidates:
+            by_kind[c.kind] = by_kind.get(c.kind, 0) + 1
+        for kind in ("archive", "artifact", "job_log"):
+            if by_kind.get(kind):
+                print(f"  {kind}: {by_kind[kind]}")
+        for c in report.candidates[:20]:
+            print(f"  [{c.kind}] {c.relpath}  ({c.size_bytes} B, {c.reason})")
+        if len(report.candidates) > 20:
+            print(f"  ... and {len(report.candidates) - 20} more")
+        if report.executed:
+            print(
+                f"  reclaimed: {report.deleted} file(s), "
+                f"{report.bytes_reclaimed / 2**20:.1f} MiB, "
+                f"{report.directories_removed} dir(s)"
+            )
+        for e in report.errors:
+            print(f"  error: {e}", file=sys.stderr)
+        if not report.executed and report.candidates:
+            print("dry-run: nothing deleted; re-run with --execute to delete")
+    return EXIT_OK if not report.errors else EXIT_ERROR
+
+
 # --- M6 pilot ---------------------------------------------------------------
 
 
@@ -1117,6 +1158,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     verify_p.add_argument("--json", action="store_true", help="emit results as JSON")
     verify_p.set_defaults(_func=_verify)
+
+    gc_p = sub.add_parser(
+        "gc",
+        help="garbage-collect unreferenced archive/artifact/log objects (M7, dry-run by default)",
+    )
+    gc_p.add_argument("--config", help="path to config YAML")
+    gc_p.add_argument(
+        "--execute",
+        action="store_true",
+        help="delete candidates (default is a dry-run report)",
+    )
+    gc_p.add_argument(
+        "--grace-seconds",
+        type=float,
+        default=600.0,
+        help="skip files modified within this window (default 600)",
+    )
+    gc_p.add_argument("--json", action="store_true", help="emit the report as JSON")
+    gc_p.set_defaults(_func=_gc)
 
     pilot_p = sub.add_parser(
         "pilot",

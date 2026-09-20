@@ -8,7 +8,7 @@ modify the "immutable" archive. The copy is checksum-verified, fsync'd, and made
 visible via the atomic rename in :mod:`library_rag.artifacts`.
 
 The archive is append-only here: this module never deletes stored objects.
-Garbage collection (with reference checks) is a later milestone (M7).
+Garbage collection with reference checks lives in :mod:`library_rag.gc` (M7).
 """
 
 from __future__ import annotations
