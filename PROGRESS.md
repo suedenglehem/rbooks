@@ -1441,12 +1441,55 @@ ships green during the full-run window.
   5073/6176 (1 running), chunk 291/300 (9 pending), embed 286
   pending, 0 failed, worker 72176 alive.
 
+### Slice 5 — full-library launch + stop/resume runbook (PRD line 183)
+- [DONE 2026-09-21] **New top-level `RUNBOOK.md`.** Docs-only slice
+  (no code, no gate); every command, flag, and behavior in it was
+  verified against the code before writing:
+  - Layout table from the live (gitignored) `config.yaml`; services
+    (8× llama-server bge-m3 on 8081–8088, vLLM :8091 — never
+    reconfigure); the one-worker-at-a-time rule for local Qdrant
+    mode (exclusive storage lock) and why read-only tools degrade
+    while the worker runs.
+  - **Launch**: doctor + 9-port health pre-flight, `scan`
+    (fast check: size+mtime, no re-hash — adding books mid-run
+    never recomputes unchanged sources), detached nohup `ingest`
+    with the PID recorded, startup verification via `status`.
+    Scale expectation: 34768 candidates (360 invalid) at the
+    pilot rate ~11–13 jobs/min → the M6 ~41–45-day serial
+    estimate; re-measure in the first hour.
+  - **Monitoring**: `status` (jobs by state, OCR units, paused
+    flag), `coverage` (funnel + roots + stalled + failures;
+    point counts `null` while the worker holds the Qdrant lock),
+    short `ingest_run.log` + kept-on-failure verbose job logs.
+  - **Stopping** (three levels, gentlest first): `pause`
+    (DB-persisted, survives restarts) → SIGTERM (finishes the
+    in-flight job — `stop_event` is consulted between jobs —
+    exits 0) → SIGKILL/power (lease TTL 300 s + fenced commits;
+    WAL, no corruption).
+  - **Resuming/crash recovery**: re-run the nohup command
+    (automatic reconcile pass on start); `resume` after a
+    pause; after a crash, expired-lease jobs reclaim to pending
+    and handlers do not redo committed work (OCR is one job per
+    page; chunking is chunk-fingerprint idempotent; embedding
+    commits per batch, vectors-to-artifact-first). Each re-claim
+    consumes one attempt (max 3) → crash-looped jobs land in
+    `retryable_failed` → fix + `retry`.
+  - **Failure triage table** (retryable/permanent, OCR unit
+    failures, fleet outage, mount_unavailable, stalled docs,
+    disk full) and the maintenance-safety split: read-only +
+    `scan` + `retry` are safe with the worker running; `gc`,
+    `remove`, `backup` require the worker stopped (gc/remove
+    refuse while jobs run; backup refuses on the Qdrant lock).
+- Drain snapshot 2026-09-21 (while writing the runbook): OCR
+  5279/6176 (~85%), 0 failed, worker 72176 alive.
+
 ### Next unfinished task
-1. [DONE 2026-09-21] Slice 4 coverage report committed (367ebc8) + pushed.
-2. **Slice 5: runbook** — full-library launch command +
-   stop/resume procedure, documented (PRD M7 gate).
-3. Slices 6–7 (order): scheduled discovery, safe revision
-   replacement + generation migration.
+1. [DONE 2026-09-21] Slice 5 runbook (RUNBOOK.md) committed + pushed.
+2. **Slice 6: scheduled discovery** — periodic re-scan of source
+   roots (new books picked up without a full reprocess; PRD §1
+   "add books").
+3. Slice 7: safe revision replacement + generation migration
+   (PRD §14).
 4. Parallel track: batch-2 drain → full-library launch (see M6
    next-task item 1-2); M7 work proceeds during the run window.
 4. Parallel track: batch-2 drain → full-library launch (see M6
