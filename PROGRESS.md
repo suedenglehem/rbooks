@@ -1194,15 +1194,18 @@ done; operator pre-approved the report 2026-09-20; the report is
 - **Next unfinished task:**
   1. **Let the batch-2 drain finish** (recovery run, worker 72176;
      monitors armed: failed-job poll 30-min expiry, re-arm as
-     needed; exit watcher on 72176). State at 21:51: **extract
-     300/300 COMPLETE**, OCR 742 done / 5,433 remaining, chunk
-     105/300, embed 103 pending, 0 failed jobs; all 8 embed
-     endpoints healthy. Measured OCR pace since 21:34: 344 jobs in
-     17 min ≈ 20.2 jobs/min → 5,433 remaining ≈ **~4.5 h → ETA
-     ~02:20** (faster than the 4.59 s/job planning rate). Terminal
-     expectation: ~300 documents, all stages succeeded except
-     legitimate per-book permanents — any permanent failure gets its
-     kept verbose log read and classified before the full run.
+     needed; exit watcher on 72176). State at 22:00: **extract
+     300/300 COMPLETE**, OCR 841 done / 5,335 remaining, chunk
+     106/300 (+1 running), embed 104 pending, 0 failed jobs.
+     Pace: 21:34–21:51 window ran 20.2 jobs/min (post-restart
+     short-book burst); 21:51–22:00 window 99 jobs / 9 min ≈
+     11 jobs/min, back near the 13.1 jobs/min planning rate as the
+     queue hits denser books — expect ETA **~05:00–06:15**
+     (re-measure at each re-arm; the 02:20 figure was off the
+     burst window). Terminal expectation: ~300 documents, all
+     stages succeeded except legitimate per-book permanents — any
+     permanent failure gets its kept verbose log read and
+     classified before the full run.
   2. Once batch 2 is fully drained and the crash sim is clean:
      **full-library ingestion** (approved, report pre-approved
      2026-09-20): `uv run library-rag scan --config config.yaml`
