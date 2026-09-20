@@ -27,10 +27,10 @@ import contextlib
 import hashlib
 import ipaddress
 import json
+import os
 import signal
 import sys
 import time
-from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
 from typing import cast
@@ -38,8 +38,9 @@ from typing import cast
 from . import __version__
 from .answers import answer_query, get_answer
 from .api import create_app
+from .backup import BackupError, create_backup, restore_backup, verify_system
 from .catalog import source_file_count
-from .config import Config, ConfigError, load_config
+from .config import MOUNT_SENTINEL_ENV, Config, ConfigError, load_config
 from .db import Database, db_path_for
 from .doctor import render_json, render_text, run_doctor
 from .embeddings import Embedder, make_embedder
@@ -81,7 +82,6 @@ from .worker import DEFAULT_LEASE_TTL, run_worker
 # Exit codes.
 EXIT_OK = 0
 EXIT_ERROR = 1
-EXIT_NOT_IMPLEMENTED = 2
 
 
 # --- helpers ---------------------------------------------------------------
@@ -115,14 +115,6 @@ def _open_state(cfg: Config) -> Database:
     db = Database.connect(db_path_for(cfg.paths.state_root))
     migrate(db)
     return db
-
-
-def _not_implemented(milestone: str) -> Callable[..., int]:
-    def _run(_args: argparse.Namespace) -> int:
-        print(f"command not yet implemented (planned: milestone {milestone})", file=sys.stderr)
-        return EXIT_NOT_IMPLEMENTED
-
-    return _run
 
 
 def _count(db: Database, sql: str) -> int:
@@ -522,6 +514,104 @@ def _evaluate(args: argparse.Namespace) -> int:
     else:
         print(format_report(report))
     return EXIT_OK
+
+
+# --- M7 backup / restore / verify --------------------------------------------
+
+
+def _config_file_path(cli_value: str | None) -> Path | None:
+    """The config file in use: CLI flag, then $LIBRARY_RAG_CONFIG, else None."""
+    p = cli_value or os.environ.get(MOUNT_SENTINEL_ENV)
+    return Path(p) if p else None
+
+
+def _backup(args: argparse.Namespace) -> int:
+    setup_logging(args.log_level, args.log_format)
+    cfg = _require_config(args)
+    dest = Path(args.to) if args.to else cfg.paths.backup_root
+    if dest is None:
+        print(
+            "error: no backup destination: pass --to or set paths.backup_root",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+    db = _open_state(cfg)
+    try:
+        manifest = create_backup(
+            db,
+            cfg,
+            dest,
+            include_contents=not args.state_only,
+            config_source=_config_file_path(args.config),
+        )
+    except BackupError as exc:
+        print(f"backup error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    finally:
+        db.close()
+    total = sum(f["size"] for f in manifest["files"])
+    print(f"backup complete: {dest}")
+    print(f"  files: {len(manifest['files'])} ({total / 2**30:.2f} GiB in {manifest['elapsed_seconds']} s)")
+    print(f"  paused: {manifest['paused']}  qdrant: {manifest['qdrant']}")
+    print(f"  counts: {json.dumps(manifest['counts'], sort_keys=True)}")
+    print(f"verify: library-rag verify --config <config> --backup {dest}")
+    return EXIT_OK
+
+
+def _restore(args: argparse.Namespace) -> int:
+    setup_logging(args.log_level, args.log_format)
+    try:
+        manifest = restore_backup(Path(args.backup), Path(args.target), force=args.force)
+    except BackupError as exc:
+        print(f"restore error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    restore = manifest["restore"]
+    print(f"restored to {restore['target']}")
+    print(f"  files: linked {restore['files_linked']}, copied {restore['files_copied']}")
+    print(f"  counts: {json.dumps(manifest['counts'], sort_keys=True)}")
+    print(
+        f"verify: library-rag verify --config {restore['target']}/config.yaml "
+        f"--backup {restore['target']}"
+    )
+    return EXIT_OK
+
+
+def _verify(args: argparse.Namespace) -> int:
+    setup_logging(args.log_level, args.log_format)
+    cfg = _require_config(args)
+    db = _open_state(cfg)
+    qdrant: RealQdrantOps | None = None
+    try:
+        embedder: Embedder | None = None
+        with contextlib.suppress(ConfigError):
+            embedder = make_embedder(cfg)
+        # A running worker holds the local Qdrant storage lock for its whole
+        # run; verify must still work while the system is up, so the index
+        # and search checks degrade instead of failing to open the client.
+        try:
+            candidate = RealQdrantOps(cfg)
+        except Exception:
+            candidate = None
+        qdrant = candidate if candidate is not None and candidate.ping() else None
+        results = verify_system(
+            cfg,
+            db,
+            qdrant,
+            search_query=args.search,
+            backup_dir=Path(args.backup) if args.backup else None,
+            full_checksums=args.full_checksums,
+            embedder=embedder,
+        )
+    finally:
+        if qdrant is not None:
+            qdrant.close()
+        db.close()
+    if args.json:
+        print(json.dumps([asdict(r) for r in results], indent=2, sort_keys=True))
+    else:
+        for r in results:
+            print(f"{'ok  ' if r.ok else 'FAIL'} {r.name}: {r.detail}")
+    return EXIT_OK if all(r.ok for r in results) else EXIT_ERROR
 
 
 # --- M6 pilot ---------------------------------------------------------------
@@ -984,6 +1074,50 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate_p.add_argument("--k", type=int, default=20, help="candidates per question (default 20)")
     evaluate_p.set_defaults(_func=_evaluate)
 
+    backup_p = sub.add_parser(
+        "backup",
+        help="consistent backup of state DB, Qdrant storage, archive, artifacts (M7, PRD §14)",
+    )
+    backup_p.add_argument("--config", help="path to config YAML")
+    backup_p.add_argument(
+        "--to", help="backup destination directory (default paths.backup_root)"
+    )
+    backup_p.add_argument(
+        "--state-only",
+        action="store_true",
+        help="skip archive+artifacts (fast state+index consistency backup)",
+    )
+    backup_p.set_defaults(_func=_backup)
+
+    restore_p = sub.add_parser(
+        "restore", help="restore a backup into an isolated directory (M7)"
+    )
+    restore_p.add_argument("--backup", required=True, help="backup directory to restore")
+    restore_p.add_argument(
+        "--target", required=True, help="fresh target directory (created if absent)"
+    )
+    restore_p.add_argument(
+        "--force", action="store_true", help="allow an existing EMPTY target directory"
+    )
+    restore_p.set_defaults(_func=_restore)
+
+    verify_p = sub.add_parser(
+        "verify",
+        help="verify system/backup integrity: DB, source links, artifacts, index, checksums (M7)",
+    )
+    verify_p.add_argument("--config", help="path to config YAML")
+    verify_p.add_argument(
+        "--backup", help="also verify this backup directory's manifest checksums"
+    )
+    verify_p.add_argument("--search", help="run a smoke search with this query")
+    verify_p.add_argument(
+        "--full-checksums",
+        action="store_true",
+        help="re-hash every backed-up file (default trusts content-addressed paths)",
+    )
+    verify_p.add_argument("--json", action="store_true", help="emit results as JSON")
+    verify_p.set_defaults(_func=_verify)
+
     pilot_p = sub.add_parser(
         "pilot",
         help="M6 pilot tooling: corpus survey, stratified sample, run, latency, report, "
@@ -1112,19 +1246,7 @@ def build_parser() -> argparse.ArgumentParser:
     pas.add_argument("--seed", type=int, default=42, help="sampling seed (default 42)")
     pas.set_defaults(_func=_pilot_annotate_suggest)
 
-    _register_stub(sub, "backup", "consistent backup of DB, Qdrant, and manifests (M7)")
-    _register_stub(sub, "restore", "restore a backup into an isolated directory (M7)")
-    _register_stub(sub, "verify", "verify source links and search after restore (M7)")
     return parser
-
-
-def _register_stub(
-    sub: argparse._SubParsersAction[argparse.ArgumentParser], name: str, help: str
-) -> None:
-    milestone = help.rsplit("(", 1)[-1].rstrip(")")
-    p = sub.add_parser(name, help=help)
-    p.add_argument("--config", help="path to config YAML")
-    p.set_defaults(_func=_not_implemented(milestone))
 
 
 def main(argv: list[str] | None = None) -> int:

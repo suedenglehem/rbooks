@@ -50,6 +50,9 @@ class Paths(BaseModel):
     - qdrant_root: Qdrant storage (SSD).
     - model_root: local model weights (GGUF, embeddings, reranker).
     - scratch_root: temporary/intermediate files; hard-capped (SSD).
+    - backup_root: optional default destination for `library-rag backup` (M7).
+      Backups on internal storage recover accidental loss; they are not
+      independent disaster backups (PRD §14).
     """
 
     source_roots: list[Path] = Field(default_factory=list)
@@ -59,6 +62,7 @@ class Paths(BaseModel):
     qdrant_root: Path
     model_root: Path
     scratch_root: Path
+    backup_root: Path | None = None
 
     @field_validator(
         "archive_root",
@@ -67,12 +71,15 @@ class Paths(BaseModel):
         "qdrant_root",
         "model_root",
         "scratch_root",
+        "backup_root",
         "source_roots",
     )
     @classmethod
     def _make_absolute(cls, v: Any) -> Any:
         # Normalize to absolute paths so overlap checks are stable. Relative paths
         # are resolved against the current working directory at load time.
+        if v is None:
+            return None
         if isinstance(v, list):
             return [Path(item).expanduser().absolute() for item in v]
         return Path(v).expanduser().absolute()
@@ -84,14 +91,19 @@ class Paths(BaseModel):
         # write into the read-only library), (b) a source root nested inside a
         # managed root (we could clobber the source), or (c) one managed root
         # nested inside another (scratch could swallow the DB, etc.).
-        managed = {
-            "archive_root": self.archive_root,
-            "artifact_root": self.artifact_root,
-            "state_root": self.state_root,
-            "qdrant_root": self.qdrant_root,
-            "model_root": self.model_root,
-            "scratch_root": self.scratch_root,
-        }
+        managed: dict[str, Path] = {}
+        for name in (
+            "archive_root",
+            "artifact_root",
+            "state_root",
+            "qdrant_root",
+            "model_root",
+            "scratch_root",
+            "backup_root",
+        ):
+            path = getattr(self, name)
+            if path is not None:
+                managed[name] = path
         # (c) managed roots must not nest inside each other.
         for name_a, path_a in managed.items():
             for name_b, path_b in managed.items():
