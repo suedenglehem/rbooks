@@ -227,8 +227,17 @@ def _reconcile(args: argparse.Namespace) -> int:
     db = _open_state(cfg)
     try:
         # For each configured source root, reconcile its aliases. A root that
-        # does not exist is treated as an unavailable mount and left untouched.
-        mounts = [Mount(label=str(r), root=r, sentinel=None) for r in cfg.paths.source_roots]
+        # does not exist — or whose configured mount sentinel is missing — is
+        # treated as an unavailable mount and left untouched, so an empty but
+        # present mount point can never prune its aliases.
+        mounts = [
+            Mount(
+                label=str(r),
+                root=r,
+                sentinel=Path(sp) if (sp := cfg.mount_sentinels.get(str(r))) is not None else None,
+            )
+            for r in cfg.paths.source_roots
+        ]
         visible = set()
         for r in cfg.paths.source_roots:
             if r.exists():

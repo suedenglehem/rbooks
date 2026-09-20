@@ -550,8 +550,10 @@ class Config(BaseModel):
     pilot: PilotSettings = Field(default_factory=PilotSettings)
 
     # Optional sentinel files that must exist to prove each mount is present.
-    # Mapping of a human label to a file path that must exist. An empty value
-    # means "no sentinel configured for this mount."
+    # Mapping of a SOURCE ROOT PATH (the same string used as the key in
+    # paths.source_roots) to a file path that must exist. scan_root looks the
+    # sentinel up by the root's path string, so key by path, not by a label;
+    # a root with no entry is scanned with no sentinel check.
     mount_sentinels: dict[str, str] = Field(default_factory=dict)
 
     # Path to the operator's GPU-assignment map (UUID -> role). Populated by the

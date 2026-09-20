@@ -1057,31 +1057,152 @@ done; operator pre-approved the report 2026-09-20; the report is
   8192 = "never reject anything that fits the context" — safe: bge-m3
   KV at 8192 is ~1.2 GB), or accept explicit failures (designed
   behavior: counted, never zombie-retried), or M7 BPE-aware chunking.
+- [DONE 2026-09-20] **Sandbox drain #2 finished, verified from the
+  jobs table:** extract 300 ✓; ocr 1048/1048 ✓; chunk 316 ✓ (300 +
+  16 re-keys); embed 306 ✓ + 1 permanent (the documented ibm.pdf,
+  number/hex-dense class); publish 13,172 ✓ + 1 permanent (the
+  ibm.pdf book — in the index minus the over-long chunks, designed
+  behavior). 292 active publications; 300 documents. Sandbox
+  quiescent — kept untouched as the pilot artifact.
+- [DONE 2026-09-20] Committed + pushed the worker self-lock fix +
+  regression test + embed-ports pooling as **22aaa70** (gate: ruff
+  clean, mypy 76 files, 400 passed).
+- [DONE 2026-09-20] config.yaml (gitignored, operator file):
+  `retrieval.stats_epoch: frozen` + `services.embed_ports:
+  [8081..8088]` (embed_port 8081 kept as the single-endpoint
+  fallback).
+- [DONE 2026-09-20] **Fleet bumped to 8192** (operator: "Bump to
+  8192, then launch"): all 8 instances run `--batch-size 8192
+  --ubatch-size 8192` (embedder.sh updated, health-verified
+  8081-8088); per-input ceiling = 8192 BPE tokens — a 3656-token
+  input verified accepted on all 8 endpoints, so the number/hex-dense
+  rejection class (ibm.pdf) is class-fixed. Measured word→BPE ratios
+  EN 1.39 / DE 1.69 / FR 1.65; ~7000 tok/s per instance on a batch of
+  8.
+- [DONE 2026-09-20] **Per-job verbose logging** (operator request,
+  verbatim: "logging system which you will able to use if something
+  goes wrong. we won't keep verbose logging forever, you run verbose
+  logging next to short logging for current jobs, if a job fails,
+  then keep verbose log for debugging, otherwise flush it"): each
+  claimed job is captured at DEBUG to
+  `<state_root>/job_logs/<job_id>.attempt<N>.log` — written under its
+  final name from the first line, so a mid-job crash leaves the log
+  (the file's existence during a run is NOT a failure signal);
+  keep-on-failure only (permanent, or retryable with an error
+  category), flush on success/deferral/lost-lease; newest-500 cap on
+  keep. 6 new tests; gate: ruff clean, mypy 76 files, **394
+  passed**. Committed + pushed as **ecd2582**.
+- [IN PROGRESS 2026-09-20] **Batch 2 — second stratified sample**
+  (operator: "sample again books in repository
+  /mnt/models_sas_ssd/books/ for running second batch of tests, to
+  see if other bugs pop up"): 300 books, seed 1337, 35 strata, no
+  page cap, **zero overlap with the pilot's 300** (survey
+  pre-filtered), 32,441 pages; isolated sandbox
+  `/mnt/models_sas_ssd/library-rag/batch2-sandbox/` (own
+  state/qdrant/archive/artifact/scratch; inherits frozen epoch +
+  8-port embed pooling from config.yaml). Launched detached:
+  `uv run library-rag pilot run --config config.yaml --manifest
+  batch2-sandbox/scratch/manifest_batch2.json --sandbox-root
+  batch2-sandbox` (short log: `batch2-sandbox/scratch/run.log`).
+  First checks: registration 300/300, ~95 extracts ✓, **zero failed
+  jobs** — a "kept log" sighting (job 96) was just the live capture
+  of an 8-minute extract, flushed on success (the keep/flush
+  mechanism verified both ways). ETA several hours (OCR-dominated,
+  ~1.9 s/page). Watch: any file left in `state/job_logs/` after a
+  job settles = a real failure to investigate; run.log for worker
+  errors; embed-pool health.
+- [IN PROGRESS 2026-09-20] **Abrupt-shutdown simulation** (operator:
+  "may be, simulate machine abrupt shutdown and recovery from that").
+  At 20:49:48 (drain 62% through extract: 200/300 ✓, 2,789 ocr
+  pending, 25,016 units, **0 failed jobs**) `kill -9` on the worker
+  (pid 64669) with job **279 in flight** (extract, attempt 1, lease
+  to 20:56:41). Post-mortem, all PASS:
+  - `PRAGMA integrity_check` = ok, `quick_check` = ok, 0 FK
+    violations on the sandbox library.db.
+  - Local-Qdrant flock acquired by a fresh probe → the kernel
+    released the dead process's lock; a new client can open the
+    store.
+  - Job 279 stayed `running` in the DB (worker died before state
+    update) — exactly the lease-expiry + reclaim path the design
+    relies on.
+  - **The crashed job's verbose log was kept**:
+    `state/job_logs/279.attempt1.log`, last line
+    `20:49:28 extract: start {job 279, rev b8cd000f…, doc
+    5a568094…}` — the logging system doing its one job.
+  Recovery: identical `pilot run` command, same `--sandbox-root`,
+  appended to the same run.log (recovery run: wrapper 72172, worker
+  72176). Pre-crash snapshot (3,289 jobs, 300 docs) recorded for
+  before/after comparison. RECOVERY VERIFIED — drill PASS:
+  re-registration added 0 docs/0 duplicate jobs (300 docs, growth
+  3289→3671 = exactly 80 new small-book extracts → +80 chunk
+  +302 ocr jobs); job 279 correctly NOT claimed before its lease
+  lapsed; after expiry (20:56:41) it was reclaimed and **succeeded
+  as attempt 2** with error_category None — `279.attempt1.log`
+  stays as the crash artifact, the attempt-2 log flushed on
+  success (keep/flush semantics verified through a real
+  crash+retry); drain re-converging (289/300 extracts, 0 failed
+  jobs) and continuing to completion (OCR-dominated).
+- **Measured per-stage rates (mid-drain, 2026-09-20 21:34; saved as
+  mycelium #55):** gap analysis of the completion timeline (single
+  worker: inter-completion gap = that job's duration): extract
+  6.2 s/book (300 books in 0.52 h wall); **OCR 4.59 s/job median**
+  (p10 1.08 / p90 5.07 / max 6.1) — OCR is SELECTIVE per PRD §8C
+  (only text-layer-less pages get routed): 6,176 OCR jobs for 32,441
+  units = **19% of pages scanned**, 20.6 OCR jobs/book; chunk
+  median 4.65 s/book (p10 0.45, max 43.7 s for a 1,622-page book);
+  embed/publish not yet complete in batch2 (embed ≈ 12 h corpus-
+  scale at the fleet's 7,000 tok/s over ~300M BPE tokens).
+  NOTE: 4.59 s/OCR-page is 2.4× the pilot's 1.9 s — batch2 has no
+  page cap and includes large scanned books; 4.59 is the planning
+  rate.
+- **Mount-sentinel gap found and closed (2026-09-20, post-crash
+  sim):** the configured sentinel had silently never been enforced —
+  config.yaml keyed `mount_sentinels` by a human label (`books:`)
+  while `scan_root` looks it up by **source root path string**
+  (proven by tests/test_scan.py:176; the stale "human label"
+  docstring in config.py was the misleading root cause). Three-part
+  fix: (1) created
+  `/mnt/models_sas_ssd/books/.library-rag-sentinel` (21:39,
+  zero-byte marker — NOTE: this file lives INSIDE the source root;
+  flagged to operator per "do not delete or modify source books";
+  not picked up by scans since it is neither PDF nor EPUB);
+  (2) config.yaml re-keyed to the root path + config.py docstring
+  corrected (no "empty value = no sentinel" claim: scan.py treats a
+  set-but-missing/empty value as BLOCKING — only a missing KEY means
+  no check); (3) `library-rag reconcile` hardcoded `sentinel=None`,
+  so an empty-but-present mount could prune every `path_alias` under
+  its root — it now passes the configured sentinel through (one-line
+  fix; `reconcile_catalog`/`mount_present` already implement the
+  semantics and module tests cover them). Verified: gate replication
+  positive (real sentinel → scan proceeds) and negative
+  (nonexistent sentinel → mount blocked); full gate green (ruff,
+  mypy, 394 passed). Verified CLI signatures: `library-rag scan
+  [--config] [--json]`, `library-rag ingest [--config] [--once]
+  [--lease-ttl]` (ingest default runs until SIGTERM).
 - **Next unfinished task:**
-  1. Let sandbox drain #2 finish (monitor: progress + exit line in
-     drain2.log); verify final counts: chunk 0 pending; embed 292
-     succeeded + 1 documented permanent (the ibm.pdf book, see finding
-     above); publish ~0 pending; no new failures. Then the sandbox is
-     quiescent — keep it untouched as the pilot artifact.
-  2. Commit + push the worker self-lock fix + regression test +
-     embed-ports pooling (gate already green: 400 passed).
-  3. Add to /dd2/andrei/books_rag/config.yaml (gitignored, operator
-     file): `retrieval: stats_epoch: frozen` (report §8) and
-     `services.embed_ports: [8081..8088]` (keep embed_port 8081 as the
-     single-endpoint fallback).
-  4. **Full-library ingestion (approved, report pre-approved
-     2026-09-20):** `uv run library-rag scan --config config.yaml`
+  1. **Let the batch-2 drain finish** (recovery run, worker 72176;
+     monitors armed: failed-job poll 30-min expiry, re-arm as
+     needed; exit watcher on 72176). State at 21:51: **extract
+     300/300 COMPLETE**, OCR 742 done / 5,433 remaining, chunk
+     105/300, embed 103 pending, 0 failed jobs; all 8 embed
+     endpoints healthy. Measured OCR pace since 21:34: 344 jobs in
+     17 min ≈ 20.2 jobs/min → 5,433 remaining ≈ **~4.5 h → ETA
+     ~02:20** (faster than the 4.59 s/job planning rate). Terminal
+     expectation: ~300 documents, all stages succeeded except
+     legitimate per-book permanents — any permanent failure gets its
+     kept verbose log read and classified before the full run.
+  2. Once batch 2 is fully drained and the crash sim is clean:
+     **full-library ingestion** (approved, report pre-approved
+     2026-09-20): `uv run library-rag scan --config config.yaml`
      then `uv run library-rag ingest --config config.yaml` — detached
-     + monitored; ETA ~700 h ≈ 29 days serial (report §4); pooled
-     embed saves ~2 days of the 135 h embed stage (realistically 3-6x,
-     replicas share GPU 2 with vLLM). Known accepted risk: number/
-     hex-dense books fail explicitly per the finding above (0.3% of
-     the stratified sample); the operator may raise the fleet
-     `--batch-size` to 4096/8192 before or during the run — `library-
-     rag retry --include-permanent` recovers any affected books after.
-     Do not claim completion without evidence. The PRD
-     coordinator/worker-subprocess architecture is the M7 prerequisite
-     for the ~1-week parallel run.
-  5. Operator labels the 80 question candidates (top up to 100-200) in
-     /mnt/models_sata_ssd/library-rag/scratch/question_candidates.jsonl
-     — human-only; never invent labels.
+     + monitored; **recomputed ETA from batch-2 rates (replaces the
+     report's ~700 h ≈ 29 days): extract ~17 h, chunk ~48 h, OCR
+     ~914–990 h (34,768 books × 20.6 scanned pages × 4.59 s) ≈
+     38–41 days, embed ~12 h, publish ~10–20 h (frozen epoch) →
+     ~41–45 days single-worker, OCR ≈ 93% of it.** The PRD
+     coordinator/worker-subprocess architecture (M7) is the
+     prerequisite for a ~2-day parallel run (32 OCR processes). Do
+     not claim completion without evidence.
+  3. Operator labels the 80 question candidates (top up to 100-200)
+     in /mnt/models_sata_ssd/library-rag/scratch/question_candidates.
+     jsonl — human-only; never invent labels.
