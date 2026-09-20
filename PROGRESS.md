@@ -1193,19 +1193,18 @@ done; operator pre-approved the report 2026-09-20; the report is
   Consistent with the pilot capacity gate that passed.
 - **Next unfinished task:**
   1. **Let the batch-2 drain finish** (recovery run, worker 72176;
-     monitors armed: failed-job poll 30-min expiry, re-arm as
-     needed; exit watcher on 72176). State at 22:00: **extract
-     300/300 COMPLETE**, OCR 841 done / 5,335 remaining, chunk
-     106/300 (+1 running), embed 104 pending, 0 failed jobs.
-     Pace: 21:34–21:51 window ran 20.2 jobs/min (post-restart
-     short-book burst); 21:51–22:00 window 99 jobs / 9 min ≈
-     11 jobs/min, back near the 13.1 jobs/min planning rate as the
-     queue hits denser books — expect ETA **~05:00–06:15**
-     (re-measure at each re-arm; the 02:20 figure was off the
-     burst window). Terminal expectation: ~300 documents, all
-     stages succeeded except legitimate per-book permanents — any
-     permanent failure gets its kept verbose log read and
-     classified before the full run.
+     monitors armed: failed-job poll "re-arm 4", 30-min expiry,
+     exit watcher on 72176). State at 23:03: **extract 300/300
+     COMPLETE**, OCR 2,488 done / 3,687 remaining (+1 running),
+     chunk 187/300, embed 183 pending, 0 failed jobs. Pace:
+     22:17–23:03 window 1,257 OCR jobs / 46 min ≈ 27.3 jobs/min
+     (another short-book burst; re-measure at each re-arm).
+     Remaining OCR ≈ 135 min at this pace → **ETA ~01:30–03:30**
+     (the 05:00–06:15 band assumed the 13.1 jobs/min planning
+     rate and is now stale-fast). Terminal expectation: ~300
+     documents, all stages succeeded except legitimate per-book
+     permanents — any permanent failure gets its kept verbose log
+     read and classified before the full run.
   2. Once batch 2 is fully drained and the crash sim is clean:
      **full-library ingestion** (approved, report pre-approved
      2026-09-20): `uv run library-rag scan --config config.yaml`
@@ -1221,3 +1220,71 @@ done; operator pre-approved the report 2026-09-20; the report is
   3. Operator labels the 80 question candidates (top up to 100-200)
      in /mnt/models_sata_ssd/library-rag/scratch/question_candidates.
      jsonl — human-only; never invent labels.
+
+## M7 — Full-run operations and maintenance
+
+Scope (PRD line 180): scheduled discovery, safe revision
+replacement, explicit removal, generation migration, GC with
+reference checks, backup/restore, coverage reports. Gate: "restore
+into an isolated directory and verify source links/search; add a
+book without recomputing unchanged sources; full-library launch
+command and stop/resume runbook documented." Sliced so each piece
+ships green during the full-run window.
+
+### Slice 1 — backup / restore / verify (PRD §14)
+- [DONE 2026-09-21] **Committed bff67a6, pushed to origin/master.**
+  New `src/library_rag/backup.py` (+ tests/test_backup.py, 11 tests;
+  CLI `backup`/`restore`/`verify` subcommands replacing the stubs;
+  `Paths.backup_root: Path | None` in config.py — gitignored
+  config.yaml points it at /mnt/models_sas_ssd/library-rag/backups):
+  - `create_backup`: consistent state DB via SQLite's backup API
+    (snapshot left in DELETE journal mode), Qdrant local storage
+    copied only while the storage `.lock` is free (publication
+    quiesced — refuses a locked client, remote mode, or a
+    non-empty destination), archive/artifacts included, config
+    last. Same-device files are HARDLINKED (nearly-free backups on
+    the big disk); every file recorded in a manifest written LAST
+    (sha256 per file; archive files are content-addressed so the
+    path IS the checksum — `sha256_source: "path"`).
+  - `restore_backup`: into a fresh isolated directory (force only
+    for an existing EMPTY one), materializes every manifest file,
+    and writes a rewritten self-contained `config.yaml` (5 roots
+    re-pointed under the target, `qdrant_path` → target/qdrant,
+    `backup_root` dropped, source_roots untouched). A live
+    `api_token` is redacted to "REDACTED" in the backed-up copy.
+  - `verify_system` (the M7 gate check): db.integrity (PRAGMA),
+    archive.links + artifacts.links (size-checked), qdrant.index
+    (active point count vs `SUM(expected_points)` of active
+    publications), search.smoke (real embedder round-trip), and
+    backup.checksums when a backup dir is given. Degrades
+    explicitly without a Qdrant client.
+  - **WAL-flip nuance:** `Database.connect` sets WAL, so the first
+    open of a restored DELETE-mode snapshot rewrites header bytes
+    18/19 — the state file's sha256 legitimately diverges from the
+    backup after boot. `_is_wal_database()` (header check) makes
+    `backup.checksums` size-only for such files; integrity is
+    covered by the live db.integrity check.
+- **Gate (2026-09-21, real output):** ruff "All checks passed!",
+  mypy "Success: no issues found in 78 source files", pytest
+  **405 passed in 46.53s** (2 anyio warnings, benign).
+- Bugs found en route: `_same_device` crashed on the not-yet-created
+  destination (compare against parent); `--force` into an existing
+  empty dir hit FileExistsError (mkdir exist_ok); the WAL flip broke
+  `backup.checksums` on the restored tree (see nuance above);
+  leftover stub subparser registrations conflicted with the real
+  M7 parsers (argparse ArgumentError) — stubs + dead helpers
+  removed.
+
+### Next unfinished task
+1. [DONE 2026-09-21] Slice 1 committed (bff67a6) + pushed.
+2. **Slice 2: GC with reference checks** — collect unreferenced
+   archive objects / artifacts / stale job logs only when no
+   source_revision, source_unit, embedding_batch, or publication
+   still references them; dry-run first, then `--execute`.
+3. Slices 3–7 (order): explicit removal (book → rev → points →
+   archive, with verification), coverage report (corpus stats vs
+   source root: missing / stale / orphaned), runbook (full-library
+   launch command + stop/resume, documented), scheduled discovery,
+   safe revision replacement + generation migration.
+4. Parallel track: batch-2 drain → full-library launch (see M6
+   next-task item 1-2); M7 work proceeds during the run window.
