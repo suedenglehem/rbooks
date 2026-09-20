@@ -1275,16 +1275,55 @@ ships green during the full-run window.
   M7 parsers (argparse ArgumentError) — stubs + dead helpers
   removed.
 
+### Slice 2 — GC with reference checks (PRD §14)
+- [DONE 2026-09-21] **Committed 33e6eb9, pushed to origin/master.**
+  New `src/library_rag/gc.py` (+ tests/test_gc.py, 9 tests; CLI
+  `gc` subcommand; archive.py docstring now points here):
+  - `run_gc(db, cfg, *, execute=False, grace_seconds=600.0,
+    now=None) -> GcReport`. Three kinds walked bottom-up:
+    *archive* (`<archive_root>/<2hex>/<sha256>` — candidate iff no
+    `source_revisions` row for that SHA; malformed layout →
+    "malformed archive path"), *artifact* (extract units per
+    `source_units`, embedding checkpoints per
+    `embedding_batches`; a referenced `batch_NNNNN.bin`
+    implicitly protects its `.json` sidecar via
+    `checkpoint_manifest_path`), *job_log*
+    (`<state_root>/job_logs/<job_id>.attempt<N>.log` — candidate
+    iff the job row is gone; unrecognized filenames are never
+    collected).
+  - Safety: refuses (`GcError`) while any job is `running`;
+    mtime grace window (default 600 s, `grace_seconds=0` allowed,
+    negative rejected) covers the scan window in which archive
+    bytes are copied BEFORE the revision row commits; dry-run is
+    the default (`GcReport.candidates` with kind/relpath/size/
+    reason), `--execute` unlinks and then prunes directories that
+    became empty (bottom-up fixed-point — a `topdown=False`
+    walk's dirnames list is stale mid-pass, so each pass
+    re-checks live `iterdir()` until none changes). Per-file
+    delete OSErrors land in `report.errors`, never raise. GC
+    never touches source roots, the state DB, Qdrant storage, or
+    scratch.
+- **Gate (2026-09-21, real output):** ruff "All checks passed!",
+  mypy "Success: no issues found in 80 source files", pytest
+  **414 passed in 48.43s** (405 baseline + 9 new).
+- Bugs found en route: `_prune_empty_dirs` left a parent dir
+  behind after pruning its child (stale `os.walk` dirnames —
+  fixed with the fixed-point loop); mypy no-any-return on a
+  `row[...]` cast in the test; ruff UP035 (Callable →
+  collections.abc) + F541 (stray f-prefix).
+- Drain snapshot 2026-09-21 (while writing slice 2): OCR
+  3349/6176, chunk 287/300, embed 282 pending, 0 failed, worker
+  72176 alive.
+
 ### Next unfinished task
-1. [DONE 2026-09-21] Slice 1 committed (bff67a6) + pushed.
-2. **Slice 2: GC with reference checks** — collect unreferenced
-   archive objects / artifacts / stale job logs only when no
-   source_revision, source_unit, embedding_batch, or publication
-   still references them; dry-run first, then `--execute`.
-3. Slices 3–7 (order): explicit removal (book → rev → points →
-   archive, with verification), coverage report (corpus stats vs
-   source root: missing / stale / orphaned), runbook (full-library
-   launch command + stop/resume, documented), scheduled discovery,
-   safe revision replacement + generation migration.
+1. [DONE 2026-09-21] Slice 2 committed (33e6eb9) + pushed.
+2. **Slice 3: explicit removal** — `library-rag remove <book>`:
+   deactivate revision, delete its points from Qdrant, then the
+   archive object if no other revision references the SHA, with
+   verification (counts before/after).
+3. Slices 4–7 (order): coverage report (corpus stats vs source
+   root: missing / stale / orphaned), runbook (full-library
+   launch command + stop/resume, documented), scheduled
+   discovery, safe revision replacement + generation migration.
 4. Parallel track: batch-2 drain → full-library launch (see M6
    next-task item 1-2); M7 work proceeds during the run window.
