@@ -41,6 +41,7 @@ from .api import create_app
 from .backup import BackupError, create_backup, restore_backup, verify_system
 from .catalog import source_file_count
 from .config import MOUNT_SENTINEL_ENV, Config, ConfigError, load_config
+from .coverage import CoverageReport, coverage_report
 from .db import Database, db_path_for
 from .doctor import render_json, render_text, run_doctor
 from .embeddings import Embedder, make_embedder
@@ -710,6 +711,98 @@ def _remove(args: argparse.Namespace) -> int:
     return EXIT_OK if not report.errors else EXIT_ERROR
 
 
+def _coverage(args: argparse.Namespace) -> int:
+    setup_logging(args.log_level, args.log_format)
+    cfg = _require_config(args)
+    db = _open_state(cfg)
+    qdrant: RealQdrantOps | None = None
+    try:
+        # A running worker holds the local Qdrant storage lock for its whole
+        # run; the report must still work while the system is up, so the
+        # point counts degrade to None instead of failing the command.
+        try:
+            candidate = RealQdrantOps(cfg)
+        except Exception:
+            candidate = None
+        qdrant = candidate if candidate is not None and candidate.ping() else None
+        report = coverage_report(db, cfg, qdrant=qdrant)
+    finally:
+        if qdrant is not None:
+            qdrant.close()
+        db.close()
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+    else:
+        _coverage_text(report)
+    return EXIT_OK
+
+
+def _coverage_text(report: CoverageReport) -> None:
+    s = report.stages
+    f = report.failures
+    discovered = sum(rc.discovered for rc in report.roots if not rc.mount_unavailable)
+    print(
+        f"coverage: {s.documents} document(s), {s.revisions} revision(s), "
+        f"{s.published} active publication(s)"
+    )
+    print(
+        f"  funnel: discovered {discovered} -> archived {s.archived} -> "
+        f"extracted {s.extracted} -> chunked {s.chunked} -> embedded {s.embedded} -> "
+        f"indexed {s.indexed} -> published {s.published}"
+    )
+    print(
+        f"  ocr units: routed {s.ocr_routed}, done {s.ocr_done}, "
+        f"pending {s.ocr_pending}, failed {s.ocr_failed}"
+    )
+    if report.points_active is None:
+        print(f"  points: catalog {report.points_expected}, index: unavailable")
+    else:
+        print(
+            f"  points: catalog {report.points_expected}, "
+            f"active {report.points_active}, total {report.points_total}"
+        )
+    failed_jobs = f.failed_jobs_by_stage
+    detail = f" ({', '.join(f'{k} {v}' for k, v in sorted(failed_jobs.items()))})" if failed_jobs else ""
+    print(
+        f"  failures: {sum(failed_jobs.values())} failed job(s){detail}, "
+        f"{f.failed_extractions} failed extraction(s), {f.ocr_failed_units} failed OCR unit(s)"
+    )
+    if s.archive_missing:
+        print(
+            f"  archive missing: {len(s.archive_missing)} object(s): "
+            f"{', '.join(s.archive_missing[:10])}"
+        )
+    for rc in report.roots:
+        if rc.mount_unavailable:
+            print(f"  root {rc.root}: mount unavailable")
+            continue
+        print(
+            f"  root {rc.root}: discovered {rc.discovered}, registered {rc.registered}, "
+            f"unindexed {len(rc.unindexed)}, orphaned {len(rc.orphaned)}, "
+            f"stale {len(rc.stale)}, invalid {len(rc.invalid)}"
+        )
+        for label, paths in (
+            ("unindexed", rc.unindexed),
+            ("orphaned", rc.orphaned),
+            ("stale", rc.stale),
+            ("invalid", rc.invalid),
+        ):
+            for p in paths[:10]:
+                print(f"    {label}: {p}")
+            if len(paths) > 10:
+                print(f"    ... and {len(paths) - 10} more {label}")
+    if report.stalled:
+        by_stage: dict[str, int] = {}
+        for sd in report.stalled:
+            by_stage[sd.stage] = by_stage.get(sd.stage, 0) + 1
+        summary = ", ".join(f"{k} {v}" for k, v in sorted(by_stage.items()))
+        print(f"  stalled (no active publication): {len(report.stalled)} document(s): {summary}")
+        for sd in report.stalled[:10]:
+            print(f"    {sd.stage}: {sd.doc_id}")
+        if len(report.stalled) > 10:
+            print(f"    ... and {len(report.stalled) - 10} more")
+
+
 # --- M6 pilot ---------------------------------------------------------------
 
 
@@ -1246,6 +1339,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     remove_p.add_argument("--json", action="store_true", help="emit the report as JSON")
     remove_p.set_defaults(_func=_remove)
+
+    coverage_p = sub.add_parser(
+        "coverage",
+        help="coverage report: pipeline funnel vs source roots (M7, read-only)",
+    )
+    coverage_p.add_argument("--config", help="path to config YAML")
+    coverage_p.add_argument("--json", action="store_true", help="emit the report as JSON")
+    coverage_p.set_defaults(_func=_coverage)
 
     pilot_p = sub.add_parser(
         "pilot",
