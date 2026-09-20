@@ -76,6 +76,7 @@ from .questions import (
     suggest_candidates,
 )
 from .reconcile import Mount, reconcile_catalog
+from .removal import RemovalError, remove_document, resolve_target
 from .retrieval import IndexUnavailableError, search
 from .scan import scan_roots
 from .worker import DEFAULT_LEASE_TTL, run_worker
@@ -655,6 +656,60 @@ def _gc(args: argparse.Namespace) -> int:
     return EXIT_OK if not report.errors else EXIT_ERROR
 
 
+def _remove(args: argparse.Namespace) -> int:
+    setup_logging(args.log_level, args.log_format)
+    cfg = _require_config(args)
+    db = _open_state(cfg)
+    qdrant: RealQdrantOps | None = None
+    try:
+        # A running worker holds the local Qdrant storage lock; a document
+        # with no index points must still be removable, so the client degrades
+        # to None instead of failing the command.
+        try:
+            candidate = RealQdrantOps(cfg)
+        except Exception:
+            candidate = None
+        qdrant = candidate if candidate is not None and candidate.ping() else None
+        doc_id = resolve_target(db, args.target)
+        report = remove_document(db, cfg, qdrant, doc_id, execute=args.execute)
+    except RemovalError as exc:
+        print(f"remove error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    finally:
+        if qdrant is not None:
+            qdrant.close()
+        db.close()
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+    else:
+        mode = "execute" if report.executed else "dry-run"
+        print(f"remove ({mode}): {report.doc_id}")
+        print(
+            f"  points: {report.points}  publications: {report.publications}  "
+            f"generations: {report.generations}  revisions: {report.revisions}"
+        )
+        print(
+            f"  runs: {report.extraction_runs}  units: {report.source_units}  "
+            f"batches: {report.embedding_batches}  "
+            f"jobs cancelled: {report.jobs_cancelled}"
+        )
+        if report.archive_objects:
+            total = sum(int(o["size_bytes"]) for o in report.archive_objects)
+            print(
+                f"  archive: {len(report.archive_objects)} object(s), "
+                f"{total / 2**20:.1f} MiB"
+            )
+        for sha in report.archive_kept:
+            print(f"  archive kept (still referenced): {sha}")
+        if report.executed and report.verified:
+            print("  verified: all catalog rows and index points removed")
+        for e in report.errors:
+            print(f"  error: {e}", file=sys.stderr)
+        if not report.executed:
+            print("dry-run: nothing deleted; re-run with --execute to remove")
+    return EXIT_OK if not report.errors else EXIT_ERROR
+
+
 # --- M6 pilot ---------------------------------------------------------------
 
 
@@ -1177,6 +1232,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     gc_p.add_argument("--json", action="store_true", help="emit the report as JSON")
     gc_p.set_defaults(_func=_gc)
+
+    remove_p = sub.add_parser(
+        "remove",
+        help="explicitly remove a book: index points, catalog rows, archive object (M7)",
+    )
+    remove_p.add_argument("target", help="source path or doc_id of the book to remove")
+    remove_p.add_argument("--config", help="path to config YAML")
+    remove_p.add_argument(
+        "--execute",
+        action="store_true",
+        help="perform the removal (default is a dry-run report)",
+    )
+    remove_p.add_argument("--json", action="store_true", help="emit the report as JSON")
+    remove_p.set_defaults(_func=_remove)
 
     pilot_p = sub.add_parser(
         "pilot",
