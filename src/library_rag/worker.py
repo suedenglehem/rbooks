@@ -773,7 +773,7 @@ def _run_publish(
     jobs: Jobs,
     job: Claimed,
     lease_ttl: float,
-    qdrant: QdrantOps | None = None,
+    qdrant: QdrantOps,
 ) -> bool:
     """Stage and activate the revision's index generation under the publish
     lock (PRD §8F).
@@ -812,8 +812,7 @@ def _run_publish(
             jobs.succeed(job, json.dumps({"rev_id": rev_id, "result": "noop"}, sort_keys=True))
             return True
 
-    q = qdrant if qdrant is not None else RealQdrantOps(cfg)
-    if not q.ping():
+    if not qdrant.ping():
         jobs.fail(job, "qdrant_unavailable", "Qdrant unreachable; will retry", transient=True)
         return True
     owner = f"publish-{os.uname().nodename}-{os.getpid()}"
@@ -824,11 +823,11 @@ def _run_publish(
         try:
             # A fresh state (e.g. the pilot sandbox) has no collection yet;
             # under the publish lock creation is serialized with the switch.
-            q.ensure_collection(dimensions=cfg.embedding.dimensions)
+            qdrant.ensure_collection(dimensions=cfg.embedding.dimensions)
             result = publish_generation(
                 db,
                 cfg,
-                q,
+                qdrant,
                 rev_id=rev_id,
                 run_id=run_id,
                 on_progress=lambda: jobs.heartbeat(job, lease_ttl),
@@ -1030,47 +1029,61 @@ def run_worker(
 
     Stopping mid-loop is graceful by construction: at most the current job's
     current unit is in flight; everything already committed is durable and
-    resumable (PRD §7 SIGTERM). *qdrant*/*embedder* are injectable seams for
-    tests (and the CLI); production callers pass None and the worker builds
-    them per job.
+    resumable (PRD §7 SIGTERM).
+
+    *qdrant*/*embedder* are injectable seams for tests (and the CLI). When
+    *qdrant* is None the worker opens ONE client for the whole run — the
+    reconcile pass and every publish job share it — and closes it before
+    returning: in local (file-based) Qdrant mode a client holds an exclusive
+    lock on the storage folder for its lifetime, so a second client in the
+    same process is refused by its own first lock. The *embedder*, when None,
+    is still built per job: it is a stateless HTTP client and holds nothing
+    that can leak.
     """
     name = worker_name()
     jobs = Jobs(db)
-    if reconcile_on_start:
-        _reconcile_chunks(db, cfg)
-        _reconcile_index(db, cfg)
-        q = qdrant if qdrant is not None else RealQdrantOps(cfg)
-        try:
-            if q.ping():
-                reconcile_publications(db, cfg, q)
-        except Exception:  # best-effort: a broken index must not block the queue
-            pass
-    handlers: dict[str, Callable[..., bool]] = {
-        STAGE_EXTRACT: _run_extract,
-        STAGE_OCR: _run_ocr,
-        STAGE_CHUNK: _run_chunk,
-        STAGE_EMBED: partial(_run_embed, embedder=embedder),
-        STAGE_PUBLISH: partial(_run_publish, qdrant=qdrant),
-    }
-    completed = 0
-    while True:
-        if stop_event is not None and stop_event():
-            break
-        job = jobs.claim(name, lease_ttl)
-        if job is None:
-            if once:
+    own: RealQdrantOps | None = None
+    if qdrant is None:
+        qdrant = RealQdrantOps(cfg)
+        own = qdrant
+    try:
+        if reconcile_on_start:
+            _reconcile_chunks(db, cfg)
+            _reconcile_index(db, cfg)
+            try:
+                if qdrant.ping():
+                    reconcile_publications(db, cfg, qdrant)
+            except Exception:  # best-effort: a broken index must not block the queue
+                pass
+        handlers: dict[str, Callable[..., bool]] = {
+            STAGE_EXTRACT: _run_extract,
+            STAGE_OCR: _run_ocr,
+            STAGE_CHUNK: _run_chunk,
+            STAGE_EMBED: partial(_run_embed, embedder=embedder),
+            STAGE_PUBLISH: partial(_run_publish, qdrant=qdrant),
+        }
+        completed = 0
+        while True:
+            if stop_event is not None and stop_event():
                 break
-            if poll_delay > 0:
-                _sleep_interruptible(poll_delay, stop_event)
-            continue
-        handler = handlers.get(job.stage)
-        if handler is None:
-            jobs.fail(job, "unknown_stage", f"stage {job.stage!r} has no handler", transient=False)
-            completed += 1  # permanent_failed is a terminal state
-            continue
-        if handler(db, cfg, jobs, job, lease_ttl):
-            completed += 1
-    return completed
+            job = jobs.claim(name, lease_ttl)
+            if job is None:
+                if once:
+                    break
+                if poll_delay > 0:
+                    _sleep_interruptible(poll_delay, stop_event)
+                continue
+            handler = handlers.get(job.stage)
+            if handler is None:
+                jobs.fail(job, "unknown_stage", f"stage {job.stage!r} has no handler", transient=False)
+                completed += 1  # permanent_failed is a terminal state
+                continue
+            if handler(db, cfg, jobs, job, lease_ttl):
+                completed += 1
+        return completed
+    finally:
+        if own is not None:
+            own.close()
 
 
 def _sleep_interruptible(delay: float, stop_event: Callable[[], bool] | None) -> None:

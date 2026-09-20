@@ -6,6 +6,7 @@ jobs: extract, chunk, embed, and publish.
 
 from __future__ import annotations
 
+import fcntl
 import json
 from pathlib import Path
 from typing import Any
@@ -15,9 +16,14 @@ import pytest
 from fixtures import make_pdf
 from library_rag.config import Config
 from library_rag.db import Database
-from library_rag.embeddings import FakeEmbedder
+from library_rag.embeddings import (
+    FakeEmbedder,
+    checkpoint_path,
+    embedding_sha,
+    write_checkpoint,
+)
 from library_rag.identity import make_task_key
-from library_rag.indexing import FakeQdrant
+from library_rag.indexing import FakeQdrant, RealQdrantOps
 from library_rag.jobs import Claimed, Jobs
 from library_rag.scan import scan_roots
 from library_rag.worker import run_worker
@@ -136,3 +142,117 @@ def test_worker_missing_revision_permanent(state_db: Database, base_config: Conf
     assert jobs.counts() == {"permanent_failed": 1}
     job = _last_job(state_db)
     assert job["error_category"] == "missing_source"
+
+
+def test_worker_single_local_qdrant_client_per_run(
+    state_db: Database,
+    base_config: Config,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression for the drain-worker death: a local (file-based) Qdrant
+    # client holds an exclusive lock on the storage folder for its whole
+    # lifetime, so a *second* client in the same process is refused by its
+    # own first lock ("Storage folder ... is already accessed by another
+    # instance of Qdrant client"). The worker must therefore open at most
+    # ONE client per run, shared by the reconcile pass and every publish
+    # job, and close it before returning.
+    qdrant_dir = tmp_path / "qdrant"
+    base_config.services.qdrant_path = str(qdrant_dir)
+    # publish computes the embedding key even for an empty generation, so
+    # the embedder must be configured (fake is the test idiom).
+    base_config.embedding.fake = True
+
+    # One active revision with a succeeded, zero-unit extraction run: both
+    # seeded publish jobs reach the client without needing any artifacts,
+    # and the zero-chunk publish verifies cleanly (expected 0 points, got 0).
+    ts = 1_000_000.0
+    state_db.execute(
+        "INSERT INTO documents (doc_id, anchor_sha256, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?)",
+        ("doc-1", "a" * 64, ts, ts),
+    )
+    state_db.execute(
+        """
+        INSERT INTO source_revisions
+            (rev_id, doc_id, sha256, size_bytes, format, archive_relpath,
+             first_path, is_active, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+        """,
+        ("rev-1", "doc-1", "b" * 64, 10, "pdf", "rev-1.pdf", "/books/rev-1.pdf", ts),
+    )
+    state_db.execute(
+        """
+        INSERT INTO extraction_runs
+            (run_id, rev_id, doc_id, parser_version, settings_sha, unit_count,
+             state, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, 0, 'succeeded', ?, ?)
+        """,
+        ("run-1", "rev-1", "doc-1", "pymupdf-1.0", "c" * 64, ts, ts),
+    )
+
+    # Publication loads vectors from the embedding checkpoints even for an
+    # empty generation, so seed the consistent zero-batch the embed stage
+    # would have written: one row plus its (empty) checkpoint artifact.
+    emb_sha = embedding_sha(base_config)
+    ckpt = checkpoint_path(base_config.paths.artifact_root, "run-1", emb_sha, 0)
+    vector_sha = write_checkpoint(
+        ckpt, [], base_config.embedding.dimensions, {"chunk_ids": []}
+    )
+    state_db.execute(
+        """
+        INSERT INTO embedding_batches
+            (batch_id, run_id, model_revision, embedding_sha, batch_index,
+             chunk_ids, vector_sha256, artifact_relpath, created_at)
+        VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)
+        """,
+        (
+            "emb-1",
+            "run-1",
+            "fake-v1",
+            emb_sha,
+            "[]",
+            vector_sha,
+            str(ckpt.relative_to(base_config.paths.artifact_root)),
+            ts,
+        ),
+    )
+
+    # Count every real client the worker constructs during the run.
+    created: list[RealQdrantOps] = []
+    real_ctor = RealQdrantOps
+
+    def counting_ctor(cfg: Config, *args: Any, **kwargs: Any) -> RealQdrantOps:
+        ops = real_ctor(cfg, *args, **kwargs)
+        created.append(ops)
+        return ops
+
+    monkeypatch.setattr("library_rag.worker.RealQdrantOps", counting_ctor)
+
+    jobs = Jobs(state_db)
+    for version in ("v1", "v2"):
+        jobs.enqueue(
+            make_task_key("publish", "rev-1", version),
+            "publish",
+            input_id="rev-1",
+            input_version=version,
+        )
+
+    # No qdrant argument: the worker must open its own client. Reconcile is
+    # off so the seeded zero-fingerprint run is not re-queued as chunk work.
+    completed = run_worker(
+        state_db, base_config, once=True, poll_delay=0, reconcile_on_start=False
+    )
+
+    # The invariant the fix establishes: exactly one client for the whole
+    # run, shared by both publish jobs. (The buggy code constructed one per
+    # publish job; the second local client crashed on the first one's lock.)
+    assert len(created) == 1
+    assert completed == 2
+    assert Jobs(state_db).counts() == {"succeeded": 2}
+
+    # And the worker closed its client: the storage lock is free again, so a
+    # later client in the same process can open the store.
+    lock_path = qdrant_dir / ".lock"
+    with open(lock_path, "rb") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)

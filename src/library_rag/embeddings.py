@@ -127,9 +127,10 @@ def make_embedder(cfg: Config) -> Embedder:
         )
     if emb.fake:
         return FakeEmbedder(dimensions=emb.dimensions)
+    ports = cfg.services.embed_ports or [cfg.services.embed_port]
     return LlamaCppEmbedder(
         host=cfg.services.embed_host,
-        port=cfg.services.embed_port,
+        ports=ports,
         model_revision=emb.effective_revision,
         model_name=emb.model_name or emb.effective_revision,
         dimensions=emb.dimensions,
@@ -185,19 +186,28 @@ class FakeEmbedder:
 
 
 class LlamaCppEmbedder:
-    """OpenAI-compatible ``/v1/embeddings`` client for a local llama.cpp server.
+    """OpenAI-compatible ``/v1/embeddings`` client for local llama.cpp servers.
 
-    The server is started by the operator (pinned llama.cpp + GGUF weights
-    under the model root); this client only talks HTTP. Unreachable/5xx ->
-    :class:`ModelUnavailableError` (transient); an OOM report ->
-    :class:`EmbeddingOOMError` (caller halves the batch); malformed or
-    dimension-mismatched responses -> :class:`EmbeddingError` (permanent).
+    One or more identical replicas may be configured (``ports``); requests
+    round-robin across them, and a request whose endpoint fails with a
+    transient unavailability (:class:`ModelUnavailableError`: unreachable,
+    5xx, timeout) is retried on the next endpoint in rotation. The server(s)
+    are started by the operator (pinned llama.cpp + GGUF weights under the
+    model root); this client only talks HTTP. An OOM report ->
+    :class:`EmbeddingOOMError` (caller halves the batch) and malformed /
+    dimension-mismatched / bad-input responses -> :class:`EmbeddingError`
+    (permanent); both are endpoint-independent, so they never fail over —
+    retrying them elsewhere would either mask the halving signal or burn
+    every endpoint on an input that can never fit.
+
+    Not thread-safe: the worker embeds serially (single process, enforced by
+    the local-Qdrant lock), so the rotation counter needs no locking.
     """
 
     def __init__(
         self,
         host: str,
-        port: int,
+        ports: Sequence[int],
         *,
         model_revision: str,
         model_name: str,
@@ -205,7 +215,10 @@ class LlamaCppEmbedder:
         normalize: bool = True,
         timeout: float = 120.0,
     ) -> None:
-        self._url = f"http://{host}:{port}/v1/embeddings"
+        if not ports:
+            raise ValueError("at least one endpoint port is required")
+        self._urls = [f"http://{host}:{port}/v1/embeddings" for port in ports]
+        self._next = 0
         self._model_name = model_name
         self._model_revision = model_revision
         self._dimensions = dimensions
@@ -250,8 +263,23 @@ class LlamaCppEmbedder:
         return self.encode_documents([text])[0]
 
     def _post(self, texts: list[str]) -> list[dict[str, object]]:
+        start = self._next
+        self._next = (self._next + 1) % len(self._urls)
+        unavailable: ModelUnavailableError | None = None
+        for offset in range(len(self._urls)):
+            url = self._urls[(start + offset) % len(self._urls)]
+            try:
+                return self._post_to(url, texts)
+            except ModelUnavailableError as exc:
+                # Transient: try the next replica. Permanent and OOM errors
+                # propagate immediately (see the class docstring).
+                unavailable = exc
+        assert unavailable is not None  # loop runs at least once
+        raise unavailable
+
+    def _post_to(self, url: str, texts: list[str]) -> list[dict[str, object]]:
         try:
-            resp = self._http.post(self._url, json={"model": self._model_name, "input": texts})
+            resp = self._http.post(url, json={"model": self._model_name, "input": texts})
         except httpx.HTTPError as exc:
             raise ModelUnavailableError(f"embedding server unreachable: {exc}") from exc
         body = resp.text

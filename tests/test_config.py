@@ -159,3 +159,13 @@ def test_services_qdrant_path_defaults_none() -> None:
     # No qdrant_path by default: operators on a Qdrant server set host/port,
     # and only the pilot sandbox switches on embedded local mode.
     assert Services().qdrant_path is None
+
+
+def test_services_embed_ports_default_and_validation() -> None:
+    # Empty pool by default: single-endpoint behavior via embed_port.
+    assert Services().embed_ports == []
+    assert Services(embed_ports=[8081, 8082]).embed_ports == [8081, 8082]
+    with pytest.raises(ConfigError, match=r"port must be 1-65535"):
+        Services(embed_port=0)
+    with pytest.raises(ConfigError, match=r"port must be 1-65535"):
+        Services(embed_ports=[8081, 70000])

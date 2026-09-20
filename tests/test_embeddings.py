@@ -383,10 +383,10 @@ def test_encode_batch_oom_zero_halvings_reraises() -> None:
 # --- The llama.cpp HTTP client -----------------------------------------------------------
 
 
-def _llama(handler: object) -> LlamaCppEmbedder:
+def _llama(handler: object, ports: Sequence[int] = (1,)) -> LlamaCppEmbedder:
     emb = LlamaCppEmbedder(
         "127.0.0.1",
-        1,
+        list(ports),
         model_revision="r1",
         model_name="m",
         dimensions=4,
@@ -488,6 +488,114 @@ def test_llamacpp_unreachable_is_transient() -> None:
 
     with pytest.raises(ModelUnavailableError, match="unreachable"):
         _llama(handler).encode_documents(["t"])
+
+
+# --- Multi-endpoint pool (round-robin + failover) --------------------------------
+
+
+def _port(request: httpx.Request) -> int:
+    assert request.url.port is not None
+    return request.url.port
+
+
+def test_llamacpp_round_robin_across_pool() -> None:
+    seen: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(_port(request))
+        return httpx.Response(
+            200, json={"data": [{"index": 0, "embedding": [2.0, 0.0, 0.0, 0.0]}]}
+        )
+
+    emb = _llama(handler, ports=(8081, 8082, 8083))
+    for _ in range(6):
+        emb.encode_documents(["t"])
+    assert seen == [8081, 8082, 8083, 8081, 8082, 8083]
+
+
+def test_llamacpp_fails_over_to_next_endpoint_when_unreachable() -> None:
+    seen: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(_port(request))
+        if request.url.port == 8081:
+            raise httpx.ConnectError("connection refused", request=request)
+        return httpx.Response(
+            200, json={"data": [{"index": 0, "embedding": [2.0, 0.0, 0.0, 0.0]}]}
+        )
+
+    out = _llama(handler, ports=(8081, 8082)).encode_documents(["t"])
+    # 2.0/2.0 is exact, so plain equality works (approx does not nest).
+    assert out == [[1.0, 0.0, 0.0, 0.0]]
+    assert seen == [8081, 8082]
+
+
+def test_llamacpp_fails_over_on_5xx() -> None:
+    seen: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(_port(request))
+        if request.url.port == 8081:
+            return httpx.Response(503, text="service unavailable")
+        return httpx.Response(
+            200, json={"data": [{"index": 0, "embedding": [2.0, 0.0, 0.0, 0.0]}]}
+        )
+
+    _llama(handler, ports=(8081, 8082)).encode_documents(["t"])
+    assert seen == [8081, 8082]
+
+
+def test_llamacpp_all_endpoints_down_raises_unavailable() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    with pytest.raises(ModelUnavailableError, match="unreachable"):
+        _llama(handler, ports=(8081, 8082)).encode_documents(["t"])
+
+
+def test_llamacpp_permanent_error_does_not_fail_over() -> None:
+    seen: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(_port(request))
+        return httpx.Response(500, text="input (572 tokens) is too large to process")
+
+    with pytest.raises(EmbeddingError, match="too large"):
+        _llama(handler, ports=(8081, 8082)).encode_documents(["t"])
+    # One attempt only: the input can never fit, so burning every replica is pointless.
+    assert seen == [8081]
+
+
+def test_llamacpp_oom_does_not_fail_over() -> None:
+    seen: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(_port(request))
+        return httpx.Response(507, text="out of memory: cuda")
+
+    with pytest.raises(EmbeddingOOMError):
+        _llama(handler, ports=(8081, 8082)).encode_documents(["t"])
+    # OOM must reach the halving logic untouched, not be retried elsewhere.
+    assert seen == [8081]
+
+
+def test_make_embedder_uses_embed_ports_when_set(base_config: Config) -> None:
+    base_config.embedding.model_revision = "rev-1"
+    base_config.embedding.model_name = "bge-m3"
+    base_config.services.embed_ports = [8081, 8082]
+    emb = make_embedder(base_config)
+    assert isinstance(emb, LlamaCppEmbedder)
+    assert emb._urls == [
+        "http://127.0.0.1:8081/v1/embeddings",
+        "http://127.0.0.1:8082/v1/embeddings",
+    ]
+
+
+def test_make_embedder_defaults_to_embed_port(base_config: Config) -> None:
+    base_config.embedding.model_revision = "rev-1"
+    emb = make_embedder(base_config)
+    assert isinstance(emb, LlamaCppEmbedder)
+    assert emb._urls == ["http://127.0.0.1:8081/v1/embeddings"]
 
 
 def test_llamacpp_encode_query_posts_single_text() -> None:

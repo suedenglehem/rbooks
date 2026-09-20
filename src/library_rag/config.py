@@ -156,6 +156,11 @@ class Services(BaseModel):
     # llama.cpp embedding-model server (OpenAI-compatible /v1/embeddings).
     embed_host: str = "127.0.0.1"
     embed_port: int = 8081
+    # Optional pool of identical embedding-model replicas (one llama-server
+    # per port). When non-empty, embedding requests round-robin across these
+    # ports and fail over to the next on transient unavailability; embed_port
+    # is then ignored. Empty keeps the single-embed_port behavior.
+    embed_ports: list[int] = Field(default_factory=list)
     # FastAPI app bind address. Must stay loopback unless the operator opts in.
     app_host: str = "127.0.0.1"
     app_port: int = 8000
@@ -167,6 +172,15 @@ class Services(BaseModel):
     def _warn_public(cls, v: str) -> str:
         # We do not refuse a public bind (an operator may proxy), but this is the
         # only place a non-loopback host is surfaced, so record it explicitly.
+        return v
+
+    @field_validator("embed_port", "embed_ports")
+    @classmethod
+    def _valid_ports(cls, v: int | list[int]) -> int | list[int]:
+        ports = v if isinstance(v, list) else [v]
+        for port in ports:
+            if not 1 <= port <= 65535:
+                raise ConfigError(f"port must be 1-65535 (got {port})")
         return v
 
 

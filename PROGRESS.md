@@ -969,13 +969,119 @@ done; operator pre-approved the report 2026-09-20; the report is
   1-px raster fix, question-bank status, recommended frozen config.
   **Operator pre-approved the report (2026-09-20, "consider it already
   approved")** — marked APPROVED, not blocked on presenting it.
-- M6 done → commit (with the Co-Authored-By line) → push → shutdown
-  (terminal directive). Full-library ingestion does NOT start in this
-  session: the directive shuts the machine down immediately after
-  push, and a multi-day job would die with it. Start it in the next
-  session:
-    uv run library-rag scan --config config.yaml
-    uv run library-rag ingest --config config.yaml
-  (serial single-process worker; the PRD lines 35/53 parallel
-  coordinator/worker-subprocess architecture is the M7 prerequisite
-  for a faster full run).
+- [DONE 2026-09-20] M6 close: commit **ea36018** ("M6: pilot + capacity
+  report (gate passed)") + push to origin/master + `shutdown now` per the
+  terminal directive. Host rebooted 17:00 same day; the operator
+  relaunched the embedder fleet (8081-8084, screen session `embed`) and
+  vLLM 8091 before this session.
+- [DONE 2026-09-20] **8081 relaunched with `--ubatch-size 2048`** (first
+  next-session action). The build's default ubatch is 512, and the server
+  validates **each input** of a `/v1/embeddings` batch against it: an
+  8-chunk request with ~3,440 total BPE passes as long as every chunk is
+  ≤ 2048, while a single 2277-token input still 500s. The pilot's 132
+  failed embed jobs were single chunks of 515-723 BPE (error texts in the
+  sandbox jobs table) — all now fit with 3x margin. Only the 8081
+  instance was stopped (8082-8084 and 8091 untouched); `--ubatch-size
+  2048` was added to /dd2/llama-server/embedder.sh (persists for future
+  relaunches via that script); relaunched detached (log:
+  /dd2/llama-server/embedder_8081_restart.log). Verified live: ~700-BPE
+  single input → 1024-dim unit-norm vector; 8 x ~430-BPE batch → 8
+  vectors, indexes 0-7.
+- [DONE 2026-09-20] **Retrying the 294 permanent_failed jobs**
+  (132 embed + 162 ocr) in the pilot sandbox — requeued
+  (`library-rag retry --include-permanent`, "requeued 294 job(s)"), then
+  drained. By the time of the second reboot the 162 OCR jobs and 131 of
+  the 132 embed books had already succeeded (OCR 1048/1048 ✓; embed
+  285/293 ✓) against the ubatch-2048 fleet; the first drain
+  (`retry_run.log`) died on the local-Qdrant self-lock bug (below) part
+  way through the publish tail.
+- [DONE 2026-09-20] **Drain worker death: local-Qdrant self-lock —
+  root-caused, fixed, regression-tested.** The host rebooted a second
+  time; the operator relaunched the fleet as **8 instances 8081-8088**
+  (all `--ubatch-size 2048 --batch-size 2048`, GPU 2, auto-restart on
+  boot; operator: "and i can add 4 more") and vLLM at **port 8000**
+  (pid 3453 — the old :8091 note is stale). The re-drain ran to the
+  first non-noop publish and died:
+  `RuntimeError: Storage folder ... is already accessed by another
+  instance of Qdrant client`. Root cause: `RealQdrantOps` in local mode
+  holds an exclusive flock on `<qdrant_path>/.lock` for the client's
+  whole lifetime; the old worker built client #1 for
+  `reconcile_publications` and discarded it, then `_run_publish` built
+  client #2 in the same process → POSIX flock self-denial. Fix: ONE
+  shared `RealQdrantOps` per `run_worker` call when no client is
+  injected (opened in `run_worker`, shared into reconcile and every
+  publish via `partial`, closed in `finally`; injected clients are
+  never closed by the worker). `_run_publish`'s `qdrant` parameter is
+  now required. Regression test
+  `tests/test_worker.py::test_worker_single_local_qdrant_client_per_run`
+  pins: exactly one client constructed per run (counting constructor),
+  two publish jobs succeed through it, and the storage lock is free
+  again after return.
+- [DONE 2026-09-20] **Embedding endpoint pooling** for the 8-instance
+  fleet: `services.embed_ports: list[int]` (default `[]` = single
+  `embed_port` behavior); round-robin per `encode_documents`; failover
+  only on transient `ModelUnavailableError`; ports excluded from
+  `embedding_sha` (endpoint choice never changes the embedding key).
+  Config validation: each port must be 1-65535. Tests in
+  tests/test_config.py + tests/test_embeddings.py.
+- [DONE 2026-09-20] **Full gate green** after both changes: ruff
+  "All checks passed!", mypy "Success: no issues found in 76 source
+  files", pytest **400 passed** (exit 0).
+- [IN PROGRESS 2026-09-20] **Sandbox drain #2** (fixed worker):
+  `uv run library-rag ingest --config pilot-sandbox/scratch/
+  config.sandbox.yaml --once` detached, log
+  `pilot-sandbox/scratch/drain2.log`, started 18:56. At start: chunk
+  16 pending / 300 succeeded; embed 285 succeeded / 7 retryable (deferred
+  on the unsettled chunk jobs — all prose books, sample chunks 108-818
+  BPE, will pass) / 1 permanent; publish 6586 succeeded / 6578 pending /
+  1 stale-running (crash remnant; lease reclaim verified working).
+  Rate ~1 publish/~12 s → ETA ~22 h for the legacy republish tail
+  (converges: frozen stats_epoch ⇒ fan-out re-enqueues only existing
+  task keys, no new work).
+- **NEW FINDING (2026-09-20, measured): the 2048-BPE per-input ceiling
+  is still below real chunks for number/hex-dense content.** The one
+  permanent embed job is `ibm.pdf` (it/networking/protocols, "Mega
+  protocols" — packet dumps, hex tables). Its 10 chunks are only
+  156-254 WORDS but measure **1616-3656 BPE tokens** each via the
+  server's `usage` field (7 of 10 exceed 2048; worst 3656).
+  Word→BPE ratio here is 8-15x vs the 1.4-1.8x the config assumes for
+  prose — `WordTokenCounter`'s word budget cannot bound BPE length for
+  this content class. Consequences: (a) sandbox final state will be
+  292/293 embed succeeded, 1 permanent; that book's publish jobs fail
+  `publication_error` transiently 3× then go permanent → the book is
+  in the index minus 7/10 chunks; (b) full-library ingestion will
+  reproduce this on technical books (stratified sample: 1/300 = 0.3%
+  of the sample is this class; the report already defers BPE-aware
+  chunking to M7). Operator options: raise `--batch-size`/
+  `--ubatch-size` on the fleet (4096 covers every measured input;
+  8192 = "never reject anything that fits the context" — safe: bge-m3
+  KV at 8192 is ~1.2 GB), or accept explicit failures (designed
+  behavior: counted, never zombie-retried), or M7 BPE-aware chunking.
+- **Next unfinished task:**
+  1. Let sandbox drain #2 finish (monitor: progress + exit line in
+     drain2.log); verify final counts: chunk 0 pending; embed 292
+     succeeded + 1 documented permanent (the ibm.pdf book, see finding
+     above); publish ~0 pending; no new failures. Then the sandbox is
+     quiescent — keep it untouched as the pilot artifact.
+  2. Commit + push the worker self-lock fix + regression test +
+     embed-ports pooling (gate already green: 400 passed).
+  3. Add to /dd2/andrei/books_rag/config.yaml (gitignored, operator
+     file): `retrieval: stats_epoch: frozen` (report §8) and
+     `services.embed_ports: [8081..8088]` (keep embed_port 8081 as the
+     single-endpoint fallback).
+  4. **Full-library ingestion (approved, report pre-approved
+     2026-09-20):** `uv run library-rag scan --config config.yaml`
+     then `uv run library-rag ingest --config config.yaml` — detached
+     + monitored; ETA ~700 h ≈ 29 days serial (report §4); pooled
+     embed saves ~2 days of the 135 h embed stage (realistically 3-6x,
+     replicas share GPU 2 with vLLM). Known accepted risk: number/
+     hex-dense books fail explicitly per the finding above (0.3% of
+     the stratified sample); the operator may raise the fleet
+     `--batch-size` to 4096/8192 before or during the run — `library-
+     rag retry --include-permanent` recovers any affected books after.
+     Do not claim completion without evidence. The PRD
+     coordinator/worker-subprocess architecture is the M7 prerequisite
+     for the ~1-week parallel run.
+  5. Operator labels the 80 question candidates (top up to 100-200) in
+     /mnt/models_sata_ssd/library-rag/scratch/question_candidates.jsonl
+     — human-only; never invent labels.
