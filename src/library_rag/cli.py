@@ -9,7 +9,9 @@ is unavailable), and the M5 commands ``answer`` (cited answering with the
 persisted frozen evidence manifest), ``serve`` (the FastAPI research app),
 ``evaluate`` (labeled retrieval/answer metrics, PRD §13), and the M6
 ``pilot`` group (read-only corpus survey and deterministic stratified sample
-manifest, PRD §12) are implemented. The remaining commands are registered
+manifest, PRD §12), and the M7 ``coverage`` (pipeline funnel report,
+PRD §2/§14) and ``discover`` (scheduled discovery, PRD lines 15/83/181)
+commands are implemented. The remaining commands are registered
 with their help text and
 milestone so that ``library-rag --help`` documents the whole intended surface
 (PRD §4). Each stub prints an explicit "not yet implemented (milestone Mx)"
@@ -43,6 +45,7 @@ from .catalog import source_file_count
 from .config import MOUNT_SENTINEL_ENV, Config, ConfigError, load_config
 from .coverage import CoverageReport, coverage_report
 from .db import Database, db_path_for
+from .discover import DEFAULT_DISCOVER_INTERVAL, run_discovery
 from .doctor import render_json, render_text, run_doctor
 from .embeddings import Embedder, make_embedder
 from .evaluate import evaluate, format_report, load_dataset
@@ -314,6 +317,32 @@ def _ingest(args: argparse.Namespace) -> int:
     finally:
         db.close()
     print(f"ingest: {completed} job(s) completed")
+    return EXIT_OK
+
+
+def _discover(args: argparse.Namespace) -> int:
+    setup_logging(args.log_level, args.log_format)
+    cfg = _require_config(args)
+    db = _open_state(cfg)
+    stop = False
+
+    def _graceful_stop(_signum: int, _frame: object) -> None:
+        nonlocal stop
+        stop = True  # finish the in-flight pass, then stop (PRD §7, like ingest)
+
+    try:
+        signal.signal(signal.SIGTERM, _graceful_stop)
+        signal.signal(signal.SIGINT, _graceful_stop)
+        try:
+            passes = run_discovery(
+                db, cfg, Jobs(db), interval_seconds=args.interval, stop_event=lambda: stop
+            )
+        finally:
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+    finally:
+        db.close()
+    print(f"discover: {passes} pass(es) completed")
     return EXIT_OK
 
 
@@ -1224,6 +1253,19 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"lease TTL in seconds (default {DEFAULT_LEASE_TTL:.0f})",
     )
     ingest.set_defaults(_func=_ingest)
+
+    discover = sub.add_parser(
+        "discover",
+        help="scheduled discovery: re-scan source roots on an interval (M7)",
+    )
+    discover.add_argument("--config", help="path to config YAML")
+    discover.add_argument(
+        "--interval",
+        type=float,
+        default=DEFAULT_DISCOVER_INTERVAL,
+        help=f"seconds between discovery passes (default {DEFAULT_DISCOVER_INTERVAL:.0f})",
+    )
+    discover.set_defaults(_func=_discover)
 
     search_p = sub.add_parser(
         "search", help="lexical + semantic search over the published index (M4)"
