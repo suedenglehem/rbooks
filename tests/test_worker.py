@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +27,7 @@ from library_rag.embeddings import (
 from library_rag.identity import make_task_key
 from library_rag.indexing import FakeQdrant, RealQdrantOps
 from library_rag.jobs import Claimed, Jobs
+from library_rag.log import JobLogCapture, log_event, prune_job_logs
 from library_rag.scan import scan_roots
 from library_rag.worker import run_worker
 
@@ -256,3 +259,186 @@ def test_worker_single_local_qdrant_client_per_run(
     lock_path = qdrant_dir / ".lock"
     with open(lock_path, "rb") as f:
         fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+# --- per-job verbose logs ---------------------------------------------------
+# While a job runs, DEBUG records are captured to
+# <state_root>/job_logs/<job_id>.attempt<N>.log alongside the short stderr
+# log. The file is KEPT when the job ended in a real failure and FLUSHED
+# otherwise (success, plain deferral, or lost lease).
+
+
+def _job_logs_dir(base_config: Config) -> Path:
+    return base_config.paths.state_root / "job_logs"
+
+
+def test_job_logs_flushed_on_success(
+    state_db: Database, base_config: Config, src: Path
+) -> None:
+    make_pdf(src / "A.pdf", ["a page of text " * 5])
+    jobs = Jobs(state_db)
+    scan_roots(state_db, base_config, jobs)
+
+    base_config.embedding.fake = True
+    q = FakeQdrant(base_config.embedding.dimensions)
+    emb = FakeEmbedder(base_config.embedding.dimensions)
+    assert run_worker(state_db, base_config, once=True, poll_delay=0, qdrant=q, embedder=emb) == 4
+    assert jobs.counts() == {"succeeded": 4}
+
+    # Every job succeeded, so every per-job log was flushed: no files left.
+    d = _job_logs_dir(base_config)
+    if d.exists():
+        assert list(d.iterdir()) == []
+
+
+def test_job_logs_kept_on_permanent_failure(
+    state_db: Database, base_config: Config, src: Path
+) -> None:
+    # Magic bytes say PDF; PyMuPDF cannot open it => permanent "corrupt".
+    (src / "bad.pdf").write_bytes(b"%PDF-1.4 not really a pdf")
+    jobs = Jobs(state_db)
+    scan_roots(state_db, base_config, jobs)
+
+    assert run_worker(state_db, base_config, once=True, poll_delay=0) == 1
+    assert jobs.counts() == {"permanent_failed": 1}
+
+    d = _job_logs_dir(base_config)
+    files = sorted(d.iterdir())
+    assert len(files) == 1
+    assert files[0].name.endswith(".attempt1.log")
+    # The captured file carries the DEBUG trail: the start event and the
+    # classified failure (category + detail serialized in the payload).
+    text = files[0].read_text(encoding="utf-8")
+    assert "extract: start" in text
+    assert "extract: failed" in text
+    assert "corrupt" in text
+
+
+def test_job_log_capture_level_window(tmp_path: Path) -> None:
+    root = logging.getLogger()
+    prev_level = root.level
+    n_handlers = len(root.handlers)
+    logger = logging.getLogger("library_rag.worker")
+    path = tmp_path / "job.log"
+
+    log_event(logger, logging.DEBUG, "outside-before", marker="before")
+    with JobLogCapture(path):
+        assert root.level == logging.DEBUG
+        assert len(root.handlers) == n_handlers + 1
+        log_event(logger, logging.DEBUG, "captured", marker="inside")
+    # The window is restored: level and handler count back to what they were.
+    assert root.level == prev_level
+    assert len(root.handlers) == n_handlers
+
+    text = path.read_text(encoding="utf-8")
+    assert "captured" in text
+    assert "inside" in text  # structured fields land in the line too
+    assert "before" not in text  # nothing captured before the window opened
+
+    log_event(logger, logging.DEBUG, "outside-after", marker="after")
+    assert "after" not in path.read_text(encoding="utf-8")
+
+
+def test_prune_job_logs_keeps_newest(tmp_path: Path) -> None:
+    d = tmp_path / "job_logs"
+    d.mkdir()
+    base = 1_000_000.0
+    for i in range(505):
+        p = d / f"{i}.log"
+        p.write_text(f"log {i}\n")
+        ts = base + i  # i=0 oldest ... i=504 newest
+        os.utime(p, (ts, ts))
+
+    removed = prune_job_logs(d, limit=500)
+    assert removed == 5
+    names = {p.name for p in d.iterdir()}
+    assert len(names) == 500
+    for i in range(5):  # the five oldest are gone
+        assert f"{i}.log" not in names
+    assert "5.log" in names
+    assert "504.log" in names
+
+
+def test_job_log_kept_on_retryable_flushed_after_success(
+    state_db: Database, base_config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A transient failure (category set) keeps its log; the retry that then
+    # succeeds flushes its own, leaving the failure's log for debugging.
+    jobs = Jobs(state_db)
+    jobs.enqueue(
+        make_task_key("extract", "rev-x", "v1"),
+        "extract",
+        input_id="rev-x",
+        input_version="v1",
+    )
+
+    calls = {"n": 0}
+
+    def fake_extract(
+        db: Database, cfg: Config, jobs: Jobs, job: Claimed, lease_ttl: float
+    ) -> bool:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # A real backoff keeps attempt 2 out of the first drain window.
+            jobs.fail(job, "worker_error", "boom", transient=True, backoff=300.0)
+        else:
+            jobs.succeed(job, "{}")
+        return True
+
+    monkeypatch.setattr("library_rag.worker._run_extract", fake_extract)
+
+    # Attempt 1: retryable_failed WITH a category => the log is kept.
+    assert run_worker(state_db, base_config, once=True, poll_delay=0) == 1
+    job_row = _last_job(state_db)
+    assert job_row["state"] == "retryable_failed"
+    assert job_row["error_category"] == "worker_error"
+    d = _job_logs_dir(base_config)
+    files = sorted(p.name for p in d.iterdir())
+    assert files == [f"{job_row['job_id']}.attempt1.log"]
+
+    # The operator requeues the retryable job; attempt 2 succeeds => flushed.
+    assert jobs.retry() == 1
+    assert run_worker(state_db, base_config, once=True, poll_delay=0) == 1
+    assert Jobs(state_db).counts() == {"succeeded": 1}
+    files = sorted(p.name for p in d.iterdir())
+    assert files == [f"{job_row['job_id']}.attempt1.log"]
+
+
+def test_job_log_flushed_on_deferral(state_db: Database, base_config: Config) -> None:
+    # A publish job whose revision has no settled extraction run defers.
+    # Deferral is not a failure: error_category is cleared, so the log is
+    # flushed even though the job sits in retryable_failed.
+    ts = 1_000_000.0
+    state_db.execute(
+        "INSERT INTO documents (doc_id, anchor_sha256, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?)",
+        ("doc-1", "a" * 64, ts, ts),
+    )
+    state_db.execute(
+        """
+        INSERT INTO source_revisions
+            (rev_id, doc_id, sha256, size_bytes, format, archive_relpath,
+             first_path, is_active, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+        """,
+        ("rev-1", "doc-1", "b" * 64, 10, "pdf", "rev-1.pdf", "/books/rev-1.pdf", ts),
+    )
+    jobs = Jobs(state_db)
+    jobs.enqueue(
+        make_task_key("publish", "rev-1", "v1"),
+        "publish",
+        input_id="rev-1",
+        input_version="v1",
+    )
+
+    q = FakeQdrant(base_config.embedding.dimensions)
+    assert run_worker(
+        state_db, base_config, once=True, poll_delay=0, qdrant=q, reconcile_on_start=False
+    ) == 1
+
+    job = _job(state_db, "publish")
+    assert job["state"] == "retryable_failed"
+    assert job["error_category"] is None
+    d = _job_logs_dir(base_config)
+    if d.exists():
+        assert list(d.iterdir()) == []

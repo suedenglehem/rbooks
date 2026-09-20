@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import time
 from collections.abc import Callable
@@ -95,6 +96,7 @@ from .indexing import (
     release_publish_lock,
 )
 from .jobs import Claimed, Jobs, StaleLeaseError
+from .log import JobLogCapture, get_logger, log_event, prune_job_logs
 from .normalization import normalize_unit, unit_removed_ranges
 from .scan import STAGE_CHUNK, STAGE_EMBED, STAGE_EXTRACT, STAGE_OCR, STAGE_PUBLISH
 
@@ -114,6 +116,8 @@ _DEFER_DELAY = 15.0
 _OPEN_STATES = "('pending', 'running', 'retryable_failed')"
 # Job states that are terminal: the pipeline may move on past them.
 _SETTLED_STATES = "('succeeded', 'permanent_failed', 'cancelled')"
+
+log = get_logger("library_rag.worker")
 
 
 def worker_name() -> str:
@@ -252,17 +256,28 @@ def _run_extract(db: Database, cfg: Config, jobs: Jobs, job: Claimed, lease_ttl:
         db, cfg, rev, on_progress=lambda: jobs.heartbeat(job, lease_ttl), jobs=jobs
     )
     extract = extract_pdf if Format(rev["format"]) is Format.PDF else extract_epub
+    log_event(
+        log, logging.DEBUG, "extract: start",
+        job_id=job.job_id, rev_id=job.input_id,
+        format=rev["format"], doc_id=rev["doc_id"],
+    )
     try:
         units = extract(ctx)
     except StaleLeaseError:
         return False  # another worker owns this job now; touch nothing
     except ExtractionFailure as exc:
+        log_event(
+            log, logging.DEBUG, "extract: failed",
+            job_id=job.job_id, category=exc.category, detail=exc.detail,
+        )
         jobs.fail(job, exc.category, exc.detail, transient=not is_permanent(exc.category))
         fail_run(db, ctx.run_id, exc.category, exc.detail)
         return True
     except Exception as exc:
+        log_event(log, logging.DEBUG, "extract: unexpected error", exc_info=True)
         jobs.fail(job, "worker_error", f"{type(exc).__name__}: {exc}", transient=True)
         return True
+    log_event(log, logging.DEBUG, "extract: done", job_id=job.job_id, units=units)
     jobs.succeed(job, json.dumps({"run_id": ctx.run_id, "units": units}, sort_keys=True))
     return True
 
@@ -292,6 +307,10 @@ def _run_ocr(db: Database, cfg: Config, jobs: Jobs, job: Claimed, lease_ttl: flo
     if rev is None:
         jobs.fail(job, "missing_source", f"revision {run['rev_id']} not in catalog", transient=False)
         return True
+    log_event(
+        log, logging.DEBUG, "ocr: start",
+        job_id=job.job_id, run_id=run_id, page=page, doc_id=rev["doc_id"],
+    )
     ctx = build_ctx(db, cfg, rev, on_progress=lambda: jobs.heartbeat(job, lease_ttl))
     unit_id = unit_id_for(run_id, "page", page)
     unit_row = db.query_one(
@@ -315,6 +334,7 @@ def _run_ocr(db: Database, cfg: Config, jobs: Jobs, job: Claimed, lease_ttl: flo
     # claim): the unit already has OCR output for these settings -> skip
     # the expensive Tesseract pass entirely.
     if unit_row["ocr_state"] == "done" and payload.get("ocr", {}).get("settings_sha") == ocr_sha:
+        log_event(log, logging.DEBUG, "ocr: noop (already done)", job_id=job.job_id, unit_id=unit_id)
         jobs.succeed(job, json.dumps({"unit_id": unit_id, "noop": True}, sort_keys=True))
         return True
 
@@ -338,6 +358,10 @@ def _run_ocr(db: Database, cfg: Config, jobs: Jobs, job: Claimed, lease_ttl: flo
             char_count=char_count,
             state="done",
         )
+        log_event(
+            log, logging.DEBUG, "ocr: done",
+            job_id=job.job_id, unit_id=unit_id, chars=char_count,
+        )
         jobs.succeed(
             job, json.dumps({"unit_id": unit_id, "chars": char_count}, sort_keys=True)
         )
@@ -355,9 +379,14 @@ def _run_ocr(db: Database, cfg: Config, jobs: Jobs, job: Claimed, lease_ttl: flo
                 char_count=int(unit_row["char_count"]),
                 state="failed",
             )
+        log_event(
+            log, logging.DEBUG, "ocr: failed",
+            job_id=job.job_id, category=exc.category, detail=exc.detail,
+        )
         jobs.fail(job, exc.category, exc.detail, transient=not is_permanent(exc.category))
         return True
     except Exception as exc:
+        log_event(log, logging.DEBUG, "ocr: unexpected error", exc_info=True)
         jobs.fail(job, "worker_error", f"{type(exc).__name__}: {exc}", transient=True)
         return True
     return True
@@ -425,6 +454,10 @@ def _run_chunk(db: Database, cfg: Config, jobs: Jobs, job: Claimed, lease_ttl: f
     if rev is None:
         jobs.fail(job, "missing_source", f"revision {run['rev_id']} not in catalog", transient=False)
         return True
+    log_event(
+        log, logging.DEBUG, "chunk: start",
+        job_id=job.job_id, run_id=run_id, doc_id=rev["doc_id"],
+    )
 
     current = chunk_fingerprint_for_run(db, run_id, cfg)
     if run["chunk_fingerprint"] == current:
@@ -436,6 +469,10 @@ def _run_chunk(db: Database, cfg: Config, jobs: Jobs, job: Claimed, lease_ttl: f
         )
         assert n_chunks is not None and n_units is not None
         if int(n_chunks["n"] or 0) > 0 or int(n_units["n"] or 0) == 0:
+            log_event(
+                log, logging.DEBUG, "chunk: noop (fingerprint match)",
+                job_id=job.job_id, run_id=run_id, chunks=int(n_chunks["n"] or 0),
+            )
             _rekey_chunk_job(db, job, run_id, current)
             if int(n_chunks["n"] or 0) > 0:
                 _enqueue_embed_job(jobs, run_id, current)
@@ -457,6 +494,7 @@ def _run_chunk(db: Database, cfg: Config, jobs: Jobs, job: Claimed, lease_ttl: f
             (run_id,),
         )
         if not unit_rows:
+            log_event(log, logging.DEBUG, "chunk: no units", job_id=job.job_id, run_id=run_id)
             ts = time.time()
             with db.transaction():
                 db.execute("DELETE FROM chunks WHERE run_id = ?", (run_id,))
@@ -490,6 +528,10 @@ def _run_chunk(db: Database, cfg: Config, jobs: Jobs, job: Claimed, lease_ttl: f
         if any(p.get("normalization", {}).get("settings_sha") != norm_sha for p in payloads):
             cross_unit = any(row["kind"] == "page" for row in unit_rows)
             removed_list = unit_removed_ranges(texts, norm, cross_unit=cross_unit)
+            renormalized = sum(
+                1 for p in payloads
+                if p.get("normalization", {}).get("settings_sha") != norm_sha
+            )
             for i, (row, payload) in enumerate(zip(unit_rows, payloads, strict=True)):
                 if payload.get("normalization", {}).get("settings_sha") == norm_sha:
                     continue
@@ -508,6 +550,10 @@ def _run_chunk(db: Database, cfg: Config, jobs: Jobs, job: Claimed, lease_ttl: f
                 )
             # The artifacts just changed: recompute BEFORE comparing/record.
             current = chunk_fingerprint_for_run(db, run_id, cfg)
+            log_event(
+                log, logging.DEBUG, "chunk: re-normalized",
+                job_id=job.job_id, run_id=run_id, units=renormalized,
+            )
 
         inputs = [
             UnitInput(
@@ -555,6 +601,10 @@ def _run_chunk(db: Database, cfg: Config, jobs: Jobs, job: Claimed, lease_ttl: f
         _rekey_chunk_job(db, job, run_id, current)
         if results:
             _enqueue_embed_job(jobs, run_id, current)
+        log_event(
+            log, logging.DEBUG, "chunk: done",
+            job_id=job.job_id, run_id=run_id, chunks=len(results),
+        )
         jobs.succeed(
             job,
             json.dumps(
@@ -565,6 +615,7 @@ def _run_chunk(db: Database, cfg: Config, jobs: Jobs, job: Claimed, lease_ttl: f
     except StaleLeaseError:
         return False
     except Exception as exc:
+        log_event(log, logging.DEBUG, "chunk: unexpected error", exc_info=True)
         jobs.fail(job, "worker_error", f"{type(exc).__name__}: {exc}", transient=True)
         return True
     return True
@@ -628,6 +679,7 @@ def _run_embed(
         return True
     if not rev["is_active"]:
         # The revision was replaced: its vectors must never enter the index.
+        log_event(log, logging.DEBUG, "embed: noop (rev inactive)", job_id=job.job_id, run_id=run_id)
         jobs.succeed(
             job, json.dumps({"run_id": run_id, "chunks": 0, "noop": True}, sort_keys=True)
         )
@@ -641,6 +693,10 @@ def _run_embed(
         emb = embedder if embedder is not None else make_embedder(cfg)
         emb_sha = embedding_sha(cfg)
     except ConfigError as exc:
+        log_event(
+            log, logging.DEBUG, "embed: failed",
+            job_id=job.job_id, category="embedding_not_configured", detail=str(exc),
+        )
         jobs.fail(job, "embedding_not_configured", str(exc), transient=False)
         return True
 
@@ -648,6 +704,7 @@ def _run_embed(
         "SELECT chunk_id, text FROM chunks WHERE run_id = ? ORDER BY position", (run_id,)
     )
     if not chunk_rows:
+        log_event(log, logging.DEBUG, "embed: noop (no chunks)", job_id=job.job_id, run_id=run_id)
         jobs.succeed(
             job, json.dumps({"run_id": run_id, "chunks": 0, "noop": True}, sort_keys=True)
         )
@@ -655,6 +712,11 @@ def _run_embed(
 
     batch_size = max(1, cfg.embedding.batch_size)
     n_batches = (len(chunk_rows) + batch_size - 1) // batch_size
+    log_event(
+        log, logging.DEBUG, "embed: start",
+        job_id=job.job_id, run_id=run_id, chunks=len(chunk_rows),
+        batches=n_batches, batch_size=batch_size,
+    )
     try:
         for i in range(0, len(chunk_rows), batch_size):
             batch_index = i // batch_size
@@ -673,6 +735,10 @@ def _run_embed(
                 except CheckpointCorruptError:
                     # Corrupt artifact: drop the manifest row so the batch
                     # re-encodes and re-commits (PRD §14 corrupt-artifact case).
+                    log_event(
+                        log, logging.DEBUG, "embed: checkpoint corrupt",
+                        job_id=job.job_id, batch_id=row["batch_id"],
+                    )
                     db.execute(
                         "DELETE FROM embedding_batches WHERE batch_id = ?", (row["batch_id"],)
                     )
@@ -683,12 +749,12 @@ def _run_embed(
                 max_halvings=cfg.embedding.oom_max_halvings,
             )
             if len(vectors) != len(chunk_ids):
-                jobs.fail(
-                    job,
-                    "worker_error",
-                    f"encoder returned {len(vectors)} vectors for {len(chunk_ids)} chunks",
-                    transient=False,
+                detail = f"encoder returned {len(vectors)} vectors for {len(chunk_ids)} chunks"
+                log_event(
+                    log, logging.DEBUG, "embed: failed",
+                    job_id=job.job_id, category="worker_error", detail=detail,
                 )
+                jobs.fail(job, "worker_error", detail, transient=False)
                 return True
             vector_sha = write_checkpoint(
                 cp,
@@ -728,15 +794,28 @@ def _run_embed(
     except StaleLeaseError:
         return False
     except EmbeddingOOMError as exc:
+        log_event(
+            log, logging.DEBUG, "embed: failed",
+            job_id=job.job_id, category="embedding_oom", detail=str(exc),
+        )
         jobs.fail(job, "embedding_oom", str(exc), transient=True)
         return True
     except ModelUnavailableError as exc:
+        log_event(
+            log, logging.DEBUG, "embed: failed",
+            job_id=job.job_id, category="model_unavailable", detail=str(exc),
+        )
         jobs.fail(job, "model_unavailable", str(exc), transient=True)
         return True
     except EmbeddingError as exc:
+        log_event(
+            log, logging.DEBUG, "embed: failed",
+            job_id=job.job_id, category="embedding_error", detail=str(exc),
+        )
         jobs.fail(job, "embedding_error", str(exc), transient=False)
         return True
     except Exception as exc:
+        log_event(log, logging.DEBUG, "embed: unexpected error", exc_info=True)
         jobs.fail(job, "worker_error", f"{type(exc).__name__}: {exc}", transient=True)
         return True
 
@@ -751,6 +830,10 @@ def _run_embed(
         STAGE_PUBLISH,
         input_id=rev["rev_id"],
         input_version=version,
+    )
+    log_event(
+        log, logging.DEBUG, "embed: done",
+        job_id=job.job_id, run_id=run_id, chunks=len(chunk_rows), batches=n_batches,
     )
     jobs.succeed(
         job,
@@ -792,6 +875,7 @@ def _run_publish(
         jobs.fail(job, "missing_source", f"revision {rev_id} not in catalog", transient=False)
         return True
     if not rev["is_active"]:
+        log_event(log, logging.DEBUG, "publish: noop (rev inactive)", job_id=job.job_id, rev_id=rev_id)
         jobs.succeed(job, json.dumps({"rev_id": rev_id, "result": "noop"}, sort_keys=True))
         return True
     run = db.query_one(
@@ -800,23 +884,31 @@ def _run_publish(
         (rev_id,),
     )
     if run is None:
+        log_event(log, logging.DEBUG, "publish: deferred (extraction not settled)", job_id=job.job_id, rev_id=rev_id)
         jobs.defer(job)  # extraction not settled yet
         return True
     run_id = run["run_id"]
+    log_event(
+        log, logging.DEBUG, "publish: start",
+        job_id=job.job_id, rev_id=rev_id, run_id=run_id,
+    )
     emb_sha_part, _, stats_sha_part = (job.input_version or "").partition(":")
     if emb_sha_part and stats_sha_part:
         state = publication_is_current(
             db, rev_id=rev_id, gen_id=generation_id(run_id, emb_sha_part, stats_sha_part)
         )
         if state in ("active", "superseded"):
+            log_event(log, logging.DEBUG, "publish: noop (already current)", job_id=job.job_id, rev_id=rev_id)
             jobs.succeed(job, json.dumps({"rev_id": rev_id, "result": "noop"}, sort_keys=True))
             return True
 
     if not qdrant.ping():
+        log_event(log, logging.DEBUG, "publish: qdrant unreachable", job_id=job.job_id, rev_id=rev_id)
         jobs.fail(job, "qdrant_unavailable", "Qdrant unreachable; will retry", transient=True)
         return True
     owner = f"publish-{os.uname().nodename}-{os.getpid()}"
     if not acquire_publish_lock(db, owner):
+        log_event(log, logging.DEBUG, "publish: deferred (lock held)", job_id=job.job_id, rev_id=rev_id)
         jobs.defer(job)  # another publisher is mid-switch
         return True
     try:
@@ -835,10 +927,18 @@ def _run_publish(
         except StaleLeaseError:
             return False
         except PublicationError as exc:
+            log_event(
+                log, logging.DEBUG, "publish: failed",
+                job_id=job.job_id, rev_id=rev_id, category="publication_error", detail=str(exc),
+            )
             jobs.fail(job, "publication_error", str(exc), transient=True)
             return True
         if result == "published":
             _enqueue_epoch_republishes(db, cfg, jobs, rev_id)
+        log_event(
+            log, logging.DEBUG, "publish: done",
+            job_id=job.job_id, rev_id=rev_id, result=result,
+        )
         jobs.succeed(
             job, json.dumps({"rev_id": rev_id, "result": result}, sort_keys=True)
         )
@@ -1039,6 +1139,14 @@ def run_worker(
     same process is refused by its own first lock. The *embedder*, when None,
     is still built per job: it is a stateless HTTP client and holds nothing
     that can leak.
+
+    Per-job verbose logging: while a job runs, DEBUG records are captured to
+    ``<state_root>/job_logs/<job_id>.attempt<N>.log`` in addition to the short
+    stderr log. After the handler returns, the file is KEPT when the job
+    ended in a real failure (``permanent_failed``, or ``retryable_failed``
+    with an error category set) and FLUSHED otherwise (a success, a plain
+    deferral, which clears the category, or a lost lease is not a failure).
+    Kept files are capped by :func:`prune_job_logs`.
     """
     name = worker_name()
     jobs = Jobs(db)
@@ -1078,7 +1186,21 @@ def run_worker(
                 jobs.fail(job, "unknown_stage", f"stage {job.stage!r} has no handler", transient=False)
                 completed += 1  # permanent_failed is a terminal state
                 continue
-            if handler(db, cfg, jobs, job, lease_ttl):
+            job_log = cfg.paths.state_root / "job_logs" / f"{job.job_id}.attempt{job.attempts}.log"
+            with JobLogCapture(job_log):
+                handled = handler(db, cfg, jobs, job, lease_ttl)
+            row = db.query_one(
+                "SELECT state, error_category FROM jobs WHERE job_id = ?", (job.job_id,)
+            )
+            keep = row is not None and (
+                row["state"] == "permanent_failed"
+                or (row["state"] == "retryable_failed" and bool(row["error_category"]))
+            )
+            if keep:
+                prune_job_logs(cfg.paths.state_root / "job_logs")
+            else:
+                job_log.unlink(missing_ok=True)
+            if handled:
                 completed += 1
         return completed
     finally:
