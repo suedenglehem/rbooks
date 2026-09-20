@@ -1371,13 +1371,83 @@ ships green during the full-run window.
   4619/6176, chunk 291/300, embed 286 pending, 0 failed, worker
   72176 alive.
 
+### Slice 4 — coverage report (PRD §2 / §14)
+- [DONE 2026-09-21] **Committed 367ebc8, pushed to origin/master.**
+  New `src/library_rag/coverage.py` (+ tests/test_coverage.py, 11
+  tests; CLI `coverage [--json]`):
+  - `coverage_report(db, cfg, *, qdrant=None)`: read-only, no DB
+    writes, no file mutations, **no hashing** — staleness is the
+    same stat-only size/mtime check the scan fast check uses.
+    Qdrant is optional: when the worker holds the local storage
+    lock the point counts degrade to `None` and everything else
+    is still reported.
+  - **Pipeline funnel** (PRD §14 vocabulary, `StageCounts`):
+    documents; revisions (total + active); archived (revisions
+    whose archive object is on disk — `archive_missing` lists the
+    missing relpaths); extracted (revisions with a succeeded
+    `extraction_runs`); OCR units by `ocr_state` (routed/done/
+    pending/failed); chunked / embedded / indexed (distinct revs
+    with chunks / embedding batches / ready generations, plus
+    `SUM(point_count)` over ready generations); publications by
+    state (active/staged/superseded) + distinct published docs;
+    and index points: catalog expectation
+    (`SUM(expected_points)` over active publications) vs live
+    active/total counts (the backup-verify pattern: `active`
+    payload flag — superseded points stay counted in total).
+  - **Per-root coverage** (`RootCoverage`, scan semantics):
+    `mount_unavailable` via the same sentinel + directory check
+    as `scan_root` (nothing below a dead mount is meaningful);
+    `discovered` (candidates via `iter_candidate_paths`);
+    `registered` (alias rows under the root prefix);
+    `unindexed` (valid-format candidates with no alias — on
+    disk, never scanned); `orphaned` (alias rows whose file is
+    gone — the scan's `missing` set, report-only); `stale`
+    (`scan_state` rows whose size/mtime no longer match the
+    file; a gone file is orphaned, not stale); `invalid`
+    (magic bytes match no supported format — distinct from
+    unindexed).
+  - **Stalled documents** (`StalledDoc`): documents without an
+    active publication, labeled with the furthest stage reached
+    (indexed > embedded > chunked > extracted > registered),
+    sorted furthest first.
+  - **Failures** (`FailureCounts`): jobs by state, failed jobs
+    by stage, failed `extraction_runs`, failed OCR units.
+  - CLI: `library-rag coverage [--config X] [--json]`; text
+    view = funnel line, OCR line, points line (degrades to
+    "index: unavailable"), failures line, per-root lines with
+    up to 10 examples each, stalled summary. Qdrant is opened
+    defensively like `_verify` (open fails → None, no crash).
+- **Gate (2026-09-21, real output):** ruff "All checks
+  passed!", mypy "Success: no issues found in 84 source files",
+  pytest **434 passed in 54.62s** (423 baseline + 11 new).
+- Bugs found en route (both column-name, both caught by the
+  real embedded-Qdrant tests): `embedding_batches` has no
+  `rev_id` of its own (join through `extraction_runs`), and
+  `index_generations` has no `doc_id` at all (carries `rev_id`
+  → join through `source_revisions` for stalled-doc stage
+  labeling).
+- Live smoke (read-only, over the live batch2 sandbox, 2026-09-21):
+  34768 discovered / 300 registered / 34108 unindexed / 360
+  invalid / 0 orphaned / 0 stale; funnel 300/300/300 (extracted)
+  → 286 chunked → 0 embedded/indexed/published (drain in
+  progress — matches the drain snapshot); 300 stalled
+  (286 chunked + 14 extracted); points active/total None
+  (worker holds the Qdrant lock) as designed; 0 failed jobs;
+  real wall time 6m41s. Invalid spot-check (5/5): zeroed PDFs,
+  a REXX script, an AVI, and a `PK`-headed file that fails
+  `zipfile.testzip()` (truncated) — all correct rejections, no
+  false positives.
+- Drain snapshot 2026-09-21 (while writing slice 4): OCR
+  5073/6176 (1 running), chunk 291/300 (9 pending), embed 286
+  pending, 0 failed, worker 72176 alive.
+
 ### Next unfinished task
-1. [DONE 2026-09-21] Slice 3 committed (45e06ee) + pushed.
-2. **Slice 4: coverage report** — corpus stats vs source root:
-   which sources are missing / stale / orphaned in the index
-   (`library-rag coverage`).
-3. Slices 5–7 (order): runbook (full-library launch command +
-   stop/resume, documented), scheduled discovery, safe revision
+1. [DONE 2026-09-21] Slice 4 coverage report committed (367ebc8) + pushed.
+2. **Slice 5: runbook** — full-library launch command +
+   stop/resume procedure, documented (PRD M7 gate).
+3. Slices 6–7 (order): scheduled discovery, safe revision
    replacement + generation migration.
+4. Parallel track: batch-2 drain → full-library launch (see M6
+   next-task item 1-2); M7 work proceeds during the run window.
 4. Parallel track: batch-2 drain → full-library launch (see M6
    next-task item 1-2); M7 work proceeds during the run window.
