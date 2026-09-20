@@ -1179,6 +1179,18 @@ done; operator pre-approved the report 2026-09-20; the report is
   mypy, 394 passed). Verified CLI signatures: `library-rag scan
   [--config] [--json]`, `library-rag ingest [--config] [--once]
   [--lease-ttl]` (ingest default runs until SIGTERM).
+- **Full-run launch pre-verification (2026-09-20, read-only):** no
+  production root dir exists yet (pilot + batch2 ran in sandboxes);
+  that is fine — `_open_state` (cli.py:113) auto-creates and
+  idempotently migrates the state DB (`Database.connect` mkdirs the
+  parent, db.py:49), so the launch sequence is `scan` → `ingest`
+  (an explicit `library-rag init` is optional/idempotent, not
+  required). Capacity check against free space (df 2026-09-20
+  ~21:58): sas_ssd 6.9 T free; sata_ssd 295 G free (86% used).
+  Linear scale of the 300-book pilot footprint ×115.9 → 34,768
+  books: archive ~185 G + artifacts ~87 G (sas_ssd, ample), state
+  ~55 G + qdrant ~88 G ≈ 143 G (sata_ssd, ~2× headroom vs 295 G).
+  Consistent with the pilot capacity gate that passed.
 - **Next unfinished task:**
   1. **Let the batch-2 drain finish** (recovery run, worker 72176;
      monitors armed: failed-job poll 30-min expiry, re-arm as
