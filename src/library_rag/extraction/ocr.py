@@ -49,12 +49,12 @@ def build_transform(page: Any, settings: OcrSettings) -> dict[str, Any]:
     per-word boxes stored in the artifact) can map raster coordinates back to
     page points with a single division.
 
-    The render size must predict the pixmap PyMuPDF actually produces: it
-    sizes the raster from the *exact* scale product, rounded outward —
-    ``ceil(dim * dpi / 72)``, not ``ceil(dim * (dpi / 72))`` (for a 450 pt
-    page at 300 dpi the float-scale form overshoots by one pixel). Under the
-    max-side shrink the renderer lands exactly on the bound for the longest
-    side, so the other side is the exact product rounded outward.
+    The render size must predict the pixmap PyMuPDF actually produces, within
+    1 px per dimension: PyMuPDF sizes the raster from the matrix product in
+    its own float association, which for the max-side shrink can land 1 px
+    below the ``ceil(opp * max_side / longest)`` predicted here (pilot run:
+    2058 vs 2059). The caller checks with a ±1 px tolerance, and citation
+    boxes divide by the exact scale, so the discrepancy is harmless.
     """
     scale = settings.dpi / 72.0
     rect = page.rect
@@ -184,8 +184,17 @@ def ocr_page(doc: Any, index: int, settings: OcrSettings, scratch_dir: Path | st
     png = scratch / f"page-{index}.png"
     try:
         pixmap = page.get_pixmap(matrix=pymupdf.Matrix(transform["scale"], transform["scale"]))  # type: ignore[no-untyped-call]
-        # Sanity: the render size must be what the transform promised.
-        if (pixmap.width, pixmap.height) != (transform["render_w"], transform["render_h"]):
+        # Sanity: the render size must be what the transform promised. PyMuPDF
+        # computes the raster size from the matrix in a different float
+        # association than build_transform's ceil(), so it can land 1 px off
+        # the predicted bound (pilot run: 1400x2058 vs expected 1400x2059 on
+        # 162 pages). Tolerate ±1 px per dimension: coordinate mapping divides
+        # by the exact scale, never by the render size, so a 1 px raster
+        # difference cannot skew a citation box.
+        if (
+            abs(pixmap.width - transform["render_w"]) > 1
+            or abs(pixmap.height - transform["render_h"]) > 1
+        ):
             raise ExtractionFailure(
                 "ocr_error",
                 f"unexpected raster size {pixmap.width}x{pixmap.height}, "

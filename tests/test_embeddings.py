@@ -446,6 +446,26 @@ def test_llamacpp_oom_report_halving_signal() -> None:
         _llama(handler).encode_documents(["t"])
 
 
+def test_llamacpp_input_too_large_is_permanent() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            500,
+            json={
+                "error": {
+                    "code": 500,
+                    "message": (
+                        "input (572 tokens) is too large to process. "
+                        "increase the physical batch size (current batch size: 512)"
+                    ),
+                    "type": "server_error",
+                }
+            },
+        )
+
+    with pytest.raises(EmbeddingError, match="too large"):
+        _llama(handler).encode_documents(["t"])
+
+
 def test_llamacpp_server_error_is_transient() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500, text="internal error")

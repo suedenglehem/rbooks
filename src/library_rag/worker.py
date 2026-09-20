@@ -61,7 +61,7 @@ from .embeddings import (
     EmbeddingOOMError,
     ModelUnavailableError,
     checkpoint_path,
-    compute_sparse_stats,
+    corpus_stats_version_part,
     embedding_sha,
     encode_batch_oom,
     make_embedder,
@@ -190,11 +190,16 @@ def build_ctx(
 
     When *jobs* is given the M3 pipeline hooks are wired: each page unit
     routed to OCR enqueues its (idempotent) OCR job, and extraction
-    completion enqueues the run's chunk job.
+    completion enqueues the run's chunk job. The pilot page cap
+    (``cfg.pilot.page_cap``, M6) is threaded into the run key and the
+    extractor context so capped runs are isolated from full runs.
     """
     fmt = Format(rev["format"])
     parser = pdf_parser_version() if fmt is Format.PDF else epub_parser_version()
-    run_id = extraction_key(rev["sha256"], parser, cfg.extraction.settings_sha())
+    # M6 pilot: cfg.pilot.page_cap (None in production) is hashed into the
+    # extraction key, so capped and full runs of the same bytes are distinct.
+    page_cap = cfg.pilot.page_cap
+    run_id = extraction_key(rev["sha256"], parser, cfg.extraction.settings_sha(), page_cap)
     enqueue_ocr: Callable[[int], None] | None = None
     on_extract_done: Callable[[], None] | None = None
     if jobs is not None:
@@ -229,6 +234,7 @@ def build_ctx(
         on_progress=on_progress,
         enqueue_ocr=enqueue_ocr,
         on_extract_done=on_extract_done,
+        page_cap=page_cap,
     )
 
 
@@ -734,8 +740,12 @@ def _run_embed(
         jobs.fail(job, "worker_error", f"{type(exc).__name__}: {exc}", transient=True)
         return True
 
-    stats = compute_sparse_stats(db, cfg, include_rev_id=rev["rev_id"])
-    version = f"{emb_sha}:{stats.stats_sha}"
+    # The version is an idempotency hint only (M6 fix B1): the recorded corpus
+    # epoch, or "init" before the first publish commits one. The publish handler
+    # reuses (or, for a genuinely new revision, computes) the real epoch under
+    # the publish lock, and the epoch fan-out converges any stale-epoch
+    # republish — so enqueuing stays O(1) instead of a full corpus tokenization.
+    version = f"{emb_sha}:{corpus_stats_version_part(db)}"
     jobs.enqueue(
         make_task_key(STAGE_PUBLISH, rev["rev_id"], version),
         STAGE_PUBLISH,
@@ -769,9 +779,10 @@ def _run_publish(
     lock (PRD §8F).
 
     ``input_version`` is the ``<embedding_sha>:<stats_sha>`` the enqueue side
-    computed; it is an idempotency key only — the handler recomputes the real
-    statistics epoch (``publication_is_current``), so a job that raced a
-    corpus-stats change simply no-ops if its generation is already current.
+    computed; it is an idempotency key only — the handler resolves the real
+    statistics epoch from the committed corpus-epoch record (computing only for
+    a genuinely new revision, M6 fix B1), so a job that raced a corpus-stats
+    change simply no-ops if its generation is already current.
     """
     rev_id = job.input_id or ""
     rev = db.query_one(
@@ -811,6 +822,9 @@ def _run_publish(
         return True
     try:
         try:
+            # A fresh state (e.g. the pilot sandbox) has no collection yet;
+            # under the publish lock creation is serialized with the switch.
+            q.ensure_collection(dimensions=cfg.embedding.dimensions)
             result = publish_generation(
                 db,
                 cfg,
@@ -842,8 +856,8 @@ def _enqueue_epoch_republishes(db: Database, cfg: Config, jobs: Jobs, rev_id: st
     re-published (re-sparse-encoded) under the new epoch. Only revisions whose
     generation already carries the current embedding epoch are eligible here;
     a different model epoch belongs to the re-embedding path, not this one.
-    Task keys are idempotent and the handler recomputes the epoch, so these
-    converge even if the corpus keeps changing.
+    Task keys are idempotent and the handler resolves the epoch from the
+    committed record, so these converge even if the corpus keeps changing.
     """
     emb_sha = embedding_sha(cfg)
     row = db.query_one(
@@ -987,7 +1001,7 @@ def _reconcile_index(db: Database, cfg: Config) -> None:
         if emb_sha is None:
             continue  # cannot compute the version until embedding is configured
         if stats_sha is None:
-            stats_sha = compute_sparse_stats(db, cfg).stats_sha
+            stats_sha = corpus_stats_version_part(db)  # O(1) hint; handler resolves the real epoch
         version = f"{emb_sha}:{stats_sha}"
         jobs.enqueue(
             make_task_key(STAGE_PUBLISH, row["rev_id"], version),

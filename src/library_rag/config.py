@@ -17,7 +17,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -144,6 +144,11 @@ class Services(BaseModel):
 
     qdrant_host: str = "127.0.0.1"
     qdrant_port: int = 6333
+    # M6: embedded Qdrant storage directory. When set, the index runs in
+    # qdrant-client local mode under this directory and qdrant_host/port are
+    # ignored — no Qdrant server process is needed (pilot sandboxes use this).
+    # The directory is a *managed* storage area owned by the client process.
+    qdrant_path: str | None = None
     # llama.cpp answer-model server (OpenAI-compatible /v1/chat/completions).
     # One model per server, so the embedding model has its own endpoint.
     answer_host: str = "127.0.0.1"
@@ -422,6 +427,24 @@ class RetrievalSettings(BaseModel):
     topup_max_rounds: int = 3
     topup_limit_cap: int = 240
     bm25: Bm25Settings = Field(default_factory=Bm25Settings)
+    # Corpus-epoch policy for BM25 statistics (M6 pilot finding — the epoch
+    # includes the document count, so in "live" mode it moves on *every*
+    # publish, and every stale-epoch republish paid a full O(corpus)
+    # recompute: 12.8k jobs x ~4.2 s ~= the measured 15 h pilot tail).
+    #   "live"   — each new revision recomputes; stale republishes converge
+    #              through the epoch fan-out. Exact, but O(N²) at library
+    #              scale (~700 h for 35k books measured-and-projected).
+    #   "frozen" — the epoch is pinned to the last committed record for the
+    #              whole campaign: no per-book recompute, and the fan-out
+    #              finds no mismatches, so it enqueues nothing. A new book's
+    #              novel terms get zero sparse weight until the campaign-end
+    #              re-freeze: flip back to "live", delete the
+    #              corpus_stats_epoch meta row, and the next publish
+    #              recomputes once over the full corpus, converging
+    #              everything in one bounded round.
+    # Deliberately not part of bm25.settings_sha(): it changes how the epoch
+    # is resolved, never the weights for a given epoch.
+    stats_epoch: Literal["live", "frozen"] = "live"
 
     @model_validator(mode="after")
     def _check_counts(self) -> RetrievalSettings:
@@ -477,6 +500,28 @@ class AnswerSettings(BaseModel):
         return self.fake or self.model_revision is not None
 
 
+class PilotSettings(BaseModel):
+    """M6 pilot controls (PRD §12).
+
+    ``page_cap`` limits how many pages (PDF) or spine sections (EPUB) of each
+    source the extractor processes, so a stratified sample runs with a
+    comparable workload. ``None`` (the default) means "no cap" — production
+    configs leave it unset and their extraction keys are byte-identical to
+    pre-M6 ones. A capped run is a *different* extraction key (the cap is
+    hashed into it), so capped and full runs of the same bytes never share
+    artifacts or claim each other's state.
+    """
+
+    page_cap: int | None = None
+
+    @field_validator("page_cap")
+    @classmethod
+    def _check_page_cap(cls, v: int | None) -> int | None:
+        if v is not None and v < 1:
+            raise ConfigError(f"pilot.page_cap must be >= 1 (got {v})")
+        return v
+
+
 class Config(BaseModel):
     """Top-level application configuration."""
 
@@ -488,6 +533,7 @@ class Config(BaseModel):
     embedding: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
     retrieval: RetrievalSettings = Field(default_factory=RetrievalSettings)
     answer: AnswerSettings = Field(default_factory=AnswerSettings)
+    pilot: PilotSettings = Field(default_factory=PilotSettings)
 
     # Optional sentinel files that must exist to prove each mount is present.
     # Mapping of a human label to a file path that must exist. An empty value

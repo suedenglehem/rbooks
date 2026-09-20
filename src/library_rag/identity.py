@@ -84,7 +84,9 @@ def revision_id(doc_id: str, sha256: str) -> str:
     return str(uuid.uuid5(NAMESPACE_REV, f"{doc_id}:{sha256}"))
 
 
-def extraction_key(rev_sha256: str, parser_version: str, settings_sha: str) -> str:
+def extraction_key(
+    rev_sha256: str, parser_version: str, settings_sha: str, page_cap: int | None = None
+) -> str:
     """Deterministic extraction-run UUID.
 
     Per PRD §6 the extraction key hashes the source bytes hash, the parser
@@ -92,10 +94,17 @@ def extraction_key(rev_sha256: str, parser_version: str, settings_sha: str) -> s
     normalization settings yields a *different* key, so a re-extract never
     clobbers the outputs of the old settings; changing the answer model or
     embedding model does not appear here, so it never invalidates extraction.
+
+    *page_cap* (M6 pilot, PRD §12) is appended when set, so a capped partial
+    run of the same bytes gets its own key and can never share state or
+    artifacts with the full run. ``page_cap=None`` leaves the key
+    byte-identical to the pre-M6 form — production extraction keys are
+    unchanged by the existence of this parameter.
     """
+    cap = "" if page_cap is None else f":cap{page_cap}"
     return str(
         uuid.uuid5(
-            NAMESPACE_EXTRACT, f"extract:{rev_sha256}:{parser_version}:{settings_sha}"
+            NAMESPACE_EXTRACT, f"extract:{rev_sha256}:{parser_version}:{settings_sha}{cap}"
         )
     )
 

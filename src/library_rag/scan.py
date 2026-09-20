@@ -23,6 +23,7 @@ from __future__ import annotations
 import os
 import time
 import zipfile
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -41,6 +42,8 @@ __all__ = [
     "STAGE_PUBLISH",
     "ScanReport",
     "detect_format",
+    "iter_candidate_paths",
+    "process_paths",
     "scan_root",
     "scan_roots",
 ]
@@ -69,6 +72,35 @@ class ScanReport:
     missing: list[str] = field(default_factory=list)
     changed_during_scan: list[str] = field(default_factory=list)
     jobs_enqueued: int = 0
+
+
+def iter_candidate_paths(
+    root: Path, ignore_dirs: frozenset[str] | set[str], ignore_files: frozenset[str] | set[str]
+) -> list[Path]:
+    """Stream candidate (PDF/EPUB) files under *root*, pruned like the scanner.
+
+    Shared by :func:`scan_root` and the M6 pilot survey so both see exactly
+    the same tree: configured ignore sets applied, symlinks never followed,
+    deterministic (sorted) order. Returns the list of candidate paths.
+    """
+    found: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+        # Prune ignore sets and symlinked directories in place (never follow).
+        dirnames[:] = [
+            d
+            for d in sorted(dirnames)
+            if d not in ignore_dirs and not os.path.islink(os.path.join(dirpath, d))
+        ]
+        for name in sorted(filenames):
+            if name in ignore_files:
+                continue
+            p = Path(dirpath) / name
+            if p.is_symlink():
+                continue
+            if p.suffix.lower() not in _CANDIDATE_SUFFIXES:
+                continue
+            found.append(p)
+    return found
 
 
 def detect_format(path: Path) -> Format | None:
@@ -173,22 +205,10 @@ def scan_root(db: Database, cfg: Config, root: Path, jobs: Jobs | None = None) -
         return report
 
     visible: set[str] = set()
-    for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
-        # Prune ignore sets and symlinked directories in place (never follow).
-        dirnames[:] = [
-            d
-            for d in sorted(dirnames)
-            if d not in cfg.scan.ignore_dirs and not os.path.islink(os.path.join(dirpath, d))
-        ]
-        for name in sorted(filenames):
-            p = Path(dirpath) / name
-            if p.is_symlink() or name in cfg.scan.ignore_files:
-                continue
-            if p.suffix.lower() not in _CANDIDATE_SUFFIXES:
-                continue
-            norm = normalize_path(p)
-            visible.add(norm)
-            _process_file(db, cfg, jobs, p, report)
+    for p in iter_candidate_paths(root, cfg.scan.ignore_dirs, cfg.scan.ignore_files):
+        norm = normalize_path(p)
+        visible.add(norm)
+        _process_file(db, cfg, jobs, p, report)
 
     # Known aliases under this root that are no longer visible: report only.
     prefix = normalize_path(root) + "/"
@@ -201,3 +221,17 @@ def scan_root(db: Database, cfg: Config, root: Path, jobs: Jobs | None = None) -
 def scan_roots(db: Database, cfg: Config, jobs: Jobs | None = None) -> list[ScanReport]:
     """Scan every configured source root; one report each (JSON-friendly)."""
     return [scan_root(db, cfg, root, jobs) for root in cfg.paths.source_roots]
+
+
+def process_paths(db: Database, cfg: Config, jobs: Jobs | None, paths: Iterable[Path]) -> ScanReport:
+    """Register an explicit set of candidate paths into *report* (no tree walk).
+
+    The M6 pilot uses this to ingest exactly the manifest's books into an
+    isolated sandbox, applying the same per-file rules as a full scan (fast
+    check, content hash, magic-byte format validation, archive, registration,
+    extract-job enqueue).
+    """
+    report = ScanReport(root="(pilot manifest)")
+    for path in paths:
+        _process_file(db, cfg, jobs, path, report)
+    return report

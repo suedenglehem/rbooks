@@ -47,7 +47,10 @@ from .embeddings import (
     bm25_weights,
     checkpoint_path,
     compute_sparse_stats,
+    corpus_stats_record_load,
+    corpus_stats_record_store,
     embedding_sha,
+    load_sparse_stats,
     read_checkpoint,
 )
 from .identity import generation_id, point_id, publication_id
@@ -231,15 +234,31 @@ class RealQdrantOps:
 
     Only the verified API surface of the pinned client is used; nothing here
     depends on deprecated calls (no ``recreate_collection``).
+
+    Two backends, selected by config (M6):
+
+    * remote — ``qdrant_host``/``qdrant_port`` (a running Qdrant server);
+    * local  — ``qdrant_path`` set: qdrant-client embedded mode with storage
+      under that directory (the pilot sandbox; no server process needed).
+      Local mode uses the same client API, so every method below is
+      backend-agnostic.
     """
 
     def __init__(self, cfg: Config, *, timeout: int = 30) -> None:
-        self._client = QdrantClient(
-            host=cfg.services.qdrant_host, port=cfg.services.qdrant_port, timeout=timeout
-        )
+        self._local = cfg.services.qdrant_path is not None
+        if self._local:
+            self._client = QdrantClient(path=cfg.services.qdrant_path, timeout=timeout)
+        else:
+            self._client = QdrantClient(
+                host=cfg.services.qdrant_host, port=cfg.services.qdrant_port, timeout=timeout
+            )
         self.collection = COLLECTION
 
     # -- lifecycle -------------------------------------------------------------
+    def close(self) -> None:
+        """Release the client (local mode drops its storage flock on close)."""
+        self._client.close()
+
     def ping(self) -> bool:
         try:
             self._client.get_collections()
@@ -602,6 +621,51 @@ def publication_is_current(
 
 # --- The publication protocol -----------------------------------------------------------
 
+
+def _corpus_stats_for_publish(db: Database, cfg: Config, rev_id: str) -> SparseStats:
+    """The statistics epoch a publication of *rev_id* joins (M6 fix B1).
+
+    The record (see :func:`corpus_stats_record_load`) is committed inside this
+    function's B4 switch transaction, so it always describes the *current*
+    active set. A revision that is **already active** therefore joins exactly
+    the recorded epoch — reusing it skips the O(corpus) tokenization that
+    used to cost ~4.2 s on every stale-epoch republish (12.8k such jobs in
+    the M6 pilot; that recompute *was* the tail). A not-yet-active revision
+    grows the corpus, so it must compute.
+
+    ``retrieval.stats_epoch == "frozen"`` (M6 fix B2) extends the reuse to
+    not-yet-active revisions: the epoch is pinned to the record for the whole
+    campaign (a new book's novel terms get zero sparse weight until the
+    campaign-end re-freeze), and because every publication shares one sha,
+    the epoch fan-out finds no mismatches and enqueues nothing.
+
+    Missing or mismatched record (corpus-stats row deleted, k1/b changed,
+    first publish ever) falls back to the full compute — self-healing.
+
+    One transient: publishing a *replacement* revision of a doc whose old
+    revision is still active computes against the pre-switch corpus (the old
+    revision's chunks are included until the B4 switch supersedes them). The
+    record then lags the true corpus until the next genuinely new revision
+    computes; the epoch fan-out republishes the affected books under the
+    corrected epoch, so this converges within one fan-out round.
+    """
+    record = corpus_stats_record_load(db)
+    if record is not None and record.get("bm25") == cfg.retrieval.bm25.settings_sha():
+        staged_active = (
+            db.query_one(
+                "SELECT 1 AS x FROM publications WHERE rev_id = ? AND state = 'active'",
+                (rev_id,),
+            )
+            is not None
+        )
+        frozen = cfg.retrieval.stats_epoch == "frozen"
+        if staged_active or frozen:
+            stats = load_sparse_stats(db, str(record["stats_sha"]))
+            if stats is not None:
+                return stats
+    return compute_sparse_stats(db, cfg, include_rev_id=rev_id)
+
+
 def publish_generation(
     db: Database,
     cfg: Config,
@@ -631,7 +695,9 @@ def publish_generation(
 
     # Corpus statistics for the epoch this publication will join (includes the
     # revision being staged, so the persisted row matches the post-switch set).
-    stats = compute_sparse_stats(db, cfg, include_rev_id=rev_id)
+    # Fast path: an already-active revision reuses the recorded epoch (see
+    # _corpus_stats_for_publish); only a genuinely new revision computes.
+    stats = _corpus_stats_for_publish(db, cfg, rev_id)
     gen_id = generation_id(run_id, emb_sha, stats.stats_sha)
     pub_id = publication_id(rev_id, gen_id)
 
@@ -766,6 +832,10 @@ def publish_generation(
             "UPDATE index_generations SET point_count = ?, updated_at = ? WHERE gen_id = ?",
             (expected_count, ts, gen_id),
         )
+        # The epoch record commits atomically with the switch it describes
+        # (the record stays valid for the committed active set — see
+        # _corpus_stats_for_publish for the invariant this maintains).
+        corpus_stats_record_store(db, stats, bm25.settings_sha(), ts)
 
     return "published"
 
@@ -840,12 +910,20 @@ def reconcile_publications(db: Database, cfg: Config, qdrant: QdrantOps, *, now:
             # not happen: chunks are immutable per run). Leave it for inspection.
             continue
 
-        got_ids = qdrant.ids(IndexFilter.all(FieldCond("pub_id", "eq", pub_id)))
+        # A missing collection means every staged pub is incomplete: leave it
+        # for the open publish job (which ensures the collection) rather than
+        # treating absent points as a vanished index.
+        has_collection = qdrant.collection_exists()
+        got_ids = qdrant.ids(IndexFilter.all(FieldCond("pub_id", "eq", pub_id))) if has_collection else frozenset()
         if got_ids != expected_ids:
             continue  # points incomplete: the open publish job finishes it
 
-        active = qdrant.count(
-            IndexFilter.all(FieldCond("pub_id", "eq", pub_id), FieldCond("active", "eq", True))
+        active = (
+            qdrant.count(
+                IndexFilter.all(FieldCond("pub_id", "eq", pub_id), FieldCond("active", "eq", True))
+            )
+            if has_collection
+            else 0
         )
         if active == 0:
             open_job = db.query_one(

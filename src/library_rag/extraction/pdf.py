@@ -122,7 +122,8 @@ def _requeue_ocr_units(ctx: ExtractorCtx) -> None:
 
 
 def extract_pdf(ctx: ExtractorCtx) -> int:
-    """Extract every page of the archived PDF; return the unit count.
+    """Extract every page of the archived PDF (or the first ``ctx.page_cap``
+    pages when a pilot cap is set); return the unit count.
 
     Raises ExtractionFailure with a permanent category for encrypted, corrupt,
     or missing sources; transient errors propagate to the worker.
@@ -142,7 +143,13 @@ def extract_pdf(ctx: ExtractorCtx) -> int:
             raise ExtractionFailure("encrypted", "PDF requires a password")
         if start_run(ctx, parser_version(), ctx.settings.settings_sha()):
             done = 0
-            for index in range(doc.page_count):
+            # M6 pilot: a page cap bounds the workload per book (PRD §12). The
+            # cap is part of the run's extraction key, so a capped run never
+            # shares state with the full run of the same bytes.
+            limit = (
+                min(doc.page_count, ctx.page_cap) if ctx.page_cap is not None else doc.page_count
+            )
+            for index in range(limit):
                 unit_id = unit_id_for(ctx.run_id, "page", index)
                 if existing_verified_unit(ctx, "page", index, unit_id):
                     done += 1  # completed by a previous (crashed) run

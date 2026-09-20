@@ -22,6 +22,7 @@ from library_rag.indexing import (
     IndexingError,
     PublicationError,
     QdrantPoint,
+    RealQdrantOps,
     acquire_publish_lock,
     build_point,
     publish_generation,
@@ -377,3 +378,23 @@ def test_reconcile_leaves_incomplete_publication_alone(
 
 def test_collection_name_is_stable() -> None:
     assert COLLECTION == "library_chunks"
+
+
+def test_real_qdrant_local_mode(base_config: Config) -> None:
+    # Embedded (local) mode: qdrant_path set, no server process. This is the
+    # pilot sandbox backend; the client API is backend-agnostic.
+    base_config.services.qdrant_path = str(base_config.paths.qdrant_root)
+    ops = RealQdrantOps(base_config)
+    assert ops.ping() is True
+    assert ops.collection_exists() is False
+    ops.ensure_collection(dimensions=8)
+    assert ops.collection_exists() is True
+    # Re-ensure with matching dimensions is a no-op (idempotent startup).
+    ops.ensure_collection(dimensions=8)
+    # Local mode allows exactly one open client per storage path (exclusive
+    # flock), so close before reopening for the mismatch check below.
+    ops.close()
+    # A dimension mismatch is an explicit operator error, not a silent
+    # recreate: the embedding config changed, so point at fresh roots.
+    with pytest.raises(IndexingError, match="dense dimensions"):
+        RealQdrantOps(base_config).ensure_collection(dimensions=16)

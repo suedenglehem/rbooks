@@ -140,7 +140,8 @@ def _section_payload(
 
 
 def extract_epub(ctx: ExtractorCtx) -> int:
-    """Extract every spine section of the archived EPUB; return the unit count.
+    """Extract every spine section of the archived EPUB (or the first
+    ``ctx.page_cap`` sections when a pilot cap is set); return the unit count.
 
     Raises ExtractionFailure with a permanent category for unsafe, corrupt, or
     missing sources; transient errors propagate to the worker.
@@ -159,6 +160,10 @@ def extract_epub(ctx: ExtractorCtx) -> int:
     items = _spine_items(book)
     if not items:
         raise ExtractionFailure("invalid_source", "EPUB has no spine items")
+    # M6 pilot: a page cap bounds the spine (the EPUB analogue of pages).
+    # Slicing keeps zero-based spine positions stable for the sampled prefix.
+    if ctx.page_cap is not None:
+        items = items[: ctx.page_cap]
 
     if not start_run(ctx, parser_version(), ctx.settings.settings_sha()):
         if ctx.on_extract_done is not None:

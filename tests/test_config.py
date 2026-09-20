@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from library_rag.config import Config, ConfigError, Paths, load_config
+from library_rag.config import Config, ConfigError, Paths, PilotSettings, Services, load_config
 
 
 def test_valid_config_is_accepted(base_config: Config) -> None:
@@ -142,3 +142,20 @@ def test_invalid_root_type_raises_config_error(tmp_path: Path) -> None:
     bad.write_text("- just\n- a\n- list\n", encoding="utf-8")
     with pytest.raises(ConfigError, match="config root must be a mapping"):
         load_config(bad)
+
+
+def test_pilot_page_cap_default_and_validation() -> None:
+    # None means "no cap" — the production default, which keeps extraction
+    # keys byte-identical to pre-M6 ones.
+    assert PilotSettings().page_cap is None
+    assert PilotSettings(page_cap=32).page_cap == 32
+    with pytest.raises(ConfigError, match=r"pilot\.page_cap must be >= 1"):
+        PilotSettings(page_cap=0)
+    with pytest.raises(ConfigError, match=r"pilot\.page_cap must be >= 1"):
+        PilotSettings(page_cap=-1)
+
+
+def test_services_qdrant_path_defaults_none() -> None:
+    # No qdrant_path by default: operators on a Qdrant server set host/port,
+    # and only the pilot sandbox switches on embedded local mode.
+    assert Services().qdrant_path is None

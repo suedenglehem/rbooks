@@ -220,3 +220,19 @@ def test_extract_epub_missing_source(state_db: Database, base_config: Config) ->
         extract_epub(ctx)
     assert ei.value.category == "missing_source"
     assert is_permanent(ei.value.category)
+
+
+def test_extract_epub_respects_page_cap(state_db: Database, base_config: Config) -> None:
+    src = base_config.paths.scratch_root / "capped.epub"
+    make_epub(src, [(f"Ch{i}", [f"Chapter {i} body text here."]) for i in range(5)])
+    rev_id = ingest_and_register(state_db, base_config, src, Format.EPUB)
+    base_config.pilot.page_cap = 2
+    ctx = ctx_for_rev(state_db, base_config, rev_id)
+    assert ctx.page_cap == 2
+    assert extract_epub(ctx) == 2
+    rows = state_db.query(
+        "SELECT position, kind FROM source_units WHERE run_id = ? ORDER BY position",
+        (ctx.run_id,),
+    )
+    assert [r["position"] for r in rows] == [0, 1]
+    assert all(r["kind"] == "section" for r in rows)

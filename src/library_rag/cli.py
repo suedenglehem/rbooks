@@ -7,8 +7,10 @@ extraction queue), the M4 ``search`` command (fused dense+sparse search over
 the published index, with sparse-only degraded mode when embedding inference
 is unavailable), and the M5 commands ``answer`` (cited answering with the
 persisted frozen evidence manifest), ``serve`` (the FastAPI research app),
-and ``evaluate`` (labeled retrieval/answer metrics, PRD §13) are
-implemented. The remaining commands are registered with their help text and
+``evaluate`` (labeled retrieval/answer metrics, PRD §13), and the M6
+``pilot`` group (read-only corpus survey and deterministic stratified sample
+manifest, PRD §12) are implemented. The remaining commands are registered
+with their help text and
 milestone so that ``library-rag --help`` documents the whole intended surface
 (PRD §4). Each stub prints an explicit "not yet implemented (milestone Mx)"
 message and returns a non-zero exit code rather than pretending to do the
@@ -22,12 +24,16 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import ipaddress
 import json
 import signal
 import sys
+import time
 from collections.abc import Callable
 from dataclasses import asdict
+from pathlib import Path
+from typing import cast
 
 from . import __version__
 from .answers import answer_query, get_answer
@@ -41,9 +47,32 @@ from .evaluate import evaluate, format_report, load_dataset
 from .identity import normalize_path
 from .indexing import QdrantOps, RealQdrantOps, reconcile_publications
 from .jobs import Jobs
+from .latency import build_probe_queries, run_latency
 from .llm import AnswerModel, make_answer_model
 from .log import setup_logging
 from .migrations import current_version, migrate
+from .pilot import (
+    MANIFEST_SCHEMA,
+    PILOT_REPORT_SCHEMA,
+    format_manifest_summary,
+    load_survey,
+    run_pilot,
+    sample_manifest,
+    sandbox_config,
+    survey_sources,
+    write_manifest,
+    write_pilot_report,
+)
+from .pilot_report import build_report, write_report
+from .questions import (
+    QUESTION_BANK_SCHEMA,
+    QUESTION_CATEGORIES,
+    QuestionEntry,
+    add_question,
+    export_dataset,
+    load_bank,
+    suggest_candidates,
+)
 from .reconcile import Mount, reconcile_catalog
 from .retrieval import IndexUnavailableError, search
 from .scan import scan_roots
@@ -486,6 +515,353 @@ def _evaluate(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+# --- M6 pilot ---------------------------------------------------------------
+
+
+def _pilot_survey(args: argparse.Namespace) -> int:
+    setup_logging(args.log_level, args.log_format)
+    cfg = _require_config(args)
+    for root in cfg.paths.source_roots:
+        if not root.is_dir():
+            print(f"warning: source root missing: {root}", file=sys.stderr)
+    out = Path(args.out)
+    state = {"total": 0}
+
+    def on_progress(done: int, total: int) -> None:
+        state["total"] = total
+        print(f"  survey: {done}/{total} profiled", file=sys.stderr)
+
+    try:
+        summary = survey_sources(cfg, out, limit=args.limit, on_progress=on_progress)
+    except OSError as exc:
+        print(f"survey error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    print(f"survey: {summary.files_scanned} candidates recorded in {out} (this pass: {summary.seconds}s)")
+    for fmt, n in sorted(summary.by_format.items()):
+        print(f"  format {fmt}: {n}")
+    print(f"  strata: {len(summary.by_stratum)}  errored: {summary.errors}")
+    return EXIT_OK
+
+
+def _pilot_sample(args: argparse.Namespace) -> int:
+    setup_logging(args.log_level, args.log_format)
+    survey_path = Path(args.survey)
+    if not survey_path.is_file():
+        print(f"survey error: no such file: {survey_path}", file=sys.stderr)
+        return EXIT_ERROR
+    if not (200 <= args.target <= 500) and not args.allow_out_of_range:
+        print(
+            f"error: target {args.target} is outside the PRD pilot range 200-500 "
+            "(pass --allow-out-of-range for sandbox smoke tests)",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+    if args.page_cap is not None and args.page_cap < 1:
+        print("error: --page-cap must be >= 1 (or omit it for no cap)", file=sys.stderr)
+        return EXIT_ERROR
+    try:
+        records = load_survey(survey_path)
+        survey_sha = hashlib.sha256(survey_path.read_bytes()).hexdigest()
+        manifest = sample_manifest(
+            records, seed=args.seed, target=args.target, page_cap=args.page_cap, survey_sha=survey_sha
+        )
+        write_manifest(manifest, Path(args.out))
+    except (OSError, ValueError) as exc:
+        print(f"sample error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    if args.json:
+        print(json.dumps(manifest, indent=2, ensure_ascii=False))
+    else:
+        print(f"manifest written: {args.out}")
+        for line in format_manifest_summary(manifest):
+            print(line)
+    return EXIT_OK
+
+
+def _pilot_run(args: argparse.Namespace) -> int:
+    setup_logging(args.log_level, args.log_format)
+    cfg = _require_config(args)
+    manifest_path = Path(args.manifest)
+    if not manifest_path.is_file():
+        print(f"run error: no such manifest: {manifest_path}", file=sys.stderr)
+        return EXIT_ERROR
+    try:
+        metrics = run_pilot(cfg, manifest_path, Path(args.sandbox_root))
+    except (OSError, ValueError, ConfigError) as exc:
+        print(f"run error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    out = Path(args.out) if args.out else Path(args.sandbox_root) / "scratch" / "pilot_run.json"
+    try:
+        write_pilot_report(metrics, out)
+    except OSError as exc:
+        print(f"run error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    if args.json:
+        print(json.dumps(metrics.to_dict(), indent=2, ensure_ascii=False))
+    else:
+        print(
+            f"pilot run: {metrics.documents} documents, {metrics.chunks} chunks "
+            f"({metrics.chunk_tokens} tokens) in {metrics.seconds:.1f}s -> {out}"
+        )
+        for stage, s in sorted(metrics.stages.items()):
+            print(
+                f"  {stage}: jobs={s['jobs']} ok={s['succeeded']} failed={s['failed']} "
+                f"{s['seconds']:.1f}s (max {s['seconds_max']:.1f}s)"
+            )
+        if metrics.failed_jobs:
+            print(f"  failed jobs: {len(metrics.failed_jobs)} (details in the report)")
+        for name, d in sorted(metrics.disk.items()):
+            print(f"  disk {name}: +{d['delta_bytes'] / 1048576:.1f} MiB")
+    return EXIT_OK
+
+
+def _pilot_latency(args: argparse.Namespace) -> int:
+    setup_logging(args.log_level, args.log_format)
+    cfg = _require_config(args)
+    sandbox_root = Path(args.sandbox_root)
+    try:
+        sandbox_cfg = sandbox_config(cfg, sandbox_root, page_cap=args.page_cap)
+    except (OSError, ValueError, ConfigError) as exc:
+        print(f"latency error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    if not db_path_for(sandbox_cfg.paths.state_root).is_file():
+        print(
+            f"latency error: no sandbox index at {sandbox_root} "
+            "(run `pilot run` against this sandbox first)",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+    questions = None
+    if args.questions:
+        try:
+            questions = [e.question for e in load_bank(args.questions)]
+        except (OSError, ValueError) as exc:
+            print(f"latency error: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+    db = _open_state(sandbox_cfg)
+    try:
+        qdrant = RealQdrantOps(sandbox_cfg)
+        embedder = make_embedder(sandbox_cfg)
+        probes = build_probe_queries(db, questions=questions, n=args.probes)
+        result = run_latency(
+            db,
+            sandbox_cfg,
+            qdrant,
+            embedder,
+            probe_queries=probes,
+            limit=args.limit,
+            reps=args.reps,
+            ingest_root=args.ingest_root,
+            ingest_count=args.ingest_count,
+        )
+    except (OSError, ValueError, ConfigError) as exc:
+        print(f"latency error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    finally:
+        db.close()
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(f"latency: {result['probes']} probes x {args.reps} reps, limit {args.limit}")
+        for phase in ("idle", "ingesting"):
+            s = cast("dict[str, object] | None", result[phase])
+            if s is None:
+                continue
+            print(
+                f"  {phase}: n={s['n']} mean={s['mean_ms']}ms p50={s['p50_ms']}ms "
+                f"p95={s['p95_ms']}ms max={s['max_ms']}ms"
+            )
+        if result["enqueued"]:
+            print(f"  backlog enqueued: {result['enqueued']} books")
+    return EXIT_OK
+
+
+def _pilot_report(args: argparse.Namespace) -> int:
+    setup_logging(args.log_level, args.log_format)
+    survey = None
+    if args.survey:
+        try:
+            survey = load_survey(Path(args.survey))
+        except (OSError, ValueError) as exc:
+            print(f"report error: survey: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+    manifest = None
+    if args.manifest:
+        try:
+            raw = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            print(f"report error: manifest: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+        if not isinstance(raw, dict) or raw.get("schema") != MANIFEST_SCHEMA:
+            print(
+                f"report error: manifest: schema must be {MANIFEST_SCHEMA!r}", file=sys.stderr
+            )
+            return EXIT_ERROR
+        manifest = raw
+    run = None
+    if args.run:
+        try:
+            raw = json.loads(Path(args.run).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            print(f"report error: run: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+        if not isinstance(raw, dict) or raw.get("schema") != PILOT_REPORT_SCHEMA:
+            print(
+                f"report error: run: schema must be {PILOT_REPORT_SCHEMA!r}", file=sys.stderr
+            )
+            return EXIT_ERROR
+        run = raw
+    questions = None
+    if args.questions:
+        try:
+            questions = load_bank(args.questions)
+        except (OSError, ValueError) as exc:
+            print(f"report error: questions: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+    cfg = None
+    if args.config:
+        try:
+            cfg = load_config(args.config)
+        except ConfigError as exc:
+            print(f"report error: config: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+    if survey is None and manifest is None and run is None and questions is None:
+        print(
+            "report error: give at least one of --survey --manifest --run --questions",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+    try:
+        report = build_report(
+            survey=survey, manifest=manifest, run=run, questions=questions, config=cfg
+        )
+    except (OSError, ValueError) as exc:
+        print(f"report error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    if args.out:
+        out = Path(args.out)
+    elif run and run.get("sandbox_root"):
+        out = Path(str(run["sandbox_root"])) / "scratch" / "pilot_report.md"
+    else:
+        out = Path("pilot_report.md")
+    try:
+        write_report(report, out)
+    except OSError as exc:
+        print(f"report error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        print(f"report written: {out}")
+        proj = report.get("projections")
+        if proj:
+            print(
+                f"  full corpus: ~{proj['full_chunks_est']:,} chunks, "
+                f"ETA {proj['full_run_duration_est']} (single worker)"
+            )
+        storage = report.get("storage")
+        if storage:
+            print(f"  storage estimate: {storage['total_gb']} GB")
+        q = report.get("questions") or {}
+        if q:
+            print(f"  question bank: {q['total']} — {q['status']}")
+    return EXIT_OK
+
+
+def _pilot_annotate_add(args: argparse.Namespace) -> int:
+    setup_logging(args.log_level, args.log_format)
+    # The from_dict round-trip enforces the bank's invariants (category/
+    # answerable consistency) at write time, not only at read time.
+    entry = QuestionEntry.from_dict(
+        {
+            "id": args.id or "",
+            "question": args.question,
+            "category": args.category,
+            "expected_chunks": list(args.expected_chunk or []),
+            "answerable": not args.unanswerable,
+            "source_paths": list(args.source_path or []),
+            "notes": args.notes or "",
+            "labeled_by": args.labeled_by or "",
+            "labeled_at": time.time(),
+        }
+    )
+    try:
+        added = add_question(args.file, entry)
+    except (OSError, ValueError) as exc:
+        print(f"annotate error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    if args.json:
+        print(json.dumps(added.to_dict(), indent=2, ensure_ascii=False))
+    else:
+        print(f"added {added.id} [{added.category}] to {args.file}")
+    return EXIT_OK
+
+
+def _pilot_annotate_list(args: argparse.Namespace) -> int:
+    setup_logging(args.log_level, args.log_format)
+    try:
+        entries = load_bank(args.file)
+    except (OSError, ValueError) as exc:
+        print(f"annotate error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    if args.json:
+        print(
+            json.dumps(
+                {"schema": QUESTION_BANK_SCHEMA, "questions": [e.to_dict() for e in entries]},
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+    else:
+        for e in entries:
+            flag = "answerable" if e.answerable else "UNANSWERABLE"
+            print(f"  {e.id} [{e.category}] {flag}  {e.question}")
+        print(f"{len(entries)} questions in {args.file}")
+    return EXIT_OK
+
+
+def _pilot_annotate_export(args: argparse.Namespace) -> int:
+    setup_logging(args.log_level, args.log_format)
+    try:
+        entries = load_bank(args.file)
+        payload = export_dataset(entries)
+    except (OSError, ValueError) as exc:
+        print(f"annotate error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    if args.out:
+        try:
+            out = Path(args.out)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        except OSError as exc:
+            print(f"annotate error: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+        print(f"exported {len(entries)} questions -> {out}")
+    else:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return EXIT_OK
+
+
+def _pilot_annotate_suggest(args: argparse.Namespace) -> int:
+    setup_logging(args.log_level, args.log_format)
+    cfg = _require_config(args)
+    db = _open_state(cfg)
+    try:
+        candidates = suggest_candidates(db, limit=args.limit, seed=args.seed)
+    except (OSError, ValueError) as exc:
+        print(f"annotate error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    finally:
+        db.close()
+    for c in candidates:
+        print(json.dumps(c, ensure_ascii=False))
+    print(
+        f"# {len(candidates)} candidates (unlabeled — review before `pilot annotate add`)",
+        file=sys.stderr,
+    )
+    return EXIT_OK
+
+
 # --- parser ----------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -598,6 +974,134 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate_p.add_argument("--json", action="store_true", help="emit the report as JSON")
     evaluate_p.add_argument("--k", type=int, default=20, help="candidates per question (default 20)")
     evaluate_p.set_defaults(_func=_evaluate)
+
+    pilot_p = sub.add_parser(
+        "pilot",
+        help="M6 pilot tooling: corpus survey, stratified sample, run, latency, report, "
+        "question bank (PRD §12)",
+    )
+    pilot_sub = pilot_p.add_subparsers(dest="pilot_command", required=True, metavar="STAGE")
+    ps = pilot_sub.add_parser(
+        "survey", help="read-only corpus survey of candidate books (JSONL, resumable)"
+    )
+    ps.add_argument("--config", help="path to config YAML")
+    ps.add_argument("--out", required=True, help="survey JSONL output path")
+    ps.add_argument(
+        "--limit", type=int, default=None, help="profile at most N files this pass (testing)"
+    )
+    ps.set_defaults(_func=_pilot_survey)
+    pm = pilot_sub.add_parser(
+        "sample", help="deterministic stratified manifest from a survey (200-500 books)"
+    )
+    pm.add_argument("--survey", required=True, help="survey JSONL produced by `pilot survey`")
+    pm.add_argument("--out", required=True, help="manifest JSON output path")
+    pm.add_argument("--seed", type=int, default=42, help="sampling seed (default 42)")
+    pm.add_argument("--target", type=int, default=300, help="books to sample (PRD: 200-500)")
+    pm.add_argument("--page-cap", type=int, default=None, help="per-book page cap (omit for no cap)")
+    pm.add_argument("--json", action="store_true", help="emit the full manifest as JSON")
+    pm.add_argument(
+        "--allow-out-of-range",
+        action="store_true",
+        help="permit a target outside 200-500 (sandbox smoke tests only)",
+    )
+    pm.set_defaults(_func=_pilot_sample)
+    pr = pilot_sub.add_parser(
+        "run",
+        help="ingest exactly the manifest's books into an isolated sandbox and measure it",
+    )
+    pr.add_argument("--config", help="path to config YAML")
+    pr.add_argument("--manifest", required=True, help="manifest JSON from `pilot sample`")
+    pr.add_argument(
+        "--sandbox-root",
+        required=True,
+        help="isolated writable root (archive/state/qdrant/scratch live under it; the real index is never touched)",
+    )
+    pr.add_argument(
+        "--out", default=None, help="metrics JSON output (default <sandbox>/scratch/pilot_run.json)"
+    )
+    pr.add_argument("--json", action="store_true", help="emit the full metrics as JSON")
+    pr.set_defaults(_func=_pilot_run)
+    pl = pilot_sub.add_parser(
+        "latency",
+        help="p50/p95 retrieval latency on the sandbox index, idle vs during ingestion",
+    )
+    pl.add_argument("--config", help="path to config YAML")
+    pl.add_argument(
+        "--sandbox-root",
+        required=True,
+        help="sandbox from `pilot run` (its state DB + qdrant directory are measured)",
+    )
+    pl.add_argument("--questions", default=None, help="question bank JSON (probes verbatim)")
+    pl.add_argument("--probes", type=int, default=10, help="probe queries (default 10)")
+    pl.add_argument("--reps", type=int, default=1, help="repeat the measurement pass (default 1)")
+    pl.add_argument("--limit", type=int, default=20, help="candidates per probe (default 20)")
+    pl.add_argument(
+        "--page-cap", type=int, default=None, help="per-book page cap applied to the ingest backlog"
+    )
+    pl.add_argument(
+        "--ingest-root",
+        default=None,
+        help="directory of extra books to queue while measuring (omitted: idle only)",
+    )
+    pl.add_argument(
+        "--ingest-count",
+        type=int,
+        default=0,
+        help="max books from --ingest-root to enqueue (default 0: idle only)",
+    )
+    pl.add_argument("--json", action="store_true", help="emit the full result as JSON")
+    pl.set_defaults(_func=_pilot_latency)
+    pr2 = pilot_sub.add_parser(
+        "report",
+        help="aggregate survey + manifest + run (+ question bank) into the capacity report",
+    )
+    pr2.add_argument("--survey", default=None, help="survey JSONL from `pilot survey`")
+    pr2.add_argument("--manifest", default=None, help="manifest JSON from `pilot sample`")
+    pr2.add_argument("--run", default=None, help="pilot run report JSON from `pilot run`")
+    pr2.add_argument("--questions", default=None, help="question bank JSON from `pilot annotate`")
+    pr2.add_argument("--config", default=None, help="config YAML (cited in the frozen-config section)")
+    pr2.add_argument(
+        "--out", default=None, help="markdown output (default <sandbox>/scratch/pilot_report.md)"
+    )
+    pr2.add_argument("--json", action="store_true", help="also emit the report as JSON")
+    pr2.set_defaults(_func=_pilot_report)
+    pa = pilot_sub.add_parser(
+        "annotate",
+        help="question-bank tooling (add/list/export/suggest; labels are the operator's work)",
+    )
+    pa_sub = pa.add_subparsers(dest="annotate_command", required=True, metavar="ACTION")
+    paa = pa_sub.add_parser(
+        "add", help="append one operator-labeled question (the bank's only write path)"
+    )
+    paa.add_argument("--file", required=True, help="question bank JSON path")
+    paa.add_argument("--question", required=True, help="the question text (verbatim)")
+    paa.add_argument("--category", required=True, choices=list(QUESTION_CATEGORIES))
+    paa.add_argument("--id", default="", help="question id (default: auto qNNN)")
+    paa.add_argument("--expected-chunk", action="append", default=[], help="expected chunk id (repeatable)")
+    paa.add_argument("--unanswerable", action="store_true", help="mark unanswerable (forces category=unanswerable)")
+    paa.add_argument("--source-path", action="append", default=[], help="source book path (repeatable)")
+    paa.add_argument("--notes", default="", help="free-form labeler notes")
+    paa.add_argument("--labeled-by", default="", help="who labeled this")
+    paa.add_argument("--json", action="store_true", help="emit the stored entry as JSON")
+    paa.set_defaults(_func=_pilot_annotate_add)
+    pal = pa_sub.add_parser("list", help="show the bank")
+    pal.add_argument("--file", required=True, help="question bank JSON path")
+    pal.add_argument("--json", action="store_true", help="emit the bank as JSON")
+    pal.set_defaults(_func=_pilot_annotate_list)
+    pae = pa_sub.add_parser(
+        "export", help="project the bank onto the `evaluate` dataset schema"
+    )
+    pae.add_argument("--file", required=True, help="question bank JSON path")
+    pae.add_argument("--out", default=None, help="output JSON (default: stdout)")
+    pae.set_defaults(_func=_pilot_annotate_export)
+    pas = pa_sub.add_parser(
+        "suggest",
+        help="print machine-generated, UNLABELED question candidates from the index",
+    )
+    pas.add_argument("--config", help="path to config YAML")
+    pas.add_argument("--limit", type=int, default=40, help="chunks to sample (default 40)")
+    pas.add_argument("--seed", type=int, default=42, help="sampling seed (default 42)")
+    pas.set_defaults(_func=_pilot_annotate_suggest)
 
     _register_stub(sub, "backup", "consistent backup of DB, Qdrant, and manifests (M7)")
     _register_stub(sub, "restore", "restore a backup into an isolated directory (M7)")

@@ -267,6 +267,13 @@ class LlamaCppEmbedder:
         lowered = body.lower()
         if resp.status_code >= 500 and ("out of memory" in lowered or "oom" in lowered):
             raise EmbeddingOOMError(f"embedding server OOM: {body[:200]}")
+        if "too large to process" in lowered:
+            # llama.cpp rejects inputs longer than the physical batch (a 500
+            # "input (N tokens) is too large to process"). No retry will ever
+            # fit such an input, so it is a permanent bad-input error: the job
+            # fails explicitly (``embedding_error``, transient=False) instead
+            # of zombie-retrying as a transient server error.
+            raise EmbeddingError(f"model rejected an input that is too large: {body[:200]}")
         if resp.status_code >= 500:
             raise ModelUnavailableError(f"embedding server error {resp.status_code}: {body[:200]}")
         raise EmbeddingError(f"embedding server rejected request: {resp.status_code} {body[:200]}")
@@ -595,3 +602,63 @@ def load_sparse_stats(db: Database, stats_sha_value: str) -> SparseStats | None:
         avg_doc_len=float(row["avg_doc_len"]),
         df={k: int(v) for k, v in df.items()},
     )
+
+
+# ---------------------------------------------------------------------------
+# Corpus-epoch record (M6 fix B1 — kills the O(N^2) republish recompute)
+#
+# The statistics epoch (stats_sha) includes the document count, so it moves on
+# every real publish. Without a record, every publish — including the ~99.9%
+# that are stale-epoch no-op republishes — pays a full O(corpus) tokenization
+# to discover the current epoch (12.8k such jobs x ~4.2 s = the measured M6
+# pilot tail). The record below is written inside publish_generation's B4
+# switch transaction, so it is crash-atomically consistent with the committed
+# active set: the only place the active set changes is that transaction.
+# ---------------------------------------------------------------------------
+
+CORPUS_STATS_META_KEY = "corpus_stats_epoch"
+
+
+def corpus_stats_record_load(db: Database) -> dict[str, object] | None:
+    """The last persisted corpus-epoch record, or None (no publish yet)."""
+    row = db.query_one("SELECT value FROM meta WHERE key = ?", (CORPUS_STATS_META_KEY,))
+    if row is None:
+        return None
+    try:
+        held = json.loads(row["value"])
+    except ValueError:
+        return None
+    if not isinstance(held, dict) or not isinstance(held.get("stats_sha"), str):
+        return None
+    return held
+
+
+def corpus_stats_record_store(db: Database, stats: SparseStats, bm25_sha: str, now: float) -> None:
+    """Persist the corpus-epoch record.
+
+    Callers must run this inside the B4 switch transaction so the record
+    commits exactly with the publication switch it describes (a crash between
+    the two would otherwise leave the record pointing at an uncommitted set).
+    """
+    value = json.dumps(
+        {"stats_sha": stats.stats_sha, "bm25": bm25_sha, "doc_count": stats.doc_count, "at": now},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if db.query_one("SELECT 1 AS x FROM meta WHERE key = ?", (CORPUS_STATS_META_KEY,)) is None:
+        db.execute("INSERT INTO meta (key, value) VALUES (?, ?)", (CORPUS_STATS_META_KEY, value))
+    else:
+        db.execute("UPDATE meta SET value = ? WHERE key = ?", (value, CORPUS_STATS_META_KEY))
+
+
+def corpus_stats_version_part(db: Database) -> str:
+    """The stats-sha part of a publish job's ``input_version`` (M6 fix B1).
+
+    The recorded corpus epoch, or the sentinel ``"init"`` when no publish has
+    committed one. The version is an idempotency hint only — the publish
+    handler (re)uses the real epoch under the publish lock, and the epoch
+    fan-out converges republishes — so this must stay O(1) and must never
+    trigger a corpus-wide compute.
+    """
+    record = corpus_stats_record_load(db)
+    return str(record["stats_sha"]) if record is not None else "init"

@@ -146,3 +146,31 @@ def test_extraction_key_is_deterministic() -> None:
     other_settings = ExtractionSettings(pdf=PdfLimits(sparse_chars=10)).settings_sha()
     assert other_settings != "settings-1"
     assert base != extraction_key("a" * 64, "pymupdf-1.0.0", other_settings)
+
+
+def test_extraction_key_page_cap_variants() -> None:
+    base = extraction_key("a" * 64, "pymupdf-1.0.0", "settings-1")
+    cap5 = extraction_key("a" * 64, "pymupdf-1.0.0", "settings-1", 5)
+    cap10 = extraction_key("a" * 64, "pymupdf-1.0.0", "settings-1", 10)
+    # An explicit None is the pre-M6 key, byte-identical.
+    assert base == extraction_key("a" * 64, "pymupdf-1.0.0", "settings-1", None)
+    # A cap is hashed in: deterministic, and distinct from both the uncapped
+    # key and any other cap.
+    assert cap5 == extraction_key("a" * 64, "pymupdf-1.0.0", "settings-1", 5)
+    assert cap5 != base
+    assert cap5 != cap10
+
+
+def test_extract_pdf_respects_page_cap(state_db: Database, base_config: Config) -> None:
+    src = base_config.paths.scratch_root / "capped.pdf"
+    make_pdf(src, [_NORMAL] * 5)
+    rev_id = ingest_and_register(state_db, base_config, src, Format.PDF)
+    base_config.pilot.page_cap = 3
+    ctx = ctx_for_rev(state_db, base_config, rev_id)
+    assert ctx.page_cap == 3
+    assert extract_pdf(ctx) == 3
+    rows = state_db.query(
+        "SELECT position FROM source_units WHERE run_id = ? ORDER BY position",
+        (ctx.run_id,),
+    )
+    assert [r["position"] for r in rows] == [0, 1, 2]

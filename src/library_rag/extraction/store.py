@@ -61,6 +61,10 @@ class ExtractorCtx:
     # Both are no-ops when None (tests that drive extractors directly).
     enqueue_ocr: Callable[[int], None] | None = None
     on_extract_done: Callable[[], None] | None = None
+    # M6 pilot: maximum number of pages (PDF) / spine sections (EPUB) to
+    # extract; None = the whole source. Set by the worker from
+    # cfg.pilot.page_cap and hashed into the run's extraction key.
+    page_cap: int | None = None
 
 
 def unit_artifact_path(artifact_root: Path, rev_id: str, unit_id: str) -> Path:

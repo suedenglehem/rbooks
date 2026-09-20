@@ -657,3 +657,325 @@ Gate cases (all passing, run this session):
   report (measured results, uncertainty, full-run ETA by bottleneck, storage
   estimate with rebuild headroom, recommended frozen config). **Operator
   approval is required before full ingestion.**
+
+## M6 — Pilot and capacity report
+
+**Status: COMPLETE** (run #2 deliberately stopped 2026-09-20 after all
+300 books had passed extract→ocr→chunk→embed — the only remaining queue
+was the O(N²) epoch-republish churn, which is finding F1 and is fixed as
+Fix B; report, latency measurement, and question candidates are all
+done; operator pre-approved the report 2026-09-20; the report is
+`M6_PILOT_REPORT.md`, marked APPROVED).
+
+### Delivered (code, gate green)
+- `pilot.py` — `pilot survey` (serial MuPDF survey of the corpus → JSONL
+  strata records: format, ocr_class, language, pages, size) and
+  `pilot sample` (stratified sample manifest, seed-reproducible, page cap,
+  schema `pilot-manifest/1`). Survey of the full corpus complete: 34,768
+  records (25,279 pdf / 9,129 epub / 360 invalid), 51 strata.
+- `pilot run` — ingests exactly the manifest's books into an isolated
+  sandbox (derived config: own state/qdrant/archive/artifacts/scratch
+  under the sandbox root, embedded local Qdrant, page cap from the
+  manifest), runs the serial worker to drain, and writes measured metrics
+  (per-stage seconds from the jobs table, units/chars, chunks/tokens,
+  peak RAM via getrusage incl. children, VRAM deltas via nvidia-smi
+  sampling, disk deltas per sub-root) to `scratch/pilot_run.json`.
+- `latency.py` — `pilot latency`: p50/p95 for search/answer probes,
+  idle vs with ingestion in flight (bounded ingest backlog from a
+  source root), probes against the sandbox index.
+- `questions.py` — annotation/evaluation tooling for 100–200
+  human-labeled questions (exact_term / conceptual / ocr / epub /
+  conflict / unanswerable). `pilot annotate suggest` proposes candidate
+  questions from the sandbox index for a human to label; the bank
+  accepts ONLY human-written labels — the tooling never invents labels.
+- `pilot_report.py` — `pilot report`: measurements, uncertainty,
+  full-run ETA by bottleneck, storage estimate (dense + two-generation
+  rebuild headroom + archive copy vs free space), recommended frozen
+  config, and explicit findings.
+
+### Findings so far
+- Embedding server is bge-m3 Q8_0 on 127.0.0.1:8081 (llama.cpp
+  `--embedding`, build /dd2/andrei/bench/build/bin). Its `/v1/embeddings`
+  endpoint returns the standard OpenAI shape (verified live).
+- The running instance enforces a 512-token PHYSICAL BATCH ceiling: a
+  single input above ~512 BPE tokens → HTTP 500 "input (N tokens) is too
+  large to process". Before M6's run this was misclassified as a
+  transient server error (infinite zombie retries). Now classified
+  permanent (`embedding_error`, transient=False) in `embeddings.py` with
+  a regression test, so affected books fail explicitly and are counted
+  in the report instead of retrying forever.
+- **Ceiling root cause (server startup log, confirmed 2026-09-20):**
+  the 8081 server is launched with `--embedding -c 8192 --batch-size
+  2048` (`/dd2/llama-server/embedder.sh`), but this llama.cpp build's
+  embedding mode asserts `n_batch <= n_ubatch` and silently clamps at
+  startup — `embedder-8081.log`: "embeddings enabled with n_batch (2048)
+  > n_ubatch (512)" / "setting n_batch = n_ubatch = 512 to avoid
+  assertion failure". The effective batch is the model default
+  `n_ubatch=512`, not the 2048 requested — this was previously
+  misreported as "an operator restart of the wrong server would fix
+  it"; there is no wrong server. The fix is relaunching 8081 with
+  `--ubatch-size 2048` (covers every observed failure: inputs 515–1293
+  tokens).
+- Consequence for the corpus: `WordTokenCounter` counts `\S+` runs, so a
+  spaceless CJK paragraph is one "word" and a chunk can exceed the 512
+  BPE ceiling. The manifest contains CJK strata; 132 of the 300 sample
+  books failed explicitly with `embedding_error`. Before full
+  ingestion: relaunch the embedder with `--ubatch-size 2048`; the report
+  additionally recommends BPE-aware chunking (M7) for robustness beyond
+  2048 tokens.
+- Survey ran serial after a MuPDF thread race (concurrent
+  `page_get_textpage` → segfault) made multithreaded surveying unsafe.
+
+### Bugs the pilot found (its job is working)
+- **First publish crashed the worker: `Collection library_chunks not
+  found`.** `RealQdrantOps.ensure_collection` was only ever called in
+  tests; on a fresh sandbox the first publish upserted into a
+  non-existent collection, the qdrant exception escaped the job handler,
+  and the run died at exit 1 after extract/chunk had finished (135 books
+  embedded, 134 publishes left pending). Fixed in three parts, all
+  gated:
+  1. `worker.py` `_run_publish` now calls
+     `q.ensure_collection(dimensions=…)` under the publish lock, before
+     the switch — creation is serialized with publication.
+  2. `indexing.py` `reconcile_publications` guards on
+     `qdrant.collection_exists()` — a missing collection no longer
+     looks like "vanished index points" and fabricates republish jobs.
+  3. Regression test
+     `tests/test_worker_m4.py::test_publish_creates_missing_collection_in_local_mode`
+     runs the full pipeline in embedded (local) Qdrant mode from an
+     empty collection. Gate after fixes: **373 passed, ruff clean,
+     mypy clean (76 files)**.
+- **tesseract was missing from the host** while ~99% of the sample
+  needs OCR: all 1048 OCR page units in run #1 permanently failed with
+  `ocr_unavailable` ("tesseract binary not found"). Operator approved
+  the install; tesseract 5.3.4 (+ eng + osd, Ubuntu 24.04 apt) is now
+  at /usr/bin/tesseract and was smoke-tested with the exact worker
+  invocation (pdftoppm 150 dpi → `tesseract -l eng --psm 3 tsv`,
+  OMP_THREAD_LIMIT=1 → exit 0). Full ingestion requires tesseract —
+  requirement now satisfied.
+- Run #1 forensics (per-stage counts, the 55 embed failures by token
+  count — 513–531, all CJK —, 110 zero-chunk books) saved to
+  `/mnt/models_sata_ssd/library-rag/scratch/pilot_run1_forensics.md`.
+  Sandbox wiped; run #2 launched from clean state.
+- **O(N²) statistics-epoch republishing (HEADLINE CAPACITY FINDING).**
+  Every successful publish converges all earlier books onto the current
+  corpus-stats epoch: `_enqueue_epoch_republishes` (called at
+  worker.py:837, defined worker.py:846) enqueues one republish job per
+  earlier active publication. Measured: 161 embed successes → exactly
+  13,041 = 161×162/2 publish jobs, settling at 14.2/min (0.24/s) under
+  the global publication lock (indexing.py:546). The handler
+  "recomputes the epoch" (worker.py:846 docstring) — i.e. recomputes
+  corpus statistics — even when the book is already on the current
+  epoch, so no-op jobs cost ~4.2 s too. The first four stages finished
+  in ~52 min; the publish tail alone is ~15 h (7.7 h measured for
+  6,586/13,041 at stop). At full-corpus scale (34,768 books; ~19k at
+  the pilot's 55% embed success) this is ~180M–600M republish jobs —
+  infeasible. **The report must recommend a frozen corpus-stats epoch**
+  (freeze the epoch at ingest start; republish only on a real epoch
+  change) or batched end-of-run republishing. Not a pilot blocker — the
+  explosion and its rate are fully measured at 6,586/13,041.
+  **Mechanism confirmed in code (2026-09-20):** `stats_sha`
+  (embeddings.py:513) hashes `{"N", "avgdl", "df", "k1", "b"}` — the
+  document count is inside the identity, so **the epoch necessarily
+  moves on every new book** (by design: adding a document changes every
+  sparse vector, exactly like changing k1/b does). Every publish then
+  pays a corpus-wide `compute_sparse_stats` (~4.2 s, O(corpus)) before
+  its own current-epoch check can return noop. Sandbox DB evidence:
+  113 generations share the initial epoch `dc0fbcb8…`, then one new
+  epoch per book (~149 distinct shas over 273 generations); ~12.8k of
+  the 13,041 publish jobs were stale-epoch no-ops that each paid the
+  full recompute — that is the constant 14.2/min. (The superseded-row
+  pattern — 112 books with one superseded pub row, 49 with none — is
+  the same per-book epoch movement at the publication level.) Fix plan:
+  **B1** — persist the corpus epoch in the meta table (under the
+  publish lock) and skip the recompute in `_run_publish`/
+  `publish_generation` when it is unchanged (kills the ~12.8k wasted
+  recomputes); **B2** — epoch stability for full scale: thresholded
+  stats hash (sub-~0.1%-df terms excluded from the identity sha only;
+  `bm25_weights` keeps the full dfs) and/or an opt-in frozen-epoch
+  config knob (default = current behavior) → two-phase ingestion:
+  live ingest without per-publish fan-out, then ONE bounded full
+  re-sparse at campaign end.
+- **1-pixel raster-size check loses OCR pages (ocr.py) — FIXED
+  2026-09-20.** 162/1048 OCR pages (15.5%) permanently failed with
+  e.g. `unexpected raster size 1400x2058, expected 1400x2059` — a
+  1-pixel mismatch between `build_transform`'s `ceil()` prediction and
+  the pixmap PyMuPDF actually sizes (different float association in
+  PyMuPDF's matrix→raster math), deterministic per page, so all 3
+  retries fail identically → `ocr_error` → permanent_failed. 15.5% of
+  OCR'd text was missing from the index. Fix: ±1 px per-dimension
+  tolerance — citation boxes divide by the exact scale, never the
+  render size, so a 1 px raster difference cannot skew a box
+  (docstring + inline comment in ocr.py). Regression tests
+  `test_ocr_page_tolerates_one_pixel_raster_drift` (±1 px predicted
+  drift → OCR proceeds, page-point boxes unchanged, scratch cleaned)
+  and `test_ocr_page_still_rejects_two_pixel_raster_mismatch` (+2 px →
+  `ocr_error`, scratch cleaned); both monkeypatch
+  `build_transform` because the drift is NOT reproducible
+  synthetically on PyMuPDF 1.28.2 (0 drifts in a 0.001 pt geometry
+  scan at the pilot's implied 336.0×493.92 pt @300 dpi — it is a
+  property of PyMuPDF's internal float association, not of any
+  particular page size). Gate after fix: **375 passed (360 + 15 in the
+  dot tally), ruff clean, mypy clean (76 files)**. The 162 pages
+  re-OCR cleanly on the next worker run (retry the permanent_failed
+  jobs).
+- **Final measured state of run #2** (stopped 2026-09-20; worker
+  confirmed dead by pgrep at now≈1789898062): extract 300/300 ✓;
+  ocr 886 ✓ + 162 ✗ (2.95 s/page, 43.5 min for 886 pages); chunk
+  300/300 ✓ (34,908 chunks; only 7 empty books vs 110 in run #1 — with
+  OCR working, books get text); embed 161 ✓ + 132 ✗ (embedding_error,
+  the known 512-token ceiling; 46.7 min for all 293 jobs); publish
+  6,586 ✓ + 6,454 pending + 1 running of 13,041 (14.2/min sustained,
+  queue monotonically shrinking — embed fully settled so no further
+  republish jobs are created). Publications: 161 active + 112
+  superseded. All publish input_versions share one 64-char prefix
+  (single embedding epoch; bge-m3 for all 161).
+
+### Run #2 — stopped (2026-09-20)
+- Same 300-book manifest (seed 42, page cap 32), clean sandbox at
+  /mnt/models_sas_ssd/library-rag/pilot-sandbox (archive 1.6G / 300
+  files). **All 300 books passed extract→ocr→chunk→embed**; the only
+  remaining work was the O(N²) republish tail (6,454 of 13,041
+  pending), already measured in kind at 14.2/min. Stopped deliberately
+  (TaskStop `bkue5984m`; worker death verified by pgrep; monitor
+  `bjnbqjfn2` had already expired) — waiting ~7.7 h more would only
+  complete known quadratic churn and would block the latency probe,
+  which needs a quiescent index. The pilot is "complete in kind": every
+  per-stage rate the report needs is measured, and the republish
+  explosion is the finding, not a gap.
+- `scratch/pilot_run.json` was NOT auto-written (pilot.py writes it at
+  run end). Metrics must be collected from the sandbox jobs table with
+  pilot.py's own collector and written with an explicit
+  "interrupted: republish tail stopped" flag — see Next.
+- Post-run runbook at
+  `/mnt/models_sata_ssd/library-rag/scratch/m6_post_run.sh`:
+  report → latency (idle vs 8-book ingest backlog) → annotate suggest.
+
+### Worker architecture note (capacity finding)
+- The host has **32 CPUs, no cgroup quota** (cpu.max = max; affinity
+  0-31 — verified via sched_getaffinity; `nproc` misreports as 1 on
+  this host, which caused an earlier wrong "1 effective CPU" note).
+- OCR/extract use ~1 CPU because the M4 worker is a **single serial
+  process** (one job at a time; tesseract OMP_THREAD_LIMIT=1 per call).
+  PRD lines 35/53 specify coordinator + bounded worker subprocesses
+  with extraction at min(4, cores) and OCR at 2 workers — **not yet
+  implemented**. Sandbox local-mode Qdrant's exclusive flock also bars
+  a second worker process (production's Qdrant container does not).
+- OCR phase finished in 43.5 min (2.95 s/page measured), as predicted;
+  the long pole turned out to be the O(N²) republish tail, not OCR —
+  run #2 was stopped there (see above). The report presents full-run
+  ETA for both the shipped serial worker and the PRD-parallel config,
+  and flags the worker-architecture gap as a before-full-ingestion
+  item (M7 candidate).
+
+### Next unfinished task
+- [DONE 2026-09-20] 1-px raster fix (±1 px tolerance) + 2 regression
+  tests; gate green: 375 passed, ruff clean, mypy 76 files clean.
+- [DONE 2026-09-20] Epoch-republish mechanism confirmed in code (see
+  the O(N²) bullet: doc_count inside `stats_sha` ⇒ the epoch moves on
+  every new book; ~12.8k of the 13,041 jobs were stale-epoch no-ops
+  that each paid the ~4.2 s corpus recompute).
+- [DONE 2026-09-20] **FIX B: kill the O(N²) republish cost.** Shipped
+  design — the thresholded-identity hash variant was analyzed and
+  rejected as unsound (N enters the idf of *every* existing term).
+  - **B1 (always-on): corpus-epoch record.** `meta` key
+    `corpus_stats_epoch` (JSON `{"at","bm25","doc_count","stats_sha"}`)
+    written **inside `publish_generation`'s B4 SQLite transaction**
+    (the only place the active set changes, under the publish lock →
+    crash-atomic with the committed active set).
+    `indexing._corpus_stats_for_publish` reuses the record when the
+    bm25 sha matches AND (the revision is already active — 99.9% of
+    the measured tail — OR frozen mode); otherwise it computes.
+    Missing row = self-healing fallback.
+  - **B2 (opt-in knob): `retrieval.stats_epoch: live|frozen`**
+    (default `live` = current behavior; deliberately NOT part of
+    `bm25.settings_sha()`, so the embedding identity never changes).
+    Frozen pins the epoch for the whole campaign: a new book's novel
+    terms get zero sparse weight until re-freeze, and the fan-out
+    finds no mismatches → zero fan-out jobs. Campaign-end re-freeze
+    recipe (documented in config.example.yaml): flip to `live`,
+    `DELETE FROM meta WHERE key='corpus_stats_epoch';`, then one
+    publish recomputes over the full corpus and its fan-out converges
+    everything in a single bounded round.
+  - **O(1) version strings:** the embed-handoff publish job
+    (`_run_embed`) and the reconcile publication-gap job
+    (`_reconcile_index`) use `f"{emb_sha}:{record_sha|'init'}"` — no
+    job-table queries; the handler resolves the real epoch under the
+    publish lock. Accepted consequence: re-embedding an
+    already-published book enqueues one extra publish job under the
+    post-publish sha that early-no-ops in O(1).
+  - **Files:** embeddings.py (record helpers), indexing.py (fast path
+    + record store in B4), worker.py (O(1) versions, docstrings),
+    config.py (`stats_epoch` field), config.example.yaml (documented
+    `retrieval` block, recommends frozen for full ingestion).
+  - **Tests (test_worker_m4.py):** 3 new —
+    `test_republish_fast_path_skips_stats_recompute` (stale-epoch job
+    for an active book: zero compute calls, noop manifest),
+    `test_frozen_epoch_pins_and_skips_fanout` (second book: no
+    fan-out job, record doc_count unchanged),
+    `test_refreeze_recomputes_once_and_converges` (re-freeze recipe:
+    exactly one full-corpus compute, fan-out converges both books).
+    Plus 4 mechanical count updates (re-embed handoff now enqueues an
+    O(1) no-op republish; the Qdrant-down retried publish coalesces
+    with the gap job under emb:init).
+  - **Gate (run 2026-09-20, real output):** ruff "All checks passed!",
+    mypy "Success: no issues found in 76 source files", pytest
+    **378 passed** (baseline 375 + 3 new).
+- [DONE 2026-09-20] Run metrics: `m6_collect_run_metrics.py` (scratch)
+  reconstructs `pilot-sandbox/scratch/pilot_run.json` READ-ONLY using
+  run_pilot()'s verbatim collection SQL, `interrupted: true` (run_pilot
+  itself cannot be re-run — it would drain the 6,454 pending legacy
+  republish jobs and mutate the frozen artifact). Plus
+  `m6_stage_attribution.py`: real per-stage worker time from the
+  completion sequence — publish (old code) 27,288.9 s = 89.6% of the
+  run; ocr 2,005.9 s; embed 511.9 s (12,385 tok/s); extract 346.4 s;
+  chunk 294.9 s. The auto-report's per-stage ETAs (759,999-day) are
+  queue-wait inflation in a single-consumer queue; its measured sections
+  stay authoritative, its projections are replaced by report §4.
+- [DONE 2026-09-20] Latency (post-runbook step 2, replaced after the
+  stuck-run forensics): the full post-runbook latency run in the legacy
+  sandbox hung in the idle phase — root-caused with py-spy: 49 distinct
+  active epochs × 52,257 points × per-point payload-filter evaluation in
+  pure Python (local-mode Qdrant is a pure-Python embedded backend;
+  payload indexes have no effect locally — client warning) → ~4 min per
+  probe. Replaced with a two-part measurement:
+  (a) single read-only probe in the frozen legacy state:
+  **230,275 ms per query** (49 epochs);
+  (b) fresh 30-book sandbox under the recommended frozen config
+  (manifest30.json seed 42 cap 32; config.m6lat.yaml = config.yaml +
+  `retrieval.stats_epoch: frozen`): **idle p50 215.3 ms / p95 218.4 ms;
+  ingesting p50 233.9 ms / p95 246.5 ms** (8 new books enqueued, n=30
+  per phase) — concurrent ingest is +10%, not the problem; the epoch
+  fan-out is. The 30-book run also live-verified both fixes: OCR
+  205/205 OK (Fix A; 162/1048 failed in the legacy run) and publish
+  18 jobs / 18 publications, 1:1, zero fan-out (Fix B frozen; legacy:
+  13,041 jobs / 300 books). 12 embed failures = the known 512-BPE
+  ceiling (8081 not relaunched — first action next session).
+  Search-side consequence (report §5): a query runs one full-corpus
+  sparse search per active epoch, so a full-scale pre-fix campaign
+  approaches ~34k per query.
+- [DONE 2026-09-20] Annotate suggest (post-runbook step 3): 80
+  unlabeled candidates (40 chunks x exact_term+conceptual, seed 42) →
+  /mnt/models_sata_ssd/library-rag/scratch/question_candidates.jsonl,
+  generated READ-ONLY against the frozen pilot sandbox DB (mode=ro
+  connection wrapped in Database — no artifact mutation). Labeling
+  remains a human task (never invent labels).
+- [DONE 2026-09-20] Final report: M6_PILOT_REPORT.md — measured run +
+  corrected full-corpus ETA by bottleneck (~700 h ≈ 29 days serial
+  single worker; ~1 week with the M7 PRD-parallel architecture),
+  O(N²) finding + Fix B (frozen epoch recommended), latency (§5),
+  storage 1,481 GB vs ~14.4 TB free (~4x headroom), 512-token ceiling
+  (relaunch 8081 with `--ubatch-size 2048` = first next-session action),
+  1-px raster fix, question-bank status, recommended frozen config.
+  **Operator pre-approved the report (2026-09-20, "consider it already
+  approved")** — marked APPROVED, not blocked on presenting it.
+- M6 done → commit (with the Co-Authored-By line) → push → shutdown
+  (terminal directive). Full-library ingestion does NOT start in this
+  session: the directive shuts the machine down immediately after
+  push, and a multi-day job would die with it. Start it in the next
+  session:
+    uv run library-rag scan --config config.yaml
+    uv run library-rag ingest --config config.yaml
+  (serial single-process worker; the PRD lines 35/53 parallel
+  coordinator/worker-subprocess architecture is the M7 prerequisite
+  for a faster full run).

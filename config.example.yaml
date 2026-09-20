@@ -22,35 +22,90 @@ paths:
   scratch_root: /mnt/models_sata_ssd/library-rag/scratch
 
 services:
+  # Either a remote Qdrant server (host/port) or a LOCAL embedded instance.
+  # qdrant_path is preferred when no server is installed (M6 pilot runs local).
+  qdrant_path: /mnt/models_sata_ssd/library-rag/qdrant
   qdrant_host: 127.0.0.1
   qdrant_port: 6333
   # llama.cpp answer-model server (OpenAI-compatible /v1/chat/completions).
   # One model per server, so the embedding model has its own endpoint.
+  # On this machine: vLLM qwen3.8-27b (FP8, TP=2) on :8091.
   answer_host: 127.0.0.1
-  answer_port: 8080
+  answer_port: 8091
   # llama.cpp embedding-model server (OpenAI-compatible /v1/embeddings).
   embed_host: 127.0.0.1
   embed_port: 8081
   # FastAPI app bind. Keep loopback unless the operator opts into LAN exposure
-  # (which then requires api_token).
+  # (which then requires api_token). Avoid :8000/:8081/:8091 (occupied).
   app_host: 127.0.0.1
-  app_port: 8000
+  app_port: 8100
   # api_token: "..."   # or set LIBRARY_RAG_API_TOKEN
 
 # Embedding model (PRD §6/§8F). The exact model + revision — never a bare
 # family name. Changing this value changes the embedding key and forces fresh
 # checkpoints, but not re-extraction. embedding.fake is for tests only.
+#
+# MEASURED CONSTRAINTS (2026-09-19, pilot): bge-m3 is 1024-dim with an 8192
+# trained context, so there is no trained-context cap. However llama.cpp
+# rejects a SINGLE input longer than the server's physical batch size: the
+# running instance on :8081 reports 512, and inputs above ~510 BPE tokens are
+# rejected (500, "increase the physical batch size"). embedder.sh already
+# passes --batch-size 2048, so restarting the operator's server would raise
+# the per-input ceiling to 2048 tokens. Measured word->BPE ratios for this
+# model: EN 1.39 / DE 1.69 / FR 1.65 (incl. ~2 special tokens); measured
+# throughput ~7000 tok/s on a batch of 8 (~3.5x the old BCE server).
+#
+# The GGUF at /dd2/llama-server/bge-m3-q8_0.gguf is 627 MiB, Q8_0,
+# sha256:aa473d51f451a22f0fcf39ba3330c14bed38a385712b1113440f69df4047a173.
 embedding:
-  model_revision: bge-m3@561cab6a4299   # e.g. the exact GGUF + hash you loaded
-  # model_name: bge-m3                  # server-side "model" field, optional
+  model_revision: bge-m3@Q8_0-aa473d51
+  model_name: bge-m3-q8_0
   dimensions: 1024
+
+# Chunking. target_tokens is the per-chunk WORD budget (the WordTokenCounter
+# unit), not BPE tokens. Keep it low enough that target_tokens * worst-case
+# word->BPE ratio + title stays under the embedder's per-input ceiling.
+# Measured ratios: bge-m3 EN 1.39 / DE 1.69 / FR 1.65; BCE EN 1.36 / DE 1.61 /
+# FR 1.77 (kept as the conservative worst case). At the running server's
+# 512 per-input BPE ceiling, 256*1.77+2 ~= 455 leaves a measured margin.
+# After a server restart with --batch-size 2048, target_tokens could rise to
+# ~1000 words. The pilot run measures the actual per-chunk BPE distribution
+# (via the server's usage field) and the pilot report freezes this value.
+chunking:
+  target_tokens: 256
+  overlap_tokens: 40
+
+# Retrieval (PRD §9). All counts default sensibly; the one M6 pilot finding
+# that matters at library scale is stats_epoch.
+#
+# stats_epoch controls how the BM25 corpus-statistics epoch is resolved. The
+# epoch hash includes the document count, so in "live" mode it moves on every
+# real publish, and every stale-epoch republish job pays a full O(corpus)
+# recompute to discover it. Measured in the M6 pilot: ~99.9% of the 13k
+# publish jobs were stale-epoch no-ops, each paying ~4.2 s of recompute —
+# that recompute WAS the 15 h publish tail. Projected to the full 35k-book
+# corpus, "live" is O(N^2): roughly 700 h of recompute plus ~42B re-upserted
+# sparse points.
+#   live   (default) — exact; every publish may move the epoch and fans out
+#              stale-epoch republishes. Fine for small/interactive corpora.
+#   frozen — pins the epoch to the last committed record for the whole
+#              campaign: no per-book recompute, zero fan-out. A new book's
+#              novel terms get zero sparse weight until re-freeze.
+#              Campaign-end re-freeze recipe: set stats_epoch to "live", run
+#              `DELETE FROM meta WHERE key='corpus_stats_epoch';` in the state
+#              DB, then the next publish (any new book, or one manual
+#              republish) recomputes once over the full corpus and its
+#              fan-out converges everything in one bounded round.
+# RECOMMENDED for the full-library ingestion: frozen (see M6 pilot report).
+retrieval:
+  stats_epoch: frozen
 
 # Answer model for cited answering (PRD §12). The exact model + revision.
 # A server that is down at answer time fails the answer explicitly; search
 # keeps working. answer.fake is for tests only.
 answer:
-  model_revision: qwen2.5-7b-instruct@<sha>
-  # model_name: qwen2.5-7b-instruct     # server-side "model" field, optional
+  model_revision: qwen3.8-27b-fp8@vllm-dual-max
+  model_name: qwen3.8-27b
   max_tokens: 1024
   temperature: 0.1
   timeout_seconds: 60

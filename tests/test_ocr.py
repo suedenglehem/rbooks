@@ -185,6 +185,77 @@ def test_ocr_page_words_map_to_page_points(tmp_path: Path, shim_bin: Path) -> No
     assert list(scratch.iterdir()) == []
 
 
+# --- 1 px raster drift: the pilot's 162 failed pages (M6) ----------------------
+
+
+def _drifted_build_transform(delta_px: int) -> Any:
+    """``build_transform`` whose predicted ``render_h`` is off by *delta_px*.
+
+    Simulates PyMuPDF's internal raster size landing 1 px below the ``ceil``
+    prediction (pilot run: 1400x2058 vs expected 1400x2059) without hunting
+    for a page size that exhibits it on this build — the drift is a property
+    of PyMuPDF's float association, not of any particular geometry here.
+    """
+    from library_rag.extraction import ocr as ocr_mod
+
+    real = ocr_mod.build_transform
+
+    def drifted(page: Any, settings: OcrSettings) -> dict[str, Any]:
+        t = real(page, settings)
+        t["render_h"] = t["render_h"] + delta_px
+        return t
+
+    return drifted
+
+
+def test_ocr_page_tolerates_one_pixel_raster_drift(
+    tmp_path: Path, shim_bin: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pilot's 162 failed pages: the renderer lands 1 px short of the
+    predicted bound. OCR must proceed, and the word boxes must still be
+    mapped by the exact scale — a 1 px prediction error cannot skew a
+    citation box (the mapping never divides by the render size)."""
+    monkeypatch.setattr(
+        "library_rag.extraction.ocr.build_transform",
+        _drifted_build_transform(+1),
+    )
+    scratch = tmp_path / "scratch"
+    doc = pymupdf.open(str(_one_page_doc(tmp_path)))  # type: ignore[no-untyped-call]
+    try:
+        result = ocr_page(doc, 0, OcrSettings(bin=str(shim_bin)), scratch)
+    finally:
+        doc.close()  # type: ignore[no-untyped-call]
+
+    assert result["text"] == "w0-0\nw0-1\nw0-2"
+    assert [w["text"] for w in result["words"]] == ["w0-0", "w0-1", "w0-2"]
+    # Identical page-point boxes to the no-drift case (scale 300/72).
+    assert result["words"][0]["box"] == [12.0, 24.0, 48.0, 12.0]
+    assert list(scratch.iterdir()) == []
+
+
+def test_ocr_page_still_rejects_two_pixel_raster_mismatch(
+    tmp_path: Path, shim_bin: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sanity guard must still fire: 2 px is beyond the ±1 px
+    float-association tolerance, so something genuinely wrong is happening
+    (and the scratch file is still cleaned up on the error path)."""
+    monkeypatch.setattr(
+        "library_rag.extraction.ocr.build_transform",
+        _drifted_build_transform(+2),
+    )
+    scratch = tmp_path / "scratch"
+    doc = pymupdf.open(str(_one_page_doc(tmp_path)))  # type: ignore[no-untyped-call]
+    try:
+        with pytest.raises(ExtractionFailure) as exc:
+            ocr_page(doc, 0, OcrSettings(bin=str(shim_bin)), scratch)
+    finally:
+        doc.close()  # type: ignore[no-untyped-call]
+
+    assert exc.value.category == "ocr_error"
+    assert "unexpected raster size" in exc.value.detail
+    assert list(scratch.iterdir()) == []
+
+
 def test_ocr_page_failure_taxonomy(tmp_path: Path, shim_bin: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     scratch = tmp_path / "scratch"
     doc = pymupdf.open(str(_one_page_doc(tmp_path)))  # type: ignore[no-untyped-call]
