@@ -1809,6 +1809,49 @@ ships green during the full-run window.
     up). Gate: 492 passed, ruff clean, mypy clean, dist guard
     green.
 
+### Slice 13 — configurable API-token requirement (operator ask)
+- [DONE 2026-09-21] The operator asked to make the "API token"
+  requirement **configurable, disabled by default**: off by default
+  in the GUI, a fixed token value in config.yaml, and config.yaml
+  enabling it in the GUI.
+  - `Services.require_api_token: bool = False` (config.py) — the
+    **master switch**, decoupled from `Services.api_token` (the
+    value). Off (default): no request needs a token and the web UI
+    never shows its token field. On: every non-static request needs
+    `Authorization: Bearer <api_token>` and the UI shows the field.
+  - The value is **inert while the switch is off** — a configured
+    token no longer implicitly enables auth (old behavior).
+  - Fail-closed at load: `load_config` raises ConfigError when
+    `require_api_token: true` has no value (config or
+    `$LIBRARY_RAG_API_TOKEN`, which still wins over the file value).
+  - cli.py `_serve`: non-loopback bind with the switch off is now a
+    **loud stderr warning** (deliberate operator choice) instead of
+    a hard error; the loopback default is unchanged.
+  - api.py middleware: enforcement requires
+    `require_api_token and token` (previously "a value exists");
+    `_OPEN_PATHS` + static assets stay open in both modes.
+  - **No UI change needed**: the token field (app.ts) is already
+    hidden until the first 401 — switch on ⇒ 401 ⇒ field appears;
+    switch off ⇒ no 401 ⇒ field never shows. This is exactly
+    "config.yaml enables it in gui".
+  - config.example.yaml documents the two-part setup (fixed value +
+    commented-out switch, with the warning behavior noted).
+  - Verified live: pilot-sandbox config now carries fixed
+    `api_token: "library-rag-local"` + `require_api_token: false`;
+    serve relaunched **without** sourcing serve.env (config is the
+    single source of the value; app pid 104264, uv 104260);
+    /health, /library, /search all 200 with **no** Authorization
+    header; the non-loopback warning fired in serve.log.
+- **Gate (2026-09-21, real output):** pytest **495 passed** (492
+  baseline + 2 new file-based config tests + 1 new API test; the
+  existing auth test renamed and now sets the switch). ruff clean,
+  mypy clean (48 files).
+- What the tests pin: default `require_api_token` is False; switch
+  on without a value → ConfigError at load; switch on with a value
+  accepted; with the switch off a configured token value leaves
+  /library and /search 200 (value inert); switch on + wrong token →
+  401 (existing, renamed test).
+
 ### Next unfinished task
 1. [DONE 2026-09-21] Slice 7 safe revision replacement +
    generation migration committed 153ebcf, pushed.
@@ -1870,15 +1913,19 @@ ships green during the full-run window.
    testing the web interface. Interface is live at
    http://192.168.0.30:8100/ (LAN, operator opt-in 2026-09-21 —
    `app_host: 0.0.0.0` in the pilot-sandbox config; serve app pid
-   90237 (restarted 2026-09-21 for the show-path-to-original
-   opt-in; the manifest now carries source_path); pilot-sandbox
-   config → the 300-book stratified sample,
+   104264, uv 104260 — restarted 2026-09-21 for the
+   configurable-token change, **without** sourcing serve.env);
+   pilot-sandbox config → the 300-book stratified sample,
    seed 1337; pilot jobs 15,142 succeeded / 2 permanent_failed —
-   known pilot issues). API is bearer-token protected: token lives
-   only in 0600 `pilot-sandbox/scratch/serve.env`
-   (LIBRARY_RAG_API_TOKEN, never in git); verified on LAN: static
-   SPA + /health open, /library 401 without/bad token, 200 with.
-   The web UI shows a token field on 401 (stored in sessionStorage).
+   known pilot issues). **Token requirement is OFF** (slice 13):
+   sandbox config carries `require_api_token: false` + a fixed
+   local `api_token` value, so the API is open — /library and
+   /search 200 with no Authorization header — and the web UI
+   shows **no** token field. Re-enabling is a one-word flip to
+   `require_api_token: true` in the sandbox config (the API then
+   enforces it and the UI shows the token field on the first 401,
+   token stored in sessionStorage); the 0600 serve.env is no
+   longer sourced by the serve command.
    The batch-2 sandbox (second 300-book stratified sample) is also
    fully drained and available if the user prefers testing against
    it. After the user's explicit go: full-library launch per

@@ -636,13 +636,17 @@ def _serve(args: argparse.Namespace) -> int:
     setup_logging(args.log_level, args.log_format)
     cfg = _require_config(args)
     host, port = cfg.services.app_host, cfg.services.app_port
-    if not _is_loopback(host) and not cfg.services.api_token:
+    if not _is_loopback(host) and not cfg.services.require_api_token:
+        # The token requirement is opt-in (services.require_api_token), so a
+        # non-loopback bind without it is a deliberate operator choice —
+        # surface it loudly instead of refusing the start.
         print(
-            "error: binding to a non-loopback address requires services.api_token "
-            "(PRD §12: bearer auth before any network exposure)",
+            "warning: binding to a non-loopback address with "
+            "services.require_api_token off — the app is reachable without a "
+            "token. PRD §12 recommends bearer auth before any network "
+            "exposure; set services.require_api_token: true to enforce it.",
             file=sys.stderr,
         )
-        return EXIT_ERROR
     db = _open_state(cfg)
     try:
         qdrant, embedder, model = _index_and_models(cfg, db)

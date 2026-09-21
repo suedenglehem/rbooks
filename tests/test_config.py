@@ -23,6 +23,62 @@ def test_valid_config_is_accepted(base_config: Config) -> None:
     assert base_config.services.app_host == "127.0.0.1"
     # The source-path leak is opt-in, off by default.
     assert base_config.services.show_path_to_original is False
+    # The bearer-token requirement is a master switch, off by default.
+    assert base_config.services.require_api_token is False
+
+
+def test_require_api_token_without_value_raises(
+    roots: dict[str, Path], tmp_path: Path
+) -> None:
+    # Switch on with no value (neither in the file nor in the env) is
+    # rejected at load time — it would enforce auth with no usable token.
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(
+        "\n".join(
+            [
+                "paths:",
+                "  source_roots: []",
+                f"  archive_root: {roots['archive_root']}",
+                f"  artifact_root: {roots['artifact_root']}",
+                f"  state_root: {roots['state_root']}",
+                f"  qdrant_root: {roots['qdrant_root']}",
+                f"  model_root: {roots['model_root']}",
+                f"  scratch_root: {roots['scratch_root']}",
+                "services:",
+                "  require_api_token: true",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="require_api_token"):
+        load_config(cfg_file)
+
+
+def test_require_api_token_with_value_is_accepted(
+    roots: dict[str, Path], tmp_path: Path
+) -> None:
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(
+        "\n".join(
+            [
+                "paths:",
+                "  source_roots: []",
+                f"  archive_root: {roots['archive_root']}",
+                f"  artifact_root: {roots['artifact_root']}",
+                f"  state_root: {roots['state_root']}",
+                f"  qdrant_root: {roots['qdrant_root']}",
+                f"  model_root: {roots['model_root']}",
+                f"  scratch_root: {roots['scratch_root']}",
+                "services:",
+                "  api_token: fixed-local-value",
+                "  require_api_token: true",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    cfg = load_config(cfg_file)
+    assert cfg.services.require_api_token is True
+    assert cfg.services.api_token == "fixed-local-value"
 
 
 def test_managed_root_nested_in_source_is_refused(roots: dict[str, Path]) -> None:

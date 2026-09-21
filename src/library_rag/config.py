@@ -176,8 +176,15 @@ class Services(BaseModel):
     # FastAPI app bind address. Must stay loopback unless the operator opts in.
     app_host: str = "127.0.0.1"
     app_port: int = 8000
-    # Optional bearer token required before any non-loopback exposure.
+    # Bearer token VALUE, used only while require_api_token is true. May also
+    # come from $LIBRARY_RAG_API_TOKEN (env wins over this field).
     api_token: str | None = None
+    # Master switch for the bearer-token requirement. Off by default: no
+    # request needs a token and the web UI never shows its token field —
+    # the default for local-machine runs. When true, every non-static
+    # request needs Authorization: Bearer <api_token>, and the web UI shows
+    # the token field (on the first 401).
+    require_api_token: bool = False
     # Local-machine convenience (operator opt-in): when True, the reader
     # manifest (GET /books/{rev_id}) carries the book's full source path,
     # which the web UI shows in the reader pane next to the content. Off by
@@ -649,6 +656,14 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
     services = raw.setdefault("services", {})
     if os.environ.get("LIBRARY_RAG_API_TOKEN") and not services.get("api_token"):
         services["api_token"] = os.environ["LIBRARY_RAG_API_TOKEN"]
+
+    # require_api_token without a value would enforce auth with no usable
+    # token; fail at load instead of at the first request.
+    if services.get("require_api_token") and not services.get("api_token"):
+        raise ConfigError(
+            "services.require_api_token is true but no token value is set "
+            "(services.api_token or $LIBRARY_RAG_API_TOKEN)"
+        )
 
     # Coerce to Config; pydantic raises ValidationError which we wrap so callers
     # see a single, understandable exception type.

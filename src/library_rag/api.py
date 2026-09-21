@@ -12,11 +12,14 @@ reader routes (``/books/...``) plus the research surface:
 * ``/scan`` and ``/ingest/...`` — the ingestion dashboard controls
   (status, pause, resume, retry, rescan).
 
-Auth (PRD §12: the app binds loopback by default; a bearer token is required
-before any non-loopback exposure): when ``services.api_token`` is set, every
-request except liveness and static asset delivery must carry
-``Authorization: Bearer <token>``. A Content-Security-Policy header is added
-to every response so the bundled UI loads nothing from the network.
+Auth (PRD §12): the app binds loopback by default. The bearer-token
+requirement is a configurable master switch, ``services.require_api_token``,
+OFF by default (local-machine runs need no token and the web UI never shows
+its token field). When it is true, every request except liveness and static
+asset delivery must carry ``Authorization: Bearer <services.api_token>`` and
+the web UI shows the token field on the first 401. A Content-Security-Policy
+header is added to every response so the bundled UI loads nothing from the
+network.
 
 Dependencies are injected (``qdrant``/``embedder``/``model``) so tests can
 substitute the fakes; ``serve`` wires the real implementations.
@@ -135,9 +138,17 @@ def create_app(
     async def _security(
         request: Request, call_next: Callable[[Request], Awaitable[Any]]
     ) -> Any:
+        # The requirement is a master switch (require_api_token), not a side
+        # effect of a value existing: a configured token while the switch is
+        # off stays inert, so the default local run is open and the web UI
+        # never sees a 401 to prompt on. (load_config rejects a switch-on
+        # config without a value, so `token` is non-empty when enforced.)
         token = cfg.services.api_token
-        if token and request.url.path not in _OPEN_PATHS and not _is_static_path(
-            request.url.path
+        if (
+            cfg.services.require_api_token
+            and token
+            and request.url.path not in _OPEN_PATHS
+            and not _is_static_path(request.url.path)
         ):
             auth = request.headers.get("authorization", "")
             if auth != f"Bearer {token}":

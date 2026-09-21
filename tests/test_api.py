@@ -243,9 +243,10 @@ def test_scan_reports_missing_source_mount(client: TestClient) -> None:
 # --- auth + CSP ----------------------------------------------------------------------
 
 
-def test_bearer_token_required_when_configured(library: Library) -> None:
+def test_bearer_token_required_when_enabled(library: Library) -> None:
     db, cfg, q, emb, model = library
     cfg.services.api_token = "sekret"
+    cfg.services.require_api_token = True
     app = create_app(cfg, db, qdrant=q, embedder=emb, model=model)
     client = TestClient(app)
     assert client.get("/library").status_code == 401
@@ -255,6 +256,18 @@ def test_bearer_token_required_when_configured(library: Library) -> None:
     # Wrong token is rejected; liveness stays open for the operator's probe.
     assert client.get("/library", headers={"Authorization": "Bearer wrong"}).status_code == 401
     assert client.get("/health").status_code == 200
+
+
+def test_token_value_inert_while_require_api_token_off(library: Library) -> None:
+    # Default (switch off): a configured token value does nothing — the API
+    # is open and the web UI never gets a 401 to prompt on its token field.
+    db, cfg, q, emb, model = library
+    assert cfg.services.require_api_token is False
+    cfg.services.api_token = "sekret"
+    app = create_app(cfg, db, qdrant=q, embedder=emb, model=model)
+    client = TestClient(app)
+    assert client.get("/library").status_code == 200
+    assert client.post("/search", json={"query": "zebra"}).status_code == 200
 
 
 def test_csp_header_on_every_response(client: TestClient) -> None:
