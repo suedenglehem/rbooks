@@ -815,18 +815,18 @@ def publish_generation(
         )
         db.execute(
             """
-            UPDATE publications SET state = 'superseded'
+            UPDATE publications SET state = 'superseded', superseded_at = ?
             WHERE doc_id = ? AND pub_id != ? AND state = 'active'
             """,
-            (doc_id, pub_id),
+            (ts, doc_id, pub_id),
         )
         # An older staged attempt of the same revision loses to this one.
         db.execute(
             """
-            UPDATE publications SET state = 'superseded'
+            UPDATE publications SET state = 'superseded', superseded_at = ?
             WHERE rev_id = ? AND pub_id != ? AND state = 'staged'
             """,
-            (rev_id, pub_id),
+            (ts, rev_id, pub_id),
         )
         db.execute(
             "UPDATE index_generations SET point_count = ?, updated_at = ? WHERE gen_id = ?",
@@ -959,17 +959,17 @@ def reconcile_publications(db: Database, cfg: Config, qdrant: QdrantOps, *, now:
             )
             db.execute(
                 """
-                UPDATE publications SET state = 'superseded'
+                UPDATE publications SET state = 'superseded', superseded_at = ?
                 WHERE doc_id = ? AND pub_id != ? AND state = 'active'
                 """,
-                (doc_id, pub_id),
+                (ts, doc_id, pub_id),
             )
             db.execute(
                 """
-                UPDATE publications SET state = 'superseded'
+                UPDATE publications SET state = 'superseded', superseded_at = ?
                 WHERE rev_id = ? AND pub_id != ? AND state = 'staged'
                 """,
-                (rev_id, pub_id),
+                (ts, rev_id, pub_id),
             )
         promoted += 1
     return promoted

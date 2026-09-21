@@ -992,7 +992,7 @@ def _enqueue_epoch_republishes(db: Database, cfg: Config, jobs: Jobs, rev_id: st
         )
 
 
-def _reconcile_chunks(db: Database, cfg: Config) -> None:
+def _reconcile_chunks(db: Database, cfg: Config) -> int:
     """Re-enqueue the chunk job of every succeeded run whose stored
     fingerprint does not match (or was never set — runs extracted under M2).
 
@@ -1001,8 +1001,10 @@ def _reconcile_chunks(db: Database, cfg: Config) -> None:
     lost after its effects. Idempotent: enqueue is INSERT OR IGNORE on the
     task key, and the chunk job itself no-ops when the fingerprint matches.
     Runs with in-flight OCR jobs are skipped (their chunk job will defer).
+    Returns the number of chunk jobs enqueued (0 when nothing drifted).
     """
     jobs = Jobs(db)
+    enqueued = 0
     runs = db.query(
         "SELECT run_id, rev_id, chunk_fingerprint "
         "FROM extraction_runs WHERE state = 'succeeded'"
@@ -1029,9 +1031,11 @@ def _reconcile_chunks(db: Database, cfg: Config) -> None:
             input_id=run_id,
             input_version=rev["sha256"],
         )
+        enqueued += 1
+    return enqueued
 
 
-def _reconcile_index(db: Database, cfg: Config) -> None:
+def _reconcile_index(db: Database, cfg: Config) -> int:
     """Close the M4 pipeline gaps on worker start (durable, idempotent).
 
     Two lost-enqueue windows survive a crash:
@@ -1046,9 +1050,11 @@ def _reconcile_index(db: Database, cfg: Config) -> None:
 
     Runs with an in-flight ocr/chunk/embed job are skipped (their own
     handoff will re-enqueue), as are replaced revisions — their evidence must
-    not enter the index.
+    not enter the index. Returns the number of jobs enqueued (0 when the
+    index already matches the current configuration).
     """
     jobs = Jobs(db)
+    enqueued = 0
     try:
         emb_sha = embedding_sha(cfg)
     except ConfigError:
@@ -1091,6 +1097,7 @@ def _reconcile_index(db: Database, cfg: Config) -> None:
             expected = (n_chunks_count + batch_size - 1) // batch_size
             if int(n_batches["n"] or 0) != expected:
                 _enqueue_embed_job(jobs, run_id, current)
+                enqueued += 1
         # Publication gap: no staged/active publication for this revision.
         if db.query_one(
             "SELECT 1 AS x FROM publications WHERE rev_id = ? AND state IN ('staged', 'active')",
@@ -1108,6 +1115,8 @@ def _reconcile_index(db: Database, cfg: Config) -> None:
             input_id=row["rev_id"],
             input_version=version,
         )
+        enqueued += 1
+    return enqueued
 
 
 def run_worker(

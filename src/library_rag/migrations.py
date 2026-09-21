@@ -312,12 +312,25 @@ _MIGRATION_0005: tuple[str, ...] = (
 )
 
 
+# M7 slice 7: when a publication was superseded. The B4 switch that marks a
+# row ``superseded`` is atomic (the replacement is active in the same
+# transaction), so the state alone is definitive; the timestamp exists so
+# ``gc`` can apply its grace window to superseded index points and the
+# coverage report can show how long a superseded generation has lingered.
+# Rows superseded before this column existed keep NULL and are left to a
+# later supersede cycle (conservative: never collected on unknown age).
+_MIGRATION_0006: tuple[str, ...] = (
+    "ALTER TABLE publications ADD COLUMN superseded_at REAL",
+)
+
+
 MIGRATIONS: list[Migration] = [
     Migration(1, "catalog_and_jobs", _MIGRATION_0001),
     Migration(2, "pipeline_tables", _MIGRATION_0002),
     Migration(3, "ocr_and_chunks", _MIGRATION_0003),
     Migration(4, "embeddings_and_publication", _MIGRATION_0004),
     Migration(5, "answers", _MIGRATION_0005),
+    Migration(6, "publications_superseded_at", _MIGRATION_0006),
 ]
 
 

@@ -56,6 +56,7 @@ from .jobs import Jobs
 from .latency import build_probe_queries, run_latency
 from .llm import AnswerModel, make_answer_model
 from .log import setup_logging
+from .migrate import MigrationError, MigrationReport, run_migration
 from .migrations import current_version, migrate
 from .pilot import (
     MANIFEST_SCHEMA,
@@ -650,12 +651,29 @@ def _gc(args: argparse.Namespace) -> int:
     setup_logging(args.log_level, args.log_format)
     cfg = _require_config(args)
     db = _open_state(cfg)
+    qdrant: RealQdrantOps | None = None
     try:
-        report = run_gc(db, cfg, execute=args.execute, grace_seconds=args.grace_seconds)
+        # The points kind needs a Qdrant client; in local mode a running
+        # worker holds the storage lock, so the client degrades to None and
+        # the file kinds still run (the report carries a note).
+        try:
+            candidate = RealQdrantOps(cfg)
+        except Exception:
+            candidate = None
+        qdrant = candidate if candidate is not None and candidate.ping() else None
+        report = run_gc(
+            db,
+            cfg,
+            execute=args.execute,
+            grace_seconds=args.grace_seconds,
+            qdrant=qdrant,
+        )
     except GcError as exc:
         print(f"gc error: {exc}", file=sys.stderr)
         return EXIT_ERROR
     finally:
+        if qdrant is not None:
+            qdrant.close()
         db.close()
     if args.json:
         print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
@@ -666,7 +684,7 @@ def _gc(args: argparse.Namespace) -> int:
         by_kind: dict[str, int] = {}
         for c in report.candidates:
             by_kind[c.kind] = by_kind.get(c.kind, 0) + 1
-        for kind in ("archive", "artifact", "job_log"):
+        for kind in ("archive", "artifact", "job_log", "points"):
             if by_kind.get(kind):
                 print(f"  {kind}: {by_kind[kind]}")
         for c in report.candidates[:20]:
@@ -681,9 +699,72 @@ def _gc(args: argparse.Namespace) -> int:
             )
         for e in report.errors:
             print(f"  error: {e}", file=sys.stderr)
+        for note in report.notes:
+            print(f"  note: {note}")
         if not report.executed and report.candidates:
             print("dry-run: nothing deleted; re-run with --execute to delete")
     return EXIT_OK if not report.errors else EXIT_ERROR
+
+
+def _migrate(args: argparse.Namespace) -> int:
+    setup_logging(args.log_level, args.log_format)
+    cfg = _require_config(args)
+    db = _open_state(cfg)
+    try:
+        report = run_migration(
+            db,
+            cfg,
+            execute=args.execute,
+            accept_maintenance_window=args.accept_maintenance_window,
+        )
+    except MigrationError as exc:
+        print(f"migrate error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    finally:
+        db.close()
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+    else:
+        _migrate_text(report)
+    return EXIT_OK
+
+
+def _migrate_text(r: MigrationReport) -> None:
+    g = 2**30
+    mode = "execute" if r.executed else "dry-run"
+    print(f"migrate ({mode})")
+    print(
+        f"  rechunk runs: {r.rechunk_runs} (active-revision: {r.rechunk_active_runs})  "
+        f"reembed runs: {r.reembed_runs}"
+    )
+    print(
+        f"  publications to supersede: {r.publications_to_supersede}  "
+        f"migrating points: {r.migrating_points}  active points: {r.active_points}"
+    )
+    if r.qdrant_storage_bytes is not None:
+        line = f"  qdrant store: {r.qdrant_storage_bytes / g:.1f} GiB"
+        if r.free_bytes is not None:
+            line += f"  free: {r.free_bytes / g:.1f} GiB"
+        print(line)
+        if r.second_generation_bytes:
+            print(f"  estimated second generation: {r.second_generation_bytes / g:.1f} GiB")
+    if r.fits is None:
+        print("  two-generation fit: UNKNOWN (capacity unverifiable — see notes)")
+    else:
+        print(f"  two-generation fit: {'yes' if r.fits else 'NO'}")
+    if r.maintenance_window_required:
+        print(
+            "  maintenance window: REQUIRED (stop the worker, run gc --execute, "
+            "re-check; or accept explicitly with --accept-maintenance-window)"
+        )
+    else:
+        print("  maintenance window: not required")
+    for note in r.notes:
+        print(f"  note: {note}")
+    if r.executed:
+        print(f"  enqueued jobs: {r.enqueued_jobs}")
+        if r.enqueued_jobs == 0:
+            print("  (nothing drifted — no jobs enqueued)")
 
 
 def _remove(args: argparse.Namespace) -> int:
@@ -1389,6 +1470,24 @@ def build_parser() -> argparse.ArgumentParser:
     coverage_p.add_argument("--config", help="path to config YAML")
     coverage_p.add_argument("--json", action="store_true", help="emit the report as JSON")
     coverage_p.set_defaults(_func=_coverage)
+
+    migrate_p = sub.add_parser(
+        "migrate",
+        help="plan/execute a generation migration after a chunker or embedding change (M7)",
+    )
+    migrate_p.add_argument("--config", help="path to config YAML")
+    migrate_p.add_argument(
+        "--execute",
+        action="store_true",
+        help="enqueue the re-chunk/re-embed/publish jobs (default is a plan report)",
+    )
+    migrate_p.add_argument(
+        "--accept-maintenance-window",
+        action="store_true",
+        help="allow execution even though the new generation does not fit under two generations",
+    )
+    migrate_p.add_argument("--json", action="store_true", help="emit the report as JSON")
+    migrate_p.set_defaults(_func=_migrate)
 
     pilot_p = sub.add_parser(
         "pilot",

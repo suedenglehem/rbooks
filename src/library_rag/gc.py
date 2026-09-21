@@ -15,7 +15,11 @@ count). This module reclaims what no catalog row references:
   batch_NNNNN.bin`` and its ``.json`` sidecar with no ``embedding_batches``
   row (a row references the ``.bin``; the sidecar follows it);
 * **stale job logs** — ``<state_root>/job_logs/<job_id>.attempt<N>.log``
-  whose job row no longer exists.
+  whose job row no longer exists;
+* **superseded index points** — Qdrant points whose publication row SQLite
+  has marked ``superseded`` and aged past the grace window (see below).
+  Points are deleted by filter; the ``publications`` row is kept as history
+  (coverage and backup verification still see the lineage).
 
 Safety:
 
@@ -24,13 +28,25 @@ Safety:
 * **Grace period** (default 10 minutes): files modified within the window are
   skipped. This covers the scan window in which archive bytes are copied
   *before* the revision row is committed (see
-  ``library_rag.scan._process_file``), so a concurrent scan cannot lose
-  freshly-archived books.
+  ``library_rag.scan._process_file``). For the points kind the window is
+  measured from ``publications.superseded_at``: a row is only ``superseded``
+  once the B4 switch has committed atomically (the replacement generation is
+  fully active in the same transaction), so the state is definitive and the
+  grace is a second belt — it keeps GC out of a freshly-switched doc.
+  Rows superseded before the column existed carry NULL and are never
+  collected (unknown age).
 * Dry-run is the default: candidates are reported, nothing is deleted.
   ``--execute`` deletes, then removes the directories that became empty.
+* The points kind needs a Qdrant client (``run_gc(..., qdrant=...)``);
+  without one the file kinds still run and the report carries a note. In
+  local (embedded) mode a running worker holds the storage lock, so the
+  client cannot open while the worker is up — stop it first.
 
-GC never touches source roots, the state DB, Qdrant storage, or the scratch
-root.
+GC never touches source roots, the state DB, or the scratch root. The points
+kind's only Qdrant write is a filtered delete of exactly the superseded
+publication's point set — it never creates, updates, or reorganizes points
+or the storage layout. Saved answers are unaffected: citations resolve from
+the frozen evidence manifest in the ``answers`` table, not from Qdrant.
 """
 
 from __future__ import annotations
@@ -46,6 +62,7 @@ from typing import Any
 from .config import Config
 from .db import Database
 from .embeddings import checkpoint_manifest_path
+from .indexing import FieldCond, IndexFilter, QdrantOps
 
 __all__ = ["GcCandidate", "GcError", "GcReport", "run_gc"]
 
@@ -59,7 +76,12 @@ class GcError(RuntimeError):
 
 @dataclass(frozen=True)
 class GcCandidate:
-    """One collectible store object. ``relpath`` is relative to the kind root."""
+    """One collectible store object.
+
+    ``relpath`` is relative to the kind root; for the ``points`` kind it is
+    the superseded publication id (there is no file — the delete is a
+    Qdrant filter).
+    """
 
     kind: str
     relpath: str
@@ -76,6 +98,7 @@ class GcReport:
     bytes_reclaimed: int = 0
     directories_removed: int = 0
     errors: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -86,6 +109,7 @@ class GcReport:
             "bytes_reclaimed": self.bytes_reclaimed,
             "directories_removed": self.directories_removed,
             "errors": self.errors,
+            "notes": self.notes,
         }
 
 
@@ -161,6 +185,35 @@ def _job_log_candidate_reasons(db: Database) -> _Evaluator:
     return evaluate
 
 
+def _measured_point_bytes(cfg: Config, qdrant: QdrantOps) -> float:
+    """Bytes per point, measured: total storage bytes / total points.
+
+    Informational — it only sizes the points candidates in the report.
+    Falls back to 0.0 when the storage layout is unknown (remote mode,
+    directory absent) or the collection is empty, so a wrong estimate can
+    never make a delete decision (deletes are driven by the publications
+    rows, not by size).
+    """
+    root = (
+        Path(cfg.services.qdrant_path) if cfg.services.qdrant_path else cfg.paths.qdrant_root
+    )
+    total = 0
+    if root.is_dir():
+        try:
+            for f in root.rglob("*"):
+                if f.is_file():
+                    total += f.stat().st_size
+        except OSError:
+            return 0.0
+    try:
+        points = qdrant.count(IndexFilter.all())
+    except Exception:
+        return 0.0
+    if points <= 0:
+        return 0.0
+    return total / points
+
+
 def _prune_empty_dirs(root: Path) -> int:
     """Remove directories under *root* that have become empty (deepest first).
 
@@ -197,12 +250,16 @@ def run_gc(
     execute: bool = False,
     grace_seconds: float = 600.0,
     now: float | None = None,
+    qdrant: QdrantOps | None = None,
 ) -> GcReport:
     """Collect (and, with ``execute=True``, delete) unreferenced store objects.
 
     See the module docstring for the reference rules and the safety guards.
-    A :class:`GcError` is raised when a worker is running; per-file delete
-    failures are recorded in the report instead of raising.
+    ``qdrant`` enables the ``points`` kind (superseded publications past the
+    grace window); without it the file kinds still run and the report notes
+    that the points kind was skipped. A :class:`GcError` is raised when a
+    worker is running; per-file and per-point delete failures are recorded
+    in the report instead of raising.
     """
     if grace_seconds < 0:
         raise GcError("grace_seconds must be >= 0")
@@ -241,10 +298,43 @@ def run_gc(
                 )
 
     report = GcReport(candidates=candidates, executed=execute, grace_seconds=grace_seconds)
+    if qdrant is None:
+        report.notes.append(
+            "points: skipped (no Qdrant client; in local mode stop the worker first)"
+        )
+    else:
+        per_point = _measured_point_bytes(cfg, qdrant)
+        for r in db.query(
+            """
+            SELECT pub_id, expected_points, superseded_at
+            FROM publications
+            WHERE state = 'superseded' AND superseded_at IS NOT NULL
+              AND superseded_at <= ?
+            ORDER BY pub_id
+            """,
+            (ts - grace_seconds,),
+        ):
+            candidates.append(
+                GcCandidate(
+                    kind="points",
+                    relpath=r["pub_id"],
+                    size_bytes=int(int(r["expected_points"]) * per_point),
+                    reason=f"publication superseded {int(ts - r['superseded_at'])}s ago",
+                )
+            )
     if not execute:
         return report
 
     for c in candidates:
+        if c.kind == "points":
+            assert qdrant is not None
+            try:
+                qdrant.delete(IndexFilter.all(FieldCond("pub_id", "eq", c.relpath)))
+                report.deleted += 1
+                report.bytes_reclaimed += c.size_bytes
+            except Exception as exc:
+                report.errors.append(f"points: {c.relpath}: {exc}")
+            continue
         p = _kind_root(cfg, c.kind) / c.relpath
         try:
             if p.is_file():

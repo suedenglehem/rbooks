@@ -39,7 +39,7 @@ from library_rag.identity import normalize_path
 from library_rag.indexing import QdrantOps, publish_generation
 from library_rag.jobs import Jobs
 from library_rag.scan import scan_roots
-from library_rag.worker import build_ctx, run_worker
+from library_rag.worker import build_ctx, chunk_fingerprint_for_run, run_worker
 
 __all__ = [
     "ctx_for_rev",
@@ -339,9 +339,12 @@ def publish_handbuilt(
     emb_sha = embedding_sha(cfg)
     emb = FakeEmbedder(dimensions=cfg.embedding.dimensions)
     ts = 0.0
+    # ON CONFLICT: the supersede tests publish a second revision of the same
+    # document (B4 only supersedes a doc's *other* active publications, so the
+    # doc row must stay the first generation's).
     db.execute(
         "INSERT INTO documents (doc_id, anchor_sha256, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?)",
+        "VALUES (?, ?, ?, ?) ON CONFLICT(doc_id) DO NOTHING",
         (doc_id, "a" * 64, ts, ts),
     )
     db.execute(
@@ -362,6 +365,13 @@ def publish_handbuilt(
         ) VALUES (?, ?, ?, 'pdf/1', 's1', ?, 'succeeded', ?, ?)
         """,
         (run_id, rev_id, doc_id, len(texts), ts, ts),
+    )
+    # Stamp the chunk fingerprint exactly as the worker's chunk stage would:
+    # a run whose stored fingerprint is NULL (or stale) is a re-chunk
+    # candidate to the worker's reconcile pass and to `migrate` alike.
+    db.execute(
+        "UPDATE extraction_runs SET chunk_fingerprint = ?, updated_at = ? WHERE run_id = ?",
+        (chunk_fingerprint_for_run(db, run_id, cfg), ts, run_id),
     )
     chunk_ids = [f"{run_id}:chunk-{i}" for i in range(len(texts))]
     for position, (cid, text) in enumerate(zip(chunk_ids, texts, strict=True)):
