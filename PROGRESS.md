@@ -1792,6 +1792,23 @@ ships green during the full-run window.
   the key equals the `source_revisions.first_path` row value and
   points at the ingested file.
 
+### Slice 12 — Google button on citation lines (operator ask)
+- [DONE 2026-09-21] The operator asked for a button on the very
+  right of each reference line in the answer pane (the line with
+  the `[n]` number, the reference title, and the location) that
+  fires a Google search with the reference title as the query.
+  - `evidenceItem` (web/src/app.ts): `evidence-head` gets a
+    `.spacer` + a small "Google" button at the far right; the
+    handler opens
+    `https://www.google.com/search?q=<encodeURIComponent(ev.source_title)>`
+    in a new tab (`noopener,noreferrer`).
+  - No CSS changes (`.spacer` / `.btn.small` already existed).
+  - Rebuilt bundle index-OKA8Gz2h.js; served live (static mount
+    reads dist from disk — no serve restart; the app on
+    0.0.0.0:8100 now serves the new JS; browser refresh picks it
+    up). Gate: 492 passed, ruff clean, mypy clean, dist guard
+    green.
+
 ### Next unfinished task
 1. [DONE 2026-09-21] Slice 7 safe revision replacement +
    generation migration committed 153ebcf, pushed.

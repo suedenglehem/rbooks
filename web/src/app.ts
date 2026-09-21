@@ -461,6 +461,16 @@ export class App {
         el("button", { class: "btn cite-chip" }, `[${i + 1}]`),
         el("span", { class: "evidence-src" }, ev.source_title),
         el("span", { class: "muted small" }, `${locationLabel(ev.location)} · ${ev.format}`),
+        el("span", { class: "spacer" }),
+        // Operator ask: search the reference title in Google, far right of
+        // the line (new tab; the title goes in the query verbatim).
+        button("Google", "btn small", () => {
+          window.open(
+            `https://www.google.com/search?q=${encodeURIComponent(ev.source_title)}`,
+            "_blank",
+            "noopener,noreferrer",
+          );
+        }),
       ),
       el("div", { class: "evidence-text" }, ev.text),
     );
