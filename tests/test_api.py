@@ -82,7 +82,12 @@ def test_health_and_ready(client: TestClient) -> None:
     assert body["version"]
     r = client.get("/ready")
     assert r.status_code == 200
-    assert r.json() == {"qdrant": True, "embedding_model": True, "answer_model": True}
+    assert r.json() == {
+        "qdrant": True,
+        "embedding_model": True,
+        "answer_model": True,
+        "token_required": False,  # switch off by default → no token widget
+    }
 
 
 def test_ready_reports_down_qdrant(library: Library) -> None:
@@ -94,7 +99,22 @@ def test_ready_reports_down_qdrant(library: Library) -> None:
         "qdrant": False,
         "embedding_model": True,
         "answer_model": True,
+        "token_required": False,
     }
+
+
+def test_ready_reports_token_required_when_enabled(library: Library) -> None:
+    # Switch on: /ready (a non-open path) itself needs the token, and
+    # authenticated clients learn that the token widget is in use.
+    db, cfg, q, emb, model = library
+    cfg.services.api_token = "sekret"
+    cfg.services.require_api_token = True
+    app = create_app(cfg, db, qdrant=q, embedder=emb, model=model)
+    client = TestClient(app)
+    assert client.get("/ready").status_code == 401
+    r = client.get("/ready", headers={"Authorization": "Bearer sekret"})
+    assert r.status_code == 200
+    assert r.json()["token_required"] is True
 
 
 # --- library --------------------------------------------------------------------

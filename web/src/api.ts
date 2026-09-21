@@ -197,7 +197,8 @@ export function getToken(): string {
 export function setToken(t: string): void {
   token = t.trim();
   try {
-    sessionStorage.setItem("library_rag_token", token);
+    if (token) sessionStorage.setItem("library_rag_token", token);
+    else sessionStorage.removeItem("library_rag_token");
   } catch {
     // private mode: keep the in-memory token only
   }
@@ -258,9 +259,12 @@ function post(path: string, data: unknown): RequestInit {
 export const api = {
   health: () => request<{ status: string; version: string }>("/health"),
   ready: () =>
-    request<{ qdrant: boolean; embedding_model: boolean; answer_model: boolean }>(
-      "/ready",
-    ),
+    request<{
+      qdrant: boolean;
+      embedding_model: boolean;
+      answer_model: boolean;
+      token_required: boolean;
+    }>("/ready"),
   library: () => request<{ books: Book[] }>("/library"),
 
   search: (q: {

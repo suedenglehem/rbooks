@@ -172,6 +172,13 @@ def create_app(
             "qdrant": qdrant.ping(),
             "embedding_model": embedder is not None,
             "answer_model": model is not None,
+            # The web UI uses this to decide whether the token widget (field +
+            # "Set" button) exists at all: when the server does not enforce
+            # bearer auth, the widget stays hidden, the UI never prompts, and
+            # a stored token is forgotten instead of sent.
+            "token_required": bool(
+                cfg.services.require_api_token and cfg.services.api_token
+            ),
         }
 
     # --- library ----------------------------------------------------------------

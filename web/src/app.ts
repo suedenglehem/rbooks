@@ -84,6 +84,10 @@ export class App {
   private resolvedManifests = new Map<string, BookManifest>();
   private readyTimer = 0;
   private resizeT = 0;
+  // null = unknown (before the first /ready); then the server's own word on
+  // whether bearer auth is enforced. The token widget (field + "Set" button)
+  // is only ever shown while a token may be needed.
+  private tokenRequired: boolean | null = null;
 
   constructor(private root: HTMLElement) {
     root.innerHTML = "";
@@ -297,6 +301,15 @@ export class App {
       this.setReady("qdrant", r.qdrant);
       this.setReady("embedding", r.embedding_model);
       this.setReady("answer", r.answer_model);
+      this.tokenRequired = r.token_required;
+      if (!r.token_required) {
+        // The server does not enforce a token: the token widget is
+        // meaningless — keep it hidden and forget any stale stored token
+        // so it stops being sent. (Re-poll every 30 s, so a server whose
+        // config flips back on re-enables the field without a reload.)
+        this.root.querySelector<HTMLElement>(".token")!.hidden = true;
+        if (getToken()) setToken("");
+      }
     } catch {
       this.setReady("qdrant", false);
       this.setReady("embedding", false);
@@ -319,6 +332,9 @@ export class App {
   }
 
   private showTokenPrompt(): void {
+    // The server has told us it does not enforce a token: never surface the
+    // field + "Set" button, even if a stray 401 arrives.
+    if (this.tokenRequired === false) return;
     this.root.querySelector<HTMLElement>(".token")!.hidden = false;
     if (!getToken()) this.root.querySelector<HTMLInputElement>("#token-input")!.focus();
   }

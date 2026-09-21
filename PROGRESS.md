@@ -1852,6 +1852,35 @@ ships green during the full-run window.
   /library and /search 200 (value inert); switch on + wrong token →
   401 (existing, renamed test).
 
+### Slice 14 — token widget follows server state (operator ask)
+- [DONE 2026-09-21] The operator: "if api token is not used, you
+  should not show api token and its set field and button" — the
+  header widget (label + password field + "Set" button) must not
+  exist at all when the server does not enforce a token, not just
+  start hidden.
+  - Server: `GET /ready` (api.py) now also returns
+    `token_required: bool(require_api_token and api_token)` — the
+    same condition the middleware enforces.
+  - Web (app.ts): new `tokenRequired: boolean | null` state fed by
+    `loadReady()` (startup + 30 s poll). While `token_required` is
+    false: the widget is force-hidden, `showTokenPrompt()` becomes
+    a no-op (a stray 401 can never resurface it), and any stale
+    stored token is cleared via `setToken("")` so it stops being
+    sent. If the config flips back on, the next 30 s poll re-arms
+    the field with no reload.
+  - api.ts: `ready()` type gains `token_required`; `setToken("")`
+    now removes the sessionStorage entry instead of storing "".
+  - Rebuilt bundle index-Qqf7jg0J.js (CSS unchanged).
+  - Verified live: serve restarted (app pid 109491, uv 109487);
+    /ready carries `token_required: false`; /library 200 with no
+    Authorization header; index.html serves the new bundle.
+- **Gate (2026-09-21, real output):** pytest **496 passed** (495
+  baseline + 1 new /ready test; 2 existing /ready expectations
+  extended), ruff clean, mypy clean (48 files), dist guard green.
+- What the tests pin: /ready reports `token_required: False` by
+  default; with the switch on, /ready (a non-open path) is 401
+  without the token and reports `token_required: True` with it.
+
 ### Next unfinished task
 1. [DONE 2026-09-21] Slice 7 safe revision replacement +
    generation migration committed 153ebcf, pushed.
@@ -1913,8 +1942,9 @@ ships green during the full-run window.
    testing the web interface. Interface is live at
    http://192.168.0.30:8100/ (LAN, operator opt-in 2026-09-21 —
    `app_host: 0.0.0.0` in the pilot-sandbox config; serve app pid
-   104264, uv 104260 — restarted 2026-09-21 for the
-   configurable-token change, **without** sourcing serve.env);
+   109491, uv 109487 — restarted 2026-09-21 for the
+   token-widget-follows-server-state change, **without** sourcing
+   serve.env);
    pilot-sandbox config → the 300-book stratified sample,
    seed 1337; pilot jobs 15,142 succeeded / 2 permanent_failed —
    known pilot issues). **Token requirement is OFF** (slice 13):
