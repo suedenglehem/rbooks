@@ -1647,6 +1647,113 @@ ships green during the full-run window.
   `logging: debug/json/42` loads to DEBUG/json/42; a YAML file
   with `level: LOUD` raises ConfigError.
 
+### Slice 9 — job version signature + cross-version execution gate (operator ask)
+- [DONE 2026-09-21] **Committed (680b4c9), pushed to origin/master.**
+  The operator asked: if the machine was rebooted and the software
+  upgraded, the worker must not execute jobs from the previous
+  version without explicit confirmation.
+  - `software_version()` in versioning.py: SHA-256 content hash
+    over the non-cache package files (`lru_cache`d per process),
+    with a `software_version_for` test seam.
+  - Migration 7: `jobs.created_by_version`, stamped at enqueue;
+    `INSERT OR IGNORE` keeps the *original creator's* version on
+    re-enqueue — the signature records who created the job, not
+    who last tried it.
+  - `Jobs.version_mismatch_counts(current)`: per-creator-version
+    counts over not-yet-terminal jobs (pending/running/
+    retryable_failed only — terminal states are never
+    re-executed, so they are outside the gate). NULL =
+    `legacy` (pre-signature jobs, necessarily foreign).
+  - `check_version_gate` in `_ingest` (before reconcile/claim)
+    and `run_latency`: raises `VersionGateError` with per-version
+    counts unless the durable meta ack (key `version_gate_ack`,
+    shape {to, from, at}) covers *all* foreign versions for the
+    *current* version — a further upgrade re-triggers the gate
+    even for previously-confirmed versions.
+  - `--allow-version-mismatch` records the merged ack; `status`
+    shows the software version plus foreign-job counts:
+    `version gate: ok (software <content-hash>)` or
+    `version gate: N job(s) from another software version
+    (<version> xK ...) — run needs --allow-version-mismatch`.
+- **Gate (2026-09-21, real output):** ruff clean, mypy clean,
+  pytest **475 passed** (457 baseline + 18 new).
+
+### Slice 10 — graceful stop + forced start (stale lock/pidfile/dead-lease cleanup) (operator ask)
+- [DONE 2026-09-21] **Committed, pushed to origin/master.** The
+  operator asked for an option for graceful shutdown and for
+  forced startup (cleaning locks).
+  - New `locks.py` module:
+    - `pid_alive` — `os.kill(pid, 0)` probe plus a
+      `/proc/<pid>/status` State check: a **zombie counts as
+      dead** (it holds no locks; a long-lived unreaping parent
+      would otherwise keep a crashed worker looking alive).
+      PermissionError (another user's pid) counts as alive.
+    - `is_ingest_worker_pid` — identity by argv, not substring:
+      `library-rag` in the cmdline **and** `ingest` as its own
+      argument (a config merely named `ingest-*.yaml`, or a
+      `serve`/`discover` process, never matches).
+    - `descendant_pids` — single /proc scan, BFS over PPid;
+      lets `stop` look through a pre-slice-10 pidfile that
+      names the `nohup`/`uv` wrapper.
+    - pidfile helpers: the worker now writes its own
+      `<scratch_root>/ingest_worker.pid` on start and removes it
+      on clean exit (`remove_pidfile_if_ours` never clobbers a
+      file naming someone else); `remove_stale_pidfile` removes
+      **only** when the pid is provably dead — a live pid (even
+      a reused one) keeps the file, so `stop`'s refusal for
+      such a pid is not masked.
+    - `find_flock_holders` — /proc/<pid>/fd readlink scan (the
+      kernel keeps a lock's owner list private to itself);
+      `kill_pids` — SIGTERM, escalate to SIGKILL after the
+      timeout; `force_release_qdrant_lock` — non-blocking probe
+      of `<qdrant_path>/.lock`; a foreign holder → RuntimeError
+      **refusing** (not killing); a held lock with no discoverable
+      holder → manual-investigation error. `QDRANT_LOCK_NAME`
+      moved here (backup.py imports it from locks, avoiding a
+      jobs→locks→backup→jobs cycle).
+  - `library-rag stop [--timeout 300]`: no pidfile → error;
+    dead pid → drop the stale file; live but not an ingest
+    worker → refuse, showing its cmdline; otherwise SIGTERM the
+    resolved worker(s) (pidfile pid + live ingest-worker
+    descendants), SIGKILL survivors past `--timeout`, remove its
+    own pidfile, print the job counts, and warn to `ingest
+    --force` when jobs are still `running`.
+  - `library-rag ingest --force`: runs **before** the version
+    gate and normal startup work —
+    `force_release_qdrant_lock` (kill a stuck ingest worker
+    still holding the Qdrant local lock; a live hung holder is
+    the only case, since the kernel releases flocks of dead
+    processes automatically) → `remove_stale_pidfile` →
+    `jobs.reclaim_dead_lease_owners()` (flip `running` jobs
+    whose lease_owner pid — the trailing number of
+    `worker_name()` — is provably dead back to `pending`
+    immediately, instead of waiting out the 300 s lease TTL;
+    live owners and unrecognized owner formats are left to the
+    TTL). Startup then proceeds exactly as a normal start.
+  - RUNBOOK updated: §2 launch note (the worker writes its own
+    pidfile — do not create it by hand; the pre-slice-10
+    `echo $!` line removed), §4 stop level 2 (the `stop`
+    command, its refusal semantics, the raw-kill fallback for
+    pre-slice-10 launches), §5 two new recovery bullets
+    (`--force` and the post-upgrade version gate).
+- **Gate (2026-09-21, real output):** ruff "All checks
+  passed!", mypy "Success: no issues found in 48 source
+  files", pytest **490 passed** (475 baseline + 15 new).
+- What the tests pin (tests/test_ops_locks.py): a zombie
+  counts as dead (waits for `State: Z`); the worker-identity
+  check rejects this pytest process; pidfile roundtrip;
+  stale removal is conservative (dead pid → removed, live
+  pid → kept, the pid-reuse guard); `remove_pidfile_if_ours`
+  leaves a foreign file alone; descendant BFS finds a
+  grandchild; flock holders found from /proc; a **foreign**
+  holder survives `force_release_qdrant_lock` (refusal,
+  process alive); a stuck fake worker (a script literally
+  named `library-rag`, argv `ingest <lock-dir>`) is killed
+  and the lock released; a missing lock directory is a no-op;
+  a dead-lease owner is reclaimed exactly once (second pass
+  finds nothing); a live owner is left alone; an unrecognized
+  owner format ("mystery-owner") is left to the TTL.
+
 ### Next unfinished task
 1. [DONE 2026-09-21] Slice 7 safe revision replacement +
    generation migration committed 153ebcf, pushed.
@@ -1654,7 +1761,10 @@ ships green during the full-run window.
    complete (discovery, safe revision replacement, explicit removal,
    generation migration, GC with reference checks, backup/restore,
    coverage reports) plus the line 183 runbook gate.
-3. Parallel track: batch-2 drain.
+3. [DONE 2026-09-21] Slices 9 + 10 (operator asks) shipped:
+   version signature + cross-version execution gate (680b4c9)
+   and graceful stop + forced start (this commit).
+4. Parallel track: batch-2 drain.
    - Timeline: worker 13396 relaunched 02:43 after the 02:17 reboot;
      published 32 revisions (03:13:10–03:53) before the ~13:00 reboot
      killed it (and the pid 15424 poller) and wiped /tmp — the batch2
@@ -1692,5 +1802,15 @@ ships green during the full-run window.
      (legitimately nothing to publish). **Expected clean end state:
      295 active publications, 0/0/0 jobs.**
    - Drain-completion poller re-armed (Bash run_in_background, 60s
-     poll, 30-min heartbeats, 6h cap, exits on 0/0/0). →
+     poll, 30-min heartbeats, 6h cap, exits on 0/0/0). On 0/0/0:
+     verify final state (0/0/0, ~295 active publications), then
      full-library launch (see M6 next-task item 1-2).
+5. **Next: full-library launch** (pre-approved, RUNBOOK §2):
+   doctor → 9-port health (8081–8088, 8091) → df -h → scan →
+   `nohup uv run library-rag ingest --config config.yaml >>
+   /mnt/models_sata_ssd/library-rag/scratch/ingest_run.log 2>&1 &`
+   (the worker writes its own pidfile — no `echo $!`) → status
+   verify → re-measure the first-hour rate and update the ETA
+   (~41–45 days at the pilot rate of ~11–13 jobs/min). The
+   version gate will not block: the queue is drained before the
+   launch, so no foreign-version jobs remain.

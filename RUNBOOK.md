@@ -62,8 +62,13 @@ Step 2 — start the worker detached:
 mkdir -p /mnt/models_sata_ssd/library-rag/scratch
 nohup uv run library-rag ingest --config config.yaml \
   >> /mnt/models_sata_ssd/library-rag/scratch/ingest_run.log 2>&1 &
-echo $! > /mnt/models_sata_ssd/library-rag/scratch/ingest_worker.pid
 ```
+
+The worker writes its own pidfile
+(`/mnt/models_sata_ssd/library-rag/scratch/ingest_worker.pid`) on start and
+removes it on clean exit — do not create it by hand (a pidfile naming the
+`nohup`/`uv` wrapper predates slice 10; `stop` still resolves through it, but
+the worker's own file is authoritative).
 
 Step 3 — verify it took:
 
@@ -123,11 +128,19 @@ Three levels, pick the gentlest that fits:
    job, then idles without claiming. Survives restarts: a (re)started
    worker also refuses to claim while paused. Resume with
    `uv run library-rag resume --config config.yaml`.
-2. **Graceful stop (SIGTERM/SIGINT — the normal stop).**
-   `kill $(cat /mnt/models_sata_ssd/library-rag/scratch/ingest_worker.pid)`
-   The worker finishes the job in flight (its units commit individually
-   and durably as they go), then stops claiming and exits 0 with
-   `ingest: N job(s) completed`. Nothing is lost or half-committed.
+2. **Graceful stop (SIGTERM — the normal stop).**
+   `uv run library-rag stop --config config.yaml`
+   Reads the worker's own pidfile, resolves the real ingest process(es)
+   (for a pre-slice-10 launch the pidfile may name the `nohup`/`uv`
+   wrapper — `stop` looks through its process subtree), and refuses —
+   not kills — a pid that is alive but is not a `library-rag ingest`
+   worker (e.g. a reused pid). SIGTERM first; SIGKILL only for a pid
+   still alive after `--timeout` (default 300 s). The worker finishes
+   the job in flight (its units commit individually and durably as they
+   go), then stops claiming and exits 0 with `ingest: N job(s)
+   completed`. Nothing is lost or half-committed. `stop` removes its own
+   pidfile and prints the job counts; raw `kill $(cat .../ingest_worker.pid)`
+   still works as a fallback for pre-slice-10 launches.
 3. **Hard stop (SIGKILL / power loss).** The in-flight job's lease
    expires (TTL 300 s, `--lease-ttl` to change) and is reclaimed; see
    §5. WAL + fenced commits mean a hard stop cannot corrupt the state DB
@@ -155,6 +168,29 @@ the Qdrant local lock is held.
   attempt (default max 3): a job that crash-loops three times lands in
   `retryable_failed` — fix the cause, then
   `uv run library-rag retry --config config.yaml`.
+- **Stuck worker, or skipping the 300 s lease TTL:** start with
+  `nohup uv run library-rag ingest --force --config config.yaml
+  >> /mnt/models_sata_ssd/library-rag/scratch/ingest_run.log 2>&1 &`
+  instead of the plain step-2 command. `--force` runs before the version
+  gate and normal startup work, and does three things: kills a *stuck
+  ingest worker* that still holds the Qdrant local lock (refusing — not
+  killing — anything that is not an ingest worker), drops a stale pidfile,
+  and immediately flips `running` jobs whose owner process is provably dead
+  back to `pending` instead of waiting out the 300 s lease TTL. Startup
+  then proceeds exactly as a normal start.
+- **After a software upgrade (version gate):** every job is stamped with
+  the software version that enqueued it (a content hash of the installed
+  code). After a reboot + code upgrade the queue may hold work created by
+  an older version, and the worker refuses to run it without explicit
+  confirmation. `status` shows either
+  `version gate: ok (software <content-hash>)` or
+  `version gate: N job(s) from another software version (<version> xK ...)
+  — run needs --allow-version-mismatch`. In the latter case, start the
+  worker with `--allow-version-mismatch`: the confirmation is recorded
+  durably in state (meta key `version_gate_ack`, shape {to, from, at}) and
+  is not asked again until the *next* upgrade, which re-triggers the gate
+  even for previously-confirmed versions. Pre-signature jobs (NULL-stamped)
+  appear as `legacy`.
 - **After any recovery:** confirm with `status` and `coverage` — expect
   `paused=false`, no `permanent_failed`, and a consistent funnel.
 

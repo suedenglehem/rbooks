@@ -17,12 +17,14 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
 
 from .db import Database
+from .locks import pid_alive
 from .versioning import software_version
 
 __all__ = [
@@ -66,6 +68,10 @@ _NOT_TERMINAL = ("'pending'", "'running'", "'retryable_failed'")
 
 # meta key holding the operator's recorded confirmation of foreign versions.
 VERSION_ACK_KEY = "version_gate_ack"
+
+# Trailing pid in a lease_owner string (worker_name() = "<stage>-<host>-<pid>").
+# Used by reclaim_dead_lease_owners to tell a provably-dead owner from a live one.
+_OWNER_PID = re.compile(r"-(\d+)$")
 
 
 def normalize_version(version: str | None) -> str:
@@ -294,6 +300,39 @@ class Jobs:
         )
         if cur.rowcount == 0:
             raise StaleLeaseError(f"job {job.job_id}: stale token on defer")
+
+    def reclaim_dead_lease_owners(self, now: float | None = None) -> int:
+        """Flip ``running`` jobs whose owner process is provably dead back to
+        ``pending`` immediately (M7 slice 10, ``ingest --force``).
+
+        ``lease_owner`` is ``worker_name()`` = ``extract-<host>-<pid>``. If that
+        pid no longer exists, the lease is already orphaned, so there is no
+        reason to wait out the 300 s TTL. ``claim()`` still reclaims expired
+        leases on its own; this just makes the recovery instant after a crash
+        or SIGKILL. Jobs owned by a *live* pid (even a stale-token one) are
+        left alone — a live owner may still commit.
+        """
+        ts = time.time() if now is None else now
+        reclaimed = 0
+        rows = self._db.query(
+            "SELECT job_id, lease_owner FROM jobs WHERE state = 'running'"
+        )
+        for row in rows:
+            owner = row["lease_owner"] or ""
+            match = _OWNER_PID.search(owner)
+            if match is None:
+                continue  # owner format we do not recognize; let the TTL handle it
+            if not pid_alive(int(match.group(1))):
+                cur = self._db.execute(
+                    """
+                    UPDATE jobs SET state = 'pending', lease_owner = NULL,
+                           lease_token = NULL, lease_expires_at = NULL, updated_at = ?
+                    WHERE job_id = ? AND state = 'running'
+                    """,
+                    (ts, row["job_id"]),
+                )
+                reclaimed += cur.rowcount
+        return reclaimed
 
     # --- pause / resume ----------------------------------------------------
     def pause(self, reason: str = "", now: float | None = None) -> None:

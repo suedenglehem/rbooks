@@ -55,6 +55,20 @@ from .indexing import QdrantOps, RealQdrantOps, reconcile_publications
 from .jobs import Jobs, VersionGateError
 from .latency import build_probe_queries, run_latency
 from .llm import AnswerModel, make_answer_model
+from .locks import (
+    descendant_pids,
+    force_release_qdrant_lock,
+    is_ingest_worker_pid,
+    kill_pids,
+    pid_alive,
+    pid_cmdline,
+    pidfile_path,
+    read_pidfile,
+    remove_pidfile,
+    remove_pidfile_if_ours,
+    remove_stale_pidfile,
+    write_pidfile,
+)
 from .log import setup_logging
 from .migrate import MigrationError, MigrationReport, run_migration
 from .migrations import current_version, migrate
@@ -164,6 +178,76 @@ def _resume(args: argparse.Namespace) -> int:
         db.close()
     print("resumed: job claiming re-enabled")
     return EXIT_OK
+
+
+def _stop(args: argparse.Namespace) -> int:
+    setup_logging(args.log_level, args.log_format)
+    cfg = _require_config(args)
+    paths = cfg.paths
+    pid = read_pidfile(paths)
+    if pid is None:
+        print(
+            f"error: no pidfile at {pidfile_path(paths)} — either the worker "
+            "already shut down, or it was started by a version that does not "
+            "write its own pidfile (then kill the process deliberately)",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+    db = _open_state(cfg)
+    try:
+        if not pid_alive(pid):
+            remove_pidfile(paths)
+            print(f"worker pid {pid} is not running; removed stale pidfile")
+        else:
+            # The pidfile names the worker; for a pre-slice-10 launch it
+            # names the nohup/uv wrapper instead, so resolve the actual
+            # library-rag ingest process(es) in its subtree. Anything else —
+            # a reused pid, an operator's own tool — is refused, not killed.
+            targets = [
+                p
+                for p in [pid, *descendant_pids(pid)]
+                if pid_alive(p) and is_ingest_worker_pid(p)
+            ]
+            if not targets:
+                print(
+                    f"error: pidfile pid {pid} is alive but is not a "
+                    f"library-rag ingest worker (cmdline: "
+                    f"{pid_cmdline(pid) or 'unknown'}) — refusing to kill it",
+                    file=sys.stderr,
+                )
+                return EXIT_ERROR
+            print(
+                f"stopping pid(s) {', '.join(map(str, targets))} "
+                f"(SIGTERM; SIGKILL after {args.timeout:.0f}s)..."
+            )
+            signaled, escalated = kill_pids(targets, timeout=args.timeout)
+            if escalated:
+                print(f"did not exit within {args.timeout:.0f}s; SIGKILLed {escalated}")
+            else:
+                print("worker stopped gracefully (SIGTERM)")
+            still = [p for p in signaled if pid_alive(p)]
+            if still:
+                print(
+                    f"error: pid(s) {still} survived SIGKILL — investigate manually",
+                    file=sys.stderr,
+                )
+                return EXIT_ERROR
+            remove_pidfile(paths)
+        counts = Jobs(db).counts()
+        if counts:
+            job_counts = " ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+            print(f"jobs: {job_counts}")
+        else:
+            print("jobs: (none)")
+        if counts.get("running", 0):
+            print(
+                f"{counts['running']} job(s) left 'running' by a hard stop — the "
+                "next `library-rag ingest --force` reclaims them immediately "
+                "(a plain start waits out the 300 s lease TTL)"
+            )
+        return EXIT_OK
+    finally:
+        db.close()
 
 
 def _status(args: argparse.Namespace) -> int:
@@ -318,6 +402,23 @@ def _ingest(args: argparse.Namespace) -> int:
         stop = True  # finish the in-flight unit, then stop claiming (PRD §7)
 
     try:
+        # Forced start (M7 slice 10): clear the way before anything else —
+        # kill a stuck worker still holding the Qdrant local lock, drop a
+        # stale pidfile, and instantly reclaim jobs owned by dead pids
+        # (a plain start would wait out the 300 s lease TTL).
+        if args.force:
+            try:
+                killed = force_release_qdrant_lock(cfg)
+            except RuntimeError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return EXIT_ERROR
+            if killed:
+                print(f"force: killed stuck ingest worker pid(s) {killed}")
+            if remove_stale_pidfile(cfg.paths):
+                print("force: removed stale pidfile")
+            reclaimed = Jobs(db).reclaim_dead_lease_owners()
+            if reclaimed:
+                print(f"force: reclaimed {reclaimed} job(s) from a dead worker")
         # Cross-version execution gate (M7 slice 9): a reboot + upgrade must
         # not silently run jobs enqueued by another code version (or by
         # pre-signature code). Runs before any claim, including reconcile.
@@ -332,6 +433,10 @@ def _ingest(args: argparse.Namespace) -> int:
                 f"version gate: executing {sum(foreign.values())} job(s) from "
                 f"another software version ({detail}) — operator confirmed"
             )
+        # The worker writes its own pidfile (the shell's `echo $!` would
+        # capture the nohup/uv wrapper, not the python process that handles
+        # SIGTERM); stop/force find the worker through it (M7 slice 10).
+        write_pidfile(cfg.paths, os.getpid())
         if not args.once:
             signal.signal(signal.SIGTERM, _graceful_stop)
             signal.signal(signal.SIGINT, _graceful_stop)
@@ -343,6 +448,7 @@ def _ingest(args: argparse.Namespace) -> int:
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
             signal.signal(signal.SIGINT, signal.SIG_DFL)
     finally:
+        remove_pidfile_if_ours(cfg.paths, os.getpid())
         db.close()
     print(f"ingest: {completed} job(s) completed")
     return EXIT_OK
@@ -1328,6 +1434,19 @@ def build_parser() -> argparse.ArgumentParser:
     resume.add_argument("--config", help="path to config YAML")
     resume.set_defaults(_func=_resume)
 
+    stop = sub.add_parser(
+        "stop",
+        help="gracefully stop a running ingest worker (SIGTERM, SIGKILL after --timeout; M7 slice 10)",
+    )
+    stop.add_argument("--config", help="path to config YAML")
+    stop.add_argument(
+        "--timeout",
+        type=float,
+        default=300.0,
+        help="seconds to wait for a graceful exit before SIGKILL (default 300)",
+    )
+    stop.set_defaults(_func=_stop)
+
     status = sub.add_parser("status", help="show ingestion/pipeline status and counts (M1)")
     status.add_argument("--config", help="path to config YAML")
     status.add_argument("--json", action="store_true", help="emit status as JSON")
@@ -1375,6 +1494,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="confirm execution of jobs enqueued by a different software "
         "version (e.g. after a reboot + upgrade); the confirmation is "
         "recorded in state and does not repeat until the next upgrade",
+    )
+    ingest.add_argument(
+        "--force",
+        action="store_true",
+        help="forced start: kill a stuck ingest worker still holding the "
+        "Qdrant lock, remove a stale pidfile, and immediately reclaim jobs "
+        "owned by dead workers (a plain start waits out the 300 s lease TTL)",
     )
     ingest.set_defaults(_func=_ingest)
 

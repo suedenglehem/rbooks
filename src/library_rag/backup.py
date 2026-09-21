@@ -48,13 +48,13 @@ from .db import Database
 from .embeddings import Embedder
 from .indexing import FieldCond, IndexFilter, QdrantOps
 from .jobs import Jobs
+from .locks import QDRANT_LOCK_NAME
 from .migrations import current_version
 from .retrieval import search
 
 MANIFEST_VERSION = 1
 MANIFEST_NAME = "manifest.json"
 CONFIG_NAME = "config.yaml"
-QDRANT_LOCK_NAME = ".lock"
 
 _CHUNK = 1 << 20
 _PROGRESS_EVERY = 2000
