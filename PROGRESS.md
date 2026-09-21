@@ -1936,15 +1936,23 @@ ships green during the full-run window.
      state; zero failures across the whole drain. Idle sandbox
      worker stopped gracefully 16:13 (`stop`, SIGTERM, "jobs:
      succeeded=7628").
-5. **Next: OPERATOR GATE — web-interface test (user decision
-   2026-09-21 ~16:15).** Full-library launch is **ON HOLD**: the
-   user will not fire the RAG on the whole repository before
-   testing the web interface. Interface is live at
+5. **Next: OPERATOR GATE — PASSED (user verdict 2026-09-21,
+   post-reboot: "it was fine").** The interface test the
+   full-library run was held behind is complete; what remains is
+   only the user's explicit launch approval. Interface is live at
    http://192.168.0.30:8100/ (LAN, operator opt-in 2026-09-21 —
    `app_host: 0.0.0.0` in the pilot-sandbox config; serve app pid
-   109491, uv 109487 — restarted 2026-09-21 for the
-   token-widget-follows-server-state change, **without** sourcing
-   serve.env);
+   18534, uv 18530 — relaunched 2026-09-21 ~23:45 after the ~22:49
+   machine reboot killed the previous app (pid 109491/uv 109487;
+   clean "Shutting down" in serve.log), **without** sourcing
+   serve.env; smoke: /ready all-true + token_required false,
+   /library 300 books, search non-degraded, bundle
+   index-Qqf7jg0J.js). The serve.log session from before the reboot
+   shows the user's browser (192.168.0.100) loaded the new bundle and
+   exercised the interface: 10× POST /answer 200, 17× /answers 200,
+   reader unit reads + PDF source fetch 200 across several revisions
+   (the earlier 401 block is from the pre-slice-13 run with the
+   switch on);
    pilot-sandbox config → the 300-book stratified sample,
    seed 1337; pilot jobs 15,142 succeeded / 2 permanent_failed —
    known pilot issues). **Token requirement is OFF** (slice 13):
