@@ -21,6 +21,8 @@ def test_valid_config_is_accepted(base_config: Config) -> None:
     # A disjoint layout must validate cleanly.
     assert base_config.paths.state_root.name == "state"
     assert base_config.services.app_host == "127.0.0.1"
+    # The source-path leak is opt-in, off by default.
+    assert base_config.services.show_path_to_original is False
 
 
 def test_managed_root_nested_in_source_is_refused(roots: dict[str, Path]) -> None:

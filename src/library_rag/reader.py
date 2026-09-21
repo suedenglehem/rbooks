@@ -101,7 +101,7 @@ def create_app(cfg: Config, db: Database) -> FastAPI:
             """,
             (run["run_id"],),
         )
-        return {
+        out: dict[str, Any] = {
             "rev_id": rev_id,
             "doc_id": rev["doc_id"],
             "format": rev["format"],
@@ -109,6 +109,12 @@ def create_app(cfg: Config, db: Database) -> FastAPI:
             "unit_count": int(run["unit_count"] or 0),
             "units": [dict(u) for u in units],
         }
+        # Opt-in: expose the full source path for local-machine runs
+        # (services.show_path_to_original). Omitted by default so a deployed
+        # app never leaks the server filesystem layout.
+        if cfg.services.show_path_to_original:
+            out["source_path"] = rev["first_path"]
+        return out
 
     @app.get("/books/{rev_id}/source")
     def source(rev_id: str, range: str | None = Header(default=None)) -> StreamingResponse:

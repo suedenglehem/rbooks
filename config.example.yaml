@@ -40,6 +40,11 @@ services:
   app_host: 127.0.0.1
   app_port: 8100
   # api_token: "..."   # or set LIBRARY_RAG_API_TOKEN
+  # Local-machine convenience, opt-in: when true, the reader manifest
+  # (GET /books/{rev_id}) carries the book's full source path and the web UI
+  # shows it in the reader pane above the located content. Off by default —
+  # a deployed app must not leak server filesystem layout.
+  # show_path_to_original: true
 
 # Embedding model (PRD §6/§8F). The exact model + revision — never a bare
 # family name. Changing this value changes the embedding key and forces fresh

@@ -178,6 +178,11 @@ class Services(BaseModel):
     app_port: int = 8000
     # Optional bearer token required before any non-loopback exposure.
     api_token: str | None = None
+    # Local-machine convenience (operator opt-in): when True, the reader
+    # manifest (GET /books/{rev_id}) carries the book's full source path,
+    # which the web UI shows in the reader pane next to the content. Off by
+    # default — a deployed app must not leak server filesystem layout.
+    show_path_to_original: bool = False
 
     @field_validator("app_host", "qdrant_host", "answer_host", "embed_host")
     @classmethod

@@ -377,6 +377,15 @@ main > section {
 
 .reader-pos { font-size: 13px; min-width: 120px; text-align: center; }
 
+.reader-path {
+  font-size: 12px;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  margin-bottom: 6px;
+  word-break: break-all;
+  user-select: text;
+}
+
 .reader-scroll {
   flex: 1;
   min-height: 0;

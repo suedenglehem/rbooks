@@ -210,7 +210,9 @@ export class App {
     );
 
     const readerPane = el("div", { class: "pane pane-reader" },
-      toolbar, scroll, el("div", { class: "reader-status", id: "reader-status" }));
+      toolbar,
+      el("div", { class: "reader-path", id: "r-path", hidden: "true" }),
+      scroll, el("div", { class: "reader-status", id: "reader-status" }));
 
     return el("section", { id: "view-research" },
       tabs,
@@ -687,6 +689,19 @@ export class App {
       }
     }
     this.set("r-pos", pos);
+    // Source path line: every locate flow awaits the manifest before
+    // changing reader state, so the manifest for s.revId is resolved here
+    // whenever the server sent one (services.show_path_to_original).
+    const path = s.revId ? this.resolvedManifests.get(s.revId)?.source_path : undefined;
+    const pathEl = this.root.querySelector<HTMLElement>("#r-path");
+    if (pathEl) {
+      if (path) {
+        pathEl.textContent = path;
+        pathEl.hidden = false;
+      } else {
+        pathEl.hidden = true;
+      }
+    }
     const navigable = s.kind === "pdf" || s.kind === "section";
     this.disable("#r-prev", !navigable);
     this.disable("#r-next", !navigable);

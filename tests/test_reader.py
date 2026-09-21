@@ -73,6 +73,31 @@ def test_manifest_lists_units(env: Env) -> None:
     assert all(u["kind"] == "page" for u in body["units"])
 
 
+def test_manifest_source_path_hidden_by_default(env: Env) -> None:
+    # Without services.show_path_to_original the manifest must not even
+    # carry the key — a deployed app never leaks server filesystem layout.
+    body = env.client.get(f"/books/{env.pdf_rev}").json()
+    assert "source_path" not in body
+
+
+def test_manifest_source_path_when_opted_in(env: Env) -> None:
+    cfg = env.cfg.model_copy(
+        update={
+            "services": env.cfg.services.model_copy(
+                update={"show_path_to_original": True}
+            )
+        }
+    )
+    client = TestClient(create_app(cfg, env.db))
+    body = client.get(f"/books/{env.pdf_rev}").json()
+    row = env.db.query_one(
+        "SELECT first_path FROM source_revisions WHERE rev_id = ?", (env.pdf_rev,)
+    )
+    assert row is not None
+    assert body["source_path"] == row["first_path"]
+    assert body["source_path"].endswith("book.pdf")
+
+
 def test_manifest_unknown_revision_404(env: Env) -> None:
     assert env.client.get("/books/rev-does-not-exist").status_code == 404
 

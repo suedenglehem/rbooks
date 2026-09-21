@@ -1754,6 +1754,44 @@ ships green during the full-run window.
   finds nothing); a live owner is left alone; an unrecognized
   owner format ("mystery-owner") is left to the TTL.
 
+### Slice 11 — show-path-to-original config option (operator ask)
+- [DONE 2026-09-21] The operator asked for a config option that
+  shows the **full path to the original book file** in the reader
+  pane (the right window, above the "locate in reader" content) —
+  intended for local-machine runs only.
+  - `Services.show_path_to_original: bool = False` (config.py) —
+    off by default; a deployed app must never leak server
+    filesystem layout.
+  - `GET /books/{rev_id}` (reader.py `book_manifest`) adds
+    `source_path` (from `source_revisions.first_path`, the
+    registered absolute path) to the manifest **only when the
+    flag is on** — when off the key is absent, never null.
+  - Web UI: `BookManifest.source_path?` (api.ts); the reader pane
+    renders a `#r-path` line (monospace, selectable,
+    word-break) between the toolbar and the scroll area, driven
+    from `this.resolvedManifests.get(s.revId)?.source_path` in
+    `onReaderState` — every locate flow awaits the manifest
+    before changing reader state, so it is always resolved when
+    the state lands. Hidden when the server sent no path.
+  - config.example.yaml documents the option (commented out).
+  - Verified live: pilot-sandbox config flipped to
+    `show_path_to_original: true`, serve app restarted (app pid
+    90237, uv 90234, 2026-09-21); manifest for a pilot rev
+    carries `source_path` equal to the DB `first_path`;
+    no-token requests still 401; the rebuilt bundle
+    (index-BGBKgYQW.js / index-CwpwoDEP.css) is what's served.
+- **Gate (2026-09-21, real output):** pytest **492 passed**
+  (490 baseline + 2 new reader tests; the config default
+  assertion extends an existing test). New bundle built with
+  `tsc --noEmit && vite build`, self-hosted, dist guard test
+  green.
+- What the tests pin (tests/test_reader.py,
+  tests/test_config.py): default `show_path_to_original` is
+  False; the manifest has **no** `source_path` key when the flag
+  is off; with the flag on (cfg `model_copy` + fresh TestClient)
+  the key equals the `source_revisions.first_path` row value and
+  points at the ingested file.
+
 ### Next unfinished task
 1. [DONE 2026-09-21] Slice 7 safe revision replacement +
    generation migration committed 153ebcf, pushed.
@@ -1802,15 +1840,34 @@ ships green during the full-run window.
      (legitimately nothing to publish). **Expected clean end state:
      295 active publications, 0/0/0 jobs.**
    - Drain-completion poller re-armed (Bash run_in_background, 60s
-     poll, 30-min heartbeats, 6h cap, exits on 0/0/0). On 0/0/0:
-     verify final state (0/0/0, ~295 active publications), then
-     full-library launch (see M6 next-task item 1-2).
-5. **Next: full-library launch** (pre-approved, RUNBOOK §2):
-   doctor → 9-port health (8081–8088, 8091) → df -h → scan →
-   `nohup uv run library-rag ingest --config config.yaml >>
-   /mnt/models_sata_ssd/library-rag/scratch/ingest_run.log 2>&1 &`
-   (the worker writes its own pidfile — no `echo $!`) → status
-   verify → re-measure the first-hour rate and update the ETA
-   (~41–45 days at the pilot rate of ~11–13 jobs/min). The
-   version gate will not block: the queue is drained before the
-   launch, so no foreign-version jobs remain.
+     poll, 30-min heartbeats, 6h cap, exits on 0/0/0).
+   - **DONE 2026-09-21:** poller exited 0 on 0/0/0. Final state
+     verified 16:13: 0 pending / 0 running / 0 failed, 7,628
+     succeeded; 295 active publications — exactly the expected end
+     state; zero failures across the whole drain. Idle sandbox
+     worker stopped gracefully 16:13 (`stop`, SIGTERM, "jobs:
+     succeeded=7628").
+5. **Next: OPERATOR GATE — web-interface test (user decision
+   2026-09-21 ~16:15).** Full-library launch is **ON HOLD**: the
+   user will not fire the RAG on the whole repository before
+   testing the web interface. Interface is live at
+   http://192.168.0.30:8100/ (LAN, operator opt-in 2026-09-21 —
+   `app_host: 0.0.0.0` in the pilot-sandbox config; serve app pid
+   90237 (restarted 2026-09-21 for the show-path-to-original
+   opt-in; the manifest now carries source_path); pilot-sandbox
+   config → the 300-book stratified sample,
+   seed 1337; pilot jobs 15,142 succeeded / 2 permanent_failed —
+   known pilot issues). API is bearer-token protected: token lives
+   only in 0600 `pilot-sandbox/scratch/serve.env`
+   (LIBRARY_RAG_API_TOKEN, never in git); verified on LAN: static
+   SPA + /health open, /library 401 without/bad token, 200 with.
+   The web UI shows a token field on 401 (stored in sessionStorage).
+   The batch-2 sandbox (second 300-book stratified sample) is also
+   fully drained and available if the user prefers testing against
+   it. After the user's explicit go: full-library launch per
+   RUNBOOK §2 (doctor → 9-port health 8081–8088+8091 → df -h →
+   scan → `nohup uv run library-rag ingest --config config.yaml >>
+   /mnt/models_sata_ssd/library-rag/scratch/ingest_run.log 2>&1 &`,
+   worker self-writes its pidfile → status verify → re-measure
+   first-hour rate, ETA ~41–45 days at ~11–13 jobs/min). Do not
+   start it without the user's explicit approval.

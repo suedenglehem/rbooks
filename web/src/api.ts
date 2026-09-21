@@ -130,6 +130,9 @@ export interface BookManifest {
   run_id: string;
   unit_count: number;
   units: UnitRef[];
+  // Present only when the server is configured with
+  // services.show_path_to_original: true (local-machine opt-in).
+  source_path?: string | null;
 }
 
 export interface UnitPayload {
