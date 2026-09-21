@@ -23,12 +23,55 @@ from dataclasses import dataclass
 from typing import Any
 
 from .db import Database
+from .versioning import software_version
 
-__all__ = ["Claimed", "Jobs", "StaleLeaseError", "backoff_delay"]
+__all__ = [
+    "LEGACY_VERSION",
+    "VERSION_ACK_KEY",
+    "Claimed",
+    "Jobs",
+    "StaleLeaseError",
+    "VersionGateError",
+    "backoff_delay",
+    "normalize_version",
+]
 
 
 class StaleLeaseError(RuntimeError):
     """Raised when a write is rejected because the caller's lease token is stale."""
+
+
+class VersionGateError(RuntimeError):
+    """Raised at worker start when the queue holds jobs created by another
+    software version and the operator has not explicitly confirmed running them.
+
+    Carries the human-facing *message* and the *foreign versions* (with counts)
+    so the caller can render an actionable refusal."""
+
+    def __init__(self, message: str, foreign: dict[str, int]) -> None:
+        super().__init__(message)
+        self.foreign = foreign
+
+
+# Sentinel for jobs enqueued before version signatures existed (the
+# ``created_by_version`` column is NULL on them). Treated as foreign: a NULL
+# job was necessarily enqueued by pre-signature code, i.e. a different version
+# than the one now about to run it.
+LEGACY_VERSION = "legacy"
+
+# Job states that are still executable by a (re)started worker. Terminal
+# states (succeeded / permanent_failed / cancelled) are never re-executed, so
+# they are excluded from the version gate.
+_NOT_TERMINAL = ("'pending'", "'running'", "'retryable_failed'")
+
+# meta key holding the operator's recorded confirmation of foreign versions.
+VERSION_ACK_KEY = "version_gate_ack"
+
+
+def normalize_version(version: str | None) -> str:
+    """Map a stored ``created_by_version`` (NULL for pre-signature jobs) to a
+    displayable token; NULL becomes :data:`LEGACY_VERSION`."""
+    return version if version is not None else LEGACY_VERSION
 
 
 @dataclass(frozen=True)
@@ -55,8 +98,12 @@ def backoff_delay(attempts: int, base: float = 1.0, cap: float = 300.0, jitter: 
 
 
 class Jobs:
-    def __init__(self, db: Database) -> None:
+    def __init__(self, db: Database, *, version: str | None = None) -> None:
         self._db = db
+        # The software version stamped on every job this instance enqueues.
+        # Defaults to the running code's content hash (test seam: pass a
+        # literal to simulate a different installed version).
+        self._version = version if version is not None else software_version()
 
     # --- enqueue -----------------------------------------------------------
     def enqueue(
@@ -69,17 +116,35 @@ class Jobs:
         max_attempts: int = 3,
         now: float | None = None,
     ) -> None:
-        """Add a pending job, idempotently on *task_key*."""
+        """Add a pending job, idempotently on *task_key*.
+
+        The row is stamped with the software version that enqueued it
+        (``created_by_version``); the worker-start version gate uses this to
+        detect work created by a different code version (M7 slice 9).
+        ``INSERT OR IGNORE`` means a re-enqueue of an existing *task_key*
+        keeps the original creator's version — the signature records who
+        *created* the job, not who last tried to.
+        """
         ts = time.time() if now is None else now
         with self._db.transaction():
             self._db.execute(
                 """
                 INSERT OR IGNORE INTO jobs
                     (task_key, stage, input_id, input_version, range_spec, state,
-                     max_attempts, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                     max_attempts, created_by_version, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
                 """,
-                (task_key, stage, input_id, input_version, range_spec, max_attempts, ts, ts),
+                (
+                    task_key,
+                    stage,
+                    input_id,
+                    input_version,
+                    range_spec,
+                    max_attempts,
+                    self._version,
+                    ts,
+                    ts,
+                ),
             )
 
     # --- claim -------------------------------------------------------------
@@ -281,6 +346,26 @@ class Jobs:
     def counts(self) -> dict[str, int]:
         rows = self._db.query("SELECT state, COUNT(*) AS n FROM jobs GROUP BY state")
         return {r["state"]: int(r["n"]) for r in rows}
+
+    def version_mismatch_counts(self, current: str) -> dict[str, int]:
+        """Counts of not-yet-terminal jobs NOT created by *current* version.
+
+        Maps each normalized creator version (NULL -> :data:`LEGACY_VERSION`)
+        to the number of jobs in ``pending`` / ``running`` / ``retryable_failed``
+        state it enqueued. An empty result means the queue holds only work
+        created by the running code version.
+        """
+        states = ", ".join(_NOT_TERMINAL)
+        rows = self._db.query(
+            f"""
+            SELECT created_by_version, COUNT(*) AS n FROM jobs
+            WHERE state IN ({states})
+              AND (created_by_version IS NULL OR created_by_version != ?)
+            GROUP BY created_by_version
+            """,
+            (current,),
+        )
+        return {normalize_version(r["created_by_version"]): int(r["n"]) for r in rows}
 
     def get(self, job_id: int) -> dict[str, Any] | None:
         row = self._db.query_one("SELECT * FROM jobs WHERE job_id = ?", (job_id,))

@@ -52,7 +52,7 @@ from .evaluate import evaluate, format_report, load_dataset
 from .gc import GcError, run_gc
 from .identity import normalize_path
 from .indexing import QdrantOps, RealQdrantOps, reconcile_publications
-from .jobs import Jobs
+from .jobs import Jobs, VersionGateError
 from .latency import build_probe_queries, run_latency
 from .llm import AnswerModel, make_answer_model
 from .log import setup_logging
@@ -84,7 +84,8 @@ from .reconcile import Mount, reconcile_catalog
 from .removal import RemovalError, remove_document, resolve_target
 from .retrieval import IndexUnavailableError, search
 from .scan import scan_roots
-from .worker import DEFAULT_LEASE_TTL, run_worker
+from .versioning import short_version, software_version
+from .worker import DEFAULT_LEASE_TTL, check_version_gate, run_worker
 
 # Exit codes.
 EXIT_OK = 0
@@ -172,9 +173,13 @@ def _status(args: argparse.Namespace) -> int:
     try:
         jobs = Jobs(db)
         job_counts = jobs.counts()
+        current = software_version()
+        foreign = jobs.version_mismatch_counts(current)
         data: dict[str, object] = {
             "schema_version": current_version(db),
             "paused": jobs.is_paused(),
+            "software_version": short_version(current),
+            "version_gate": {"foreign_jobs": foreign},
             "jobs": job_counts,
             "documents": _count(db, "SELECT COUNT(*) AS n FROM documents"),
             "revisions": _count(db, "SELECT COUNT(*) AS n FROM source_revisions"),
@@ -200,6 +205,14 @@ def _status(args: argparse.Namespace) -> int:
             print(f"jobs: {counts}")
         else:
             print("jobs: (none)")
+        if foreign:
+            detail = " ".join(f"{k} x{v}" for k, v in sorted(foreign.items()))
+            print(
+                f"version gate: {sum(foreign.values())} job(s) from another software "
+                f"version ({detail}) — run needs --allow-version-mismatch"
+            )
+        else:
+            print(f"version gate: ok (software {data['software_version']})")
         ocr_state = data["ocr_state"]
         if isinstance(ocr_state, dict):
             ocr_counts = " ".join(f"{k}={v}" for k, v in sorted(ocr_state.items()))
@@ -305,6 +318,20 @@ def _ingest(args: argparse.Namespace) -> int:
         stop = True  # finish the in-flight unit, then stop claiming (PRD §7)
 
     try:
+        # Cross-version execution gate (M7 slice 9): a reboot + upgrade must
+        # not silently run jobs enqueued by another code version (or by
+        # pre-signature code). Runs before any claim, including reconcile.
+        try:
+            foreign = check_version_gate(db, allow=args.allow_version_mismatch)
+        except VersionGateError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+        if foreign:
+            detail = " ".join(f"{k} x{v}" for k, v in sorted(foreign.items()))
+            print(
+                f"version gate: executing {sum(foreign.values())} job(s) from "
+                f"another software version ({detail}) — operator confirmed"
+            )
         if not args.once:
             signal.signal(signal.SIGTERM, _graceful_stop)
             signal.signal(signal.SIGINT, _graceful_stop)
@@ -1052,7 +1079,7 @@ def _pilot_latency(args: argparse.Namespace) -> int:
             ingest_root=args.ingest_root,
             ingest_count=args.ingest_count,
         )
-    except (OSError, ValueError, ConfigError) as exc:
+    except (OSError, ValueError, ConfigError, VersionGateError) as exc:
         print(f"latency error: {exc}", file=sys.stderr)
         return EXIT_ERROR
     finally:
@@ -1341,6 +1368,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_LEASE_TTL,
         help=f"lease TTL in seconds (default {DEFAULT_LEASE_TTL:.0f})",
+    )
+    ingest.add_argument(
+        "--allow-version-mismatch",
+        action="store_true",
+        help="confirm execution of jobs enqueued by a different software "
+        "version (e.g. after a reboot + upgrade); the confirmation is "
+        "recorded in state and does not repeat until the next upgrade",
     )
     ingest.set_defaults(_func=_ingest)
 

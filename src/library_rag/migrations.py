@@ -324,6 +324,15 @@ _MIGRATION_0006: tuple[str, ...] = (
 )
 
 
+# M7 slice 9: the software version that enqueued each job. NULL
+# marks jobs created before version signatures existed ("legacy"): they were
+# enqueued by some code version we never recorded, and the worker-start gate
+# treats them conservatively as foreign work requiring explicit confirmation.
+_MIGRATION_0007: tuple[str, ...] = (
+    "ALTER TABLE jobs ADD COLUMN created_by_version TEXT",
+)
+
+
 MIGRATIONS: list[Migration] = [
     Migration(1, "catalog_and_jobs", _MIGRATION_0001),
     Migration(2, "pipeline_tables", _MIGRATION_0002),
@@ -331,6 +340,7 @@ MIGRATIONS: list[Migration] = [
     Migration(4, "embeddings_and_publication", _MIGRATION_0004),
     Migration(5, "answers", _MIGRATION_0005),
     Migration(6, "publications_superseded_at", _MIGRATION_0006),
+    Migration(7, "jobs_created_by_version", _MIGRATION_0007),
 ]
 
 

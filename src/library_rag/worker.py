@@ -95,14 +95,16 @@ from .indexing import (
     reconcile_publications,
     release_publish_lock,
 )
-from .jobs import Claimed, Jobs, StaleLeaseError
+from .jobs import VERSION_ACK_KEY, Claimed, Jobs, StaleLeaseError, VersionGateError
 from .log import JobLogCapture, get_logger, log_event, prune_job_logs
 from .normalization import normalize_unit, unit_removed_ranges
 from .scan import STAGE_CHUNK, STAGE_EMBED, STAGE_EXTRACT, STAGE_OCR, STAGE_PUBLISH
+from .versioning import short_version, software_version
 
 __all__ = [
     "DEFAULT_LEASE_TTL",
     "build_ctx",
+    "check_version_gate",
     "chunk_fingerprint_for_run",
     "run_worker",
     "units_fingerprint_for_run",
@@ -122,6 +124,88 @@ log = get_logger("library_rag.worker")
 
 def worker_name() -> str:
     return f"extract-{os.uname().nodename}-{os.getpid()}"
+
+
+def _read_version_ack(db: Database) -> dict[str, Any] | None:
+    """The operator's recorded confirmation of foreign job versions, or None.
+
+    Shape: ``{"to": <ack'd-against version>, "from": [versions...], "at": ts}``.
+    Corrupt values are treated as absent (the gate then re-asks rather than
+    honoring garbage)."""
+    row = db.query_one("SELECT value FROM meta WHERE key = ?", (VERSION_ACK_KEY,))
+    if row is None:
+        return None
+    try:
+        data = json.loads(row["value"])
+    except (TypeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _write_version_ack(db: Database, current: str, confirmed: list[str], at: float) -> None:
+    db.execute(
+        "INSERT INTO meta (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (VERSION_ACK_KEY, json.dumps({"to": current, "from": confirmed, "at": at})),
+    )
+
+
+def check_version_gate(db: Database, *, allow: bool = False) -> dict[str, int]:
+    """Worker-start gate against cross-version job execution (M7 slice 9).
+
+    Counts the not-yet-terminal jobs whose ``created_by_version`` differs from
+    the running code version (NULL counts as ``legacy`` — pre-signature work
+    was necessarily enqueued by other code).
+
+    * empty count -> passes silently;
+    * otherwise passes only if the durable acknowledgement (``meta`` key
+      ``version_gate_ack``) covers *every* foreign version **and** was
+      recorded against the current version (its ``to`` field) — so a reboot
+      mid-drain does not re-prompt for the same confirmation, while a further
+      upgrade re-triggers the gate even for previously confirmed versions;
+    * with *allow* (``ingest --allow-version-mismatch``), records a fresh
+      acknowledgement covering all foreign versions and passes.
+
+    Returns the foreign counts (``{}`` when the queue is entirely
+    same-version). Raises :class:`VersionGateError` when confirmation is
+    required and absent, so the caller refuses to start with an actionable
+    message instead of silently executing another code version's work.
+    """
+    current = software_version()
+    counts = Jobs(db).version_mismatch_counts(current)
+    if not counts:
+        return {}
+    ack = _read_version_ack(db)
+    prior: list[str] = []
+    if ack is not None and ack.get("to") == current:
+        value = ack.get("from")
+        if isinstance(value, list):
+            prior = [str(v) for v in value]
+    if set(counts) <= set(prior):
+        log.info(
+            "version gate: %d job(s) enqueued by version(s) %s — operator "
+            "confirmation on record",
+            sum(counts.values()),
+            ", ".join(sorted(counts)),
+        )
+        return counts
+    if not allow:
+        detail = ", ".join(f"{v} x{n}" for v, n in sorted(counts.items()))
+        raise VersionGateError(
+            f"the queue holds {sum(counts.values())} job(s) created by a "
+            f"different software version ({detail}); the running version is "
+            f"{short_version(current)}. After a reboot and/or upgrade, work "
+            f"enqueued by other code is not executed without explicit "
+            f"confirmation. Re-run with --allow-version-mismatch to confirm "
+            f"(recorded in state; it does not repeat until the next upgrade).",
+            counts,
+        )
+    _write_version_ack(db, current, sorted(set(prior) | set(counts)), time.time())
+    log.info(
+        "version gate: operator confirmed execution of job(s) from version(s) %s",
+        ", ".join(sorted(counts)),
+    )
+    return counts
 
 
 def units_fingerprint_for_run(db: Database, run_id: str) -> str:

@@ -29,7 +29,7 @@ from .indexing import QdrantOps
 from .jobs import Jobs
 from .retrieval import search_candidates
 from .scan import iter_candidate_paths, process_paths
-from .worker import run_worker
+from .worker import check_version_gate, run_worker
 
 __all__ = [
     "LatencyStats",
@@ -201,6 +201,10 @@ def run_latency(
         # busy phase would measure idle anyway — say so instead of pretending.
         return result
 
+    # Cross-version execution gate (M7 slice 9): the worker thread below runs
+    # whatever is queued, so a sandbox left behind by an older code version
+    # must not be silently drained either.
+    check_version_gate(db)
     stop = threading.Event()
     worker_db = Database.connect(db_path_for(cfg.paths.state_root))
 
