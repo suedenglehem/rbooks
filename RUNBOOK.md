@@ -181,7 +181,13 @@ process, so new books land without re-running `scan` by hand —
 `nohup uv run library-rag discover --config config.yaml
 >> /mnt/models_sata_ssd/library-rag/scratch/discover.log 2>&1 &` —
 SIGTERM stops it after the in-flight pass, like the worker; it
-never deletes catalog content, a vanished file is only reported).
+never deletes catalog content, a vanished file is only reported),
+and `migrate` (generation-migration planner: which runs need
+re-chunking / re-embedding under the current chunker or embedding
+configuration, which publications the new generation will supersede,
+and whether the new generation fits beside the current one — planning
+is read-only, and `--execute` only enqueues the reconcile jobs the
+worker's own startup pass would enqueue, so both are safe mid-run).
 
 Requires the worker stopped first (SIGTERM, then run, then resume):
 `backup` (→ `restore`/`verify` into an isolated directory), `gc`
@@ -189,6 +195,11 @@ Requires the worker stopped first (SIGTERM, then run, then resume):
 [--execute]` (explicit removal; points-first with verification),
 `reconcile` (also runs automatically on worker start, so manual runs are
 rarely needed).
+
+If `migrate` reports a maintenance window (the new generation will not
+fit beside the current one): SIGTERM the worker, `gc --execute` to
+reclaim superseded point sets, re-run `migrate` to re-check capacity,
+then `migrate --execute --accept-maintenance-window`.
 
 ## 8. Known constraints
 

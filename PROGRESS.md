@@ -1529,10 +1529,90 @@ ships green during the full-run window.
   1 running / 6269 succeeded; 81070 chunks, 0 embedding batches
   committed yet; 0 published docs; worker 72176 alive.
 
+### Slice 7 — safe revision replacement + generation migration (PRD §14)
+- [DONE 2026-09-21] **Committed 153ebcf, pushed to origin/master.**
+  New `src/library_rag/migrate.py` (+ tests/test_migrate.py, 6 tests;
+  CLI `migrate` subcommand); 5 new points-kind tests in test_gc.py;
+  migration 0006 `publications_superseded_at`:
+  - **Safe revision replacement closed**: B4's four supersede UPDATEs
+    (publish switch ×2, reconcile B3+B4-completion ×2) now stamp
+    `superseded_at` atomically with the state flip. `gc` learns a
+    fourth kind, `points`: a superseded publication older than the
+    grace window is a candidate whose object is its Qdrant point set
+    — reclaimed by a filtered `pub_id` delete (no file I/O; the
+    publications row stays as lineage). Without a Qdrant client (the
+    worker holds the local lock) the kind is skipped with an explicit
+    note rather than guessed at.
+  - **Generation migration** `run_migration(db, cfg, *, execute,
+    accept_maintenance_window) -> MigrationReport` — no Qdrant
+    client at any point (state DB + storage-dir bytes only, so it
+    works while the worker runs):
+    * drift detection mirrors the worker's reconcile pass exactly:
+      *rechunk* (stored `chunk_fingerprint` vs
+      `chunk_fingerprint_for_run`; all succeeded runs, plus
+      active-revision runs counted separately — only those
+      re-enter the index) and *reembed* (embedding-batch checkpoint
+      count under the current `embedding_sha` vs the expected
+      `(n_chunks + batch - 1) // batch`); *supersede* = the active
+      publications of the migrating revisions.
+    * capacity (PRD line 190: two generations must fit, or a
+      documented window): `second_gen = storage * migrating_points
+      / active_points`, proportional to the *measured* store rather
+      than chunks×dim×dtype, because the store still holds the
+      not-yet-superseded generation. Unknown store size or free
+      space (remote mode / stat failure) → `fits = None`, which
+      counts as *not* fitting — an unverifiable window is an
+      explicit window.
+    * execution enqueues exactly what the canonical reconcile pass
+      enqueues (idempotent; the job queue is the serialization
+      boundary, the worker simply interleaves) and is refused
+      without `--accept-maintenance-window` when the window is
+      required, with the stop → `gc --execute` → re-check → retry
+      recipe in the error.
+  - CLI `library-rag migrate --config X [--execute]
+    [--accept-maintenance-window] [--json]` — dry-run by default.
+- **Gate (2026-09-21, real output):** ruff "All checks passed!",
+  mypy "Success: no issues found in 88 source files", pytest
+  **451 passed in 59.93s** (440 baseline + 6 migrate + 5 gc
+  points-kind).
+- What the tests pin: no-drift is a noop (0/0/0, 0 superseded,
+  fits, nothing enqueued); a chunker change (target_tokens +1)
+  re-chunks exactly one active run, supersedes its publication,
+  and executing enqueues exactly the one chunk job whose handoff
+  re-drives embed+publish from the new fingerprint; a dimensions
+  change re-embeds; the fit estimate is proportional to the measured
+  store (8 MiB store, all points migrate → second generation
+  estimated at 8 MiB); a full disk (monkeypatched free=1024) refuses
+  without acceptance and enqueues nothing; unknown capacity
+  (nonexistent store dir) is treated as a required window that
+  explicit acceptance still proceeds with.
+- Bugs found en route: `publish_handbuilt` never stamped the run's
+  `chunk_fingerprint` (NULL) — NULL is drift to the reconcile pass
+  and therefore to migrate, so every hand-built library was
+  "drifted"; the fixture now stamps `chunk_fingerprint_for_run`
+  exactly as the chunk stage does. The supersede tests' second
+  generation reused the existing doc_id, colliding with the
+  fixture's plain `INSERT INTO documents` PK — now
+  `ON CONFLICT(doc_id) DO NOTHING` (the doc row must stay the first
+  generation's: B4 supersedes the doc's *other* active
+  publications). mypy: a `Row` loop variable cannot be re-bound to
+  `query_one`'s `Row | None` (renamed to `active_row`); the
+  reembed count row is `assert`-guarded like the worker's.
+- Drain snapshot 2026-09-21 (while writing slice 7): the machine
+  rebooted ~02:17, killing worker 72176 mid-embedding (last log
+  02:00:11, healthy 200 OKs to 8081–8088). Recovery: state DB
+  integrity ok (WAL, PRAGMA), 300/300 runs succeeded, 0 failed
+  jobs; both mounts rw, all 8 embedders 200. Worker relaunched
+  02:43 (first new log line 02:43:13, embedding resumed); at
+  relaunch: 294 jobs pending, 1 stale running (reclaimed at
+  startup reconcile), 6799 succeeded.
+
 ### Next unfinished task
-1. [DONE 2026-09-21] Slice 6 scheduled discovery (discover.py +
-   CLI + 6 tests) committed 119d796, pushed.
-2. Slice 7: safe revision replacement + generation migration
-   (PRD §14).
-3. Parallel track: batch-2 drain → full-library launch (see M6
-   next-task item 1-2); M7 work proceeds during the run window.
+1. [DONE 2026-09-21] Slice 7 safe revision replacement +
+   generation migration committed 153ebcf, pushed.
+2. [DONE 2026-09-21] **All seven M7 slices shipped** — PRD line 181
+   complete (discovery, safe revision replacement, explicit removal,
+   generation migration, GC with reference checks, backup/restore,
+   coverage reports) plus the line 183 runbook gate.
+3. Parallel track: batch-2 drain (worker relaunched 02:43 after the
+   02:17 reboot) → full-library launch (see M6 next-task item 1-2).
