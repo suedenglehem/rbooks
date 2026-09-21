@@ -548,6 +548,40 @@ class PilotSettings(BaseModel):
         return v
 
 
+class LoggingSettings(BaseModel):
+    """Short-log + per-job verbose-log configuration (PRD §14).
+
+    The worker's short log goes to stderr (a one-line-per-job summary); a
+    DEBUG-level per-job capture is written to
+    ``<state_root>/job_logs/<job_id>.attempt<N>.log`` and kept only for failed
+    jobs. This section is the source of truth for detached/worker runs:
+    ``level`` and ``format`` drive the short log, and ``job_log_retention``
+    caps how many failure logs accumulate (oldest pruned first). The CLI's
+    ``--log-level`` / ``--log-format`` flags override ``level`` / ``format``
+    for a single interactive invocation.
+    """
+
+    level: str = "INFO"
+    format: str = "human"
+    job_log_retention: int = 500
+
+    @model_validator(mode="after")
+    def _check_logging(self) -> LoggingSettings:
+        level = str(self.level).upper()
+        if level not in ("DEBUG", "INFO", "WARNING", "ERROR"):
+            raise ConfigError(
+                f"logging.level must be DEBUG/INFO/WARNING/ERROR (got {self.level!r})"
+            )
+        self.level = level
+        if self.format not in ("human", "json"):
+            raise ConfigError(f"logging.format must be 'human' or 'json' (got {self.format!r})")
+        if self.job_log_retention < 1:
+            raise ConfigError(
+                f"logging.job_log_retention must be >= 1 (got {self.job_log_retention})"
+            )
+        return self
+
+
 class Config(BaseModel):
     """Top-level application configuration."""
 
@@ -560,6 +594,7 @@ class Config(BaseModel):
     retrieval: RetrievalSettings = Field(default_factory=RetrievalSettings)
     answer: AnswerSettings = Field(default_factory=AnswerSettings)
     pilot: PilotSettings = Field(default_factory=PilotSettings)
+    logging: LoggingSettings = Field(default_factory=LoggingSettings)
 
     # Optional sentinel files that must exist to prove each mount is present.
     # Mapping of a SOURCE ROOT PATH (the same string used as the key in

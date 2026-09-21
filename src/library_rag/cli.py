@@ -1267,8 +1267,17 @@ def build_parser() -> argparse.ArgumentParser:
         description="Local-first RAG research application for a personal book library.",
     )
     parser.add_argument("--version", action="version", version=f"library-rag {__version__}")
-    parser.add_argument("--log-level", default="INFO", help="log level (DEBUG/INFO/WARNING)")
-    parser.add_argument("--log-format", default="human", choices=["human", "json"])
+    parser.add_argument(
+        "--log-level",
+        default=None,
+        help="log level (DEBUG/INFO/WARNING/ERROR); overrides config logging.level",
+    )
+    parser.add_argument(
+        "--log-format",
+        default=None,
+        choices=["human", "json"],
+        help="log format; overrides config logging.format",
+    )
 
     sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
@@ -1620,6 +1629,36 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _apply_config_logging(args: argparse.Namespace) -> None:
+    """Resolve the short-log level/format from config.yaml, flags as overrides.
+
+    ``--log-level`` / ``--log-format`` default to ``None`` so we can tell an
+    explicit operator flag from "not set". The per-subcommand ``--config``
+    names the YAML; we load it best-effort here and fill in
+    ``args.log_level`` / ``args.log_format`` so every handler's existing
+    ``setup_logging(args.log_level, args.log_format)`` call picks the resolved
+    values up without change. Precedence: explicit flag > config > built-in
+    default (INFO / human). The config load is best-effort: a missing or
+    invalid file just falls back to the flag/defaults, and the handler's own
+    ``_require_config`` reports the real error.
+    """
+    level = args.log_level
+    fmt = args.log_format
+    cfg_path = getattr(args, "config", None)
+    if cfg_path:
+        try:
+            cfg = load_config(cfg_path)
+        except ConfigError:
+            cfg = None
+        if cfg is not None:
+            if level is None:
+                level = cfg.logging.level
+            if fmt is None:
+                fmt = cfg.logging.format
+    args.log_level = "INFO" if level is None else level
+    args.log_format = "human" if fmt is None else fmt
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -1627,6 +1666,7 @@ def main(argv: list[str] | None = None) -> int:
     if func is None:  # pragma: no cover - argparse enforces a subcommand
         parser.print_help()
         return EXIT_ERROR
+    _apply_config_logging(args)
     result: int = func(args)
     return result
 

@@ -110,6 +110,18 @@ answer:
   temperature: 0.1
   timeout_seconds: 60
 
+# Short-log + per-job verbose-log configuration. Source of truth for detached
+# worker runs; the --log-level / --log-format CLI flags override these for a
+# single interactive invocation.
+#   level:           one of DEBUG, INFO, WARNING, ERROR (default INFO)
+#   format:          human or json (default human) — the short log's line format
+#   job_log_retention: max per-job failure logs kept under <state_root>/job_logs
+#                      (oldest pruned first); default 500
+logging:
+  level: INFO
+  format: human
+  job_log_retention: 500
+
 # Sentinel files that must exist to prove each mount is present. A missing mount
 # must never cause scans or writes to an empty fallback directory.
 mount_sentinels:

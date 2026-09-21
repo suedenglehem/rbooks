@@ -1607,6 +1607,46 @@ ships green during the full-run window.
   relaunch: 294 jobs pending, 1 stale running (reclaimed at
   startup reconcile), 6799 succeeded.
 
+### Slice 8 — logging configuration in the config file (operator ask)
+- [DONE 2026-09-21] **Committed, pushed to origin/master.** The
+  operator proposed a `logging:` section and it was missing from
+  config.yaml; the CLI flags were the only knobs, so a detached
+  nohup worker run had no persistent way to steer logging.
+  - `LoggingSettings` in config.py (`level: "INFO"`,
+    `format: "human"`, `job_log_retention: 500`) + a
+    `Config.logging` field with defaults — existing configs keep
+    working unchanged. Validators: level normalized to uppercase,
+    only DEBUG/INFO/WARNING/ERROR; format only 'human'/'json';
+    retention >= 1 — all raise `ConfigError` with a
+    `logging.<key>` prefix, and `load_config`'s tail re-raises
+    ConfigError unwrapped so the field names surface verbatim.
+  - Precedence **explicit flag > config > built-in default**:
+    `--log-level`/`--log-format` now default to None;
+    `main()` calls `_apply_config_logging(args)` after
+    parse_args and before dispatch — best-effort `load_config`
+    (a missing/invalid config never blocks; the handlers'
+    `_require_config` reports the real error) that fills only the
+    None slots, defaulting to INFO/human. All ~30 existing
+    `setup_logging(args.log_level, args.log_format)` call sites are
+    untouched; resolution happens before any handler is set up,
+    honoring setup_logging's fix-the-formatter-on-first-call
+    constraint. The resolved level also feeds
+    `uvicorn.run(..., log_level=...)`.
+  - The failure-log retention cap is now config-driven: the
+    worker's `prune_job_logs(..., limit=cfg.logging.job_log_retention)`
+    (was a hardcoded 500).
+  - `logging:` block documented in config.example.yaml (per-key
+    comments) and added to the live config.yaml.
+- **Gate (2026-09-21, real output):** ruff "All checks passed!",
+  mypy "Success: no issues found in 46 source files", pytest
+  **457 passed in 59.34s** (451 baseline + 6 new).
+- What the tests pin: defaults (INFO/human/500); a config without
+  a logging section gets the built-in defaults; lowercase levels
+  normalize to uppercase; invalid level/format/retention raise
+  ConfigError naming `logging.<key>`; a YAML file with
+  `logging: debug/json/42` loads to DEBUG/json/42; a YAML file
+  with `level: LOUD` raises ConfigError.
+
 ### Next unfinished task
 1. [DONE 2026-09-21] Slice 7 safe revision replacement +
    generation migration committed 153ebcf, pushed.
@@ -1614,5 +1654,11 @@ ships green during the full-run window.
    complete (discovery, safe revision replacement, explicit removal,
    generation migration, GC with reference checks, backup/restore,
    coverage reports) plus the line 183 runbook gate.
-3. Parallel track: batch-2 drain (worker relaunched 02:43 after the
-   02:17 reboot) → full-library launch (see M6 next-task item 1-2).
+3. Parallel track: batch-2 drain — worker relaunched 02:43 after the
+   02:17 reboot (pid 13396; alive at 03:20 session end). At 03:20:
+   11,195 embedding batches committed (~280/min since 02:48), 88,203
+   chunks, 7,093 succeeded / 272 pending / 1 running / 0 failed,
+   22 active publications (publish stage now flowing).
+   Drain-completion poller was alive at session end (pid 15424) but
+   harness watchers die with the session — re-arm on resume. →
+   full-library launch (see M6 next-task item 1-2).

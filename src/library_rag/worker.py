@@ -1206,7 +1206,10 @@ def run_worker(
                 or (row["state"] == "retryable_failed" and bool(row["error_category"]))
             )
             if keep:
-                prune_job_logs(cfg.paths.state_root / "job_logs")
+                prune_job_logs(
+                    cfg.paths.state_root / "job_logs",
+                    limit=cfg.logging.job_log_retention,
+                )
             else:
                 job_log.unlink(missing_ok=True)
             if handled:
