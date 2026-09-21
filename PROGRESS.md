@@ -1654,11 +1654,43 @@ ships green during the full-run window.
    complete (discovery, safe revision replacement, explicit removal,
    generation migration, GC with reference checks, backup/restore,
    coverage reports) plus the line 183 runbook gate.
-3. Parallel track: batch-2 drain — worker relaunched 02:43 after the
-   02:17 reboot (pid 13396; alive at 03:20 session end). At 03:20:
-   11,195 embedding batches committed (~280/min since 02:48), 88,203
-   chunks, 7,093 succeeded / 272 pending / 1 running / 0 failed,
-   22 active publications (publish stage now flowing).
-   Drain-completion poller was alive at session end (pid 15424) but
-   harness watchers die with the session — re-arm on resume. →
-   full-library launch (see M6 next-task item 1-2).
+3. Parallel track: batch-2 drain.
+   - Timeline: worker 13396 relaunched 02:43 after the 02:17 reboot;
+     published 32 revisions (03:13:10–03:53) before the ~13:00 reboot
+     killed it (and the pid 15424 poller) and wiped /tmp — the batch2
+     config died with it. Config reconstructed from the pilot-sandbox
+     template with the five writable roots re-pointed under
+     batch2-sandbox/ (`batch2-sandbox/scratch/config.sandbox.yaml`);
+     drift-sensitive values (embedding revision/model/dimensions/dtype/
+     normalize, chunking, normalization, `stats_epoch: frozen`)
+     verified against the state DB's stored chunk_fingerprint /
+     embedding_sha before relaunch. Worker relaunched 13:56:54
+     (pid 24313).
+   - **262→522 pending-publish anomaly — explained, benign.** The
+     frozen corpus-stats epoch (stats_sha 8ce63e34…, 8 chunks from the
+     first published book) was computed and committed at 03:13:10 —
+     the sandbox's first publish. Every publish job enqueued before
+     then carried the `"init"` hint (record absent; correct by
+     construction): 55 created 01:54:34–02:55:14, of which 32 ran to
+     success 03:13–03:53, and 239 created 02:52:02–03:13:09 left
+     pending when the ~13:00 reboot hit. At the 13:56 relaunch,
+     `_reconcile_index` found 262 gap revisions (no staged/active
+     publication, full embed evidence) and enqueued 262 fresh publish
+     jobs 13:57:00–02 with the frozen hint — different task key, so
+     both families coexist per revision (the 262→522 jump). Under
+     `stats_epoch: frozen` the drain is O(N) and convergent: all
+     generations already share the one frozen epoch,
+     `_corpus_stats_for_publish` reuses the pinned epoch,
+     `_enqueue_epoch_republishes` finds no mismatches (no fan-out),
+     and the redundant jobs no-op ("already current") when they run.
+   - Snapshot 14:13 (atomic, single WAL read): 469 pending / 1
+     running / 7,158 succeeded / 0 failed; 87 active publications
+     (= 87 succeeded publish jobs, all init-hint; 32 pre-relaunch +
+     55 post-relaunch, ~3.4/min); live publish lock
+     `publish-b760one-24319`. Consistency: exactly 5 active revs have
+     no publish job, all with 0 chunks / 0 embedding batches
+     (legitimately nothing to publish). **Expected clean end state:
+     295 active publications, 0/0/0 jobs.**
+   - Drain-completion poller re-armed (Bash run_in_background, 60s
+     poll, 30-min heartbeats, 6h cap, exits on 0/0/0). →
+     full-library launch (see M6 next-task item 1-2).
