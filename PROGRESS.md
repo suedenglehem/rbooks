@@ -44,6 +44,27 @@ and missing tesseract cleanly).
 - Minor: `detect_cpu` reports physical cores as 1 on this host (the /proc/cpuinfo
   physical-id parse falls back); cosmetic, non-gating — tracked for M0 polish.
 
+### ePUB "Open book" addendum (2026-09-22 evening)
+- Operator report: "'open book' works with pdf, and doesn't
+  work on epub". Root cause: `openReaderFor` opened
+  `m.units[0]`, and for ALL 82 pilot ePUBs position 0 is the
+  cover XHTML section — char_count 0, payload paragraphs [],
+  html a bare `<img>` whose archive-relative src the browser
+  cannot resolve → blank pane (live-confirmed on an ePUB test
+  rev via `GET /books/{rev}`). DB proof of the asymmetry:
+  zero-text-first units are epub 82/82 vs pdf 9/210; PDFs were
+  unaffected because pages render from the source PDF even
+  without a text layer. Fix (8378a45): open the first unit
+  that is a page or carries text (`kind === "page" ||
+  char_count > 0`), falling back to `units[0]` if no unit has
+  text — only textless sections are skipped, so a textless-
+  cover PDF still opens page 1. Live check after the rebuild:
+  same ePUB rev, old pick `cover.html` (0 chars) → new pick
+  `frontmatter.html` (1621 chars). Bundle index-DdRxYc1o.js;
+  the operator must hard-refresh the browser (Ctrl/Cmd+Shift+R)
+  — serve reads web/dist from disk, no restart. Gate: 507
+  passed, ruff + mypy clean.
+
 ### Next unfinished task
 - Begin M1: catalog + identities, source archive (content-addressed),
   job table with SQLite-claimed leases + token fencing, artifact commit
