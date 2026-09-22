@@ -515,6 +515,12 @@ export class App {
         el("span", { class: "evidence-src" }, ev.source_title),
         el("span", { class: "muted small" }, `${locationLabel(ev.location)} · ${ev.format}`),
         el("span", { class: "spacer" }),
+        // Operator ask: open this book's stored summary (M8 resume) in the
+        // Resumes view, next to the Google button.
+        button("Summary", "btn small", () => {
+          this.showView("resumes");
+          void this.openResume(ev.rev_id, ev.source_title);
+        }),
         // Operator ask: search the reference title in Google, far right of
         // the line (new tab; the title goes in the query verbatim).
         button("Google", "btn small", () => {
@@ -962,7 +968,16 @@ export class App {
       text.scrollTop = 0;
     } catch (e) {
       this.handleApiError(e);
-      this.set("resume-msg", errText(e));
+      // A missing resume (HTTP 404) is normal while the backfill runs: say so
+      // plainly and clear the previous book's text instead of leaving it
+      // under the error.
+      const msg =
+        e instanceof ApiError && e.status === 404
+          ? "No summary stored for this book yet."
+          : errText(e);
+      this.set("resume-title", fallbackTitle);
+      this.set("resume-msg", msg);
+      this.root.querySelector<HTMLElement>("#resume-text")!.textContent = "";
     }
   }
 
