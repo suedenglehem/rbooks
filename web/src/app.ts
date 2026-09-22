@@ -666,13 +666,18 @@ export class App {
     return p;
   }
 
-  /** Make sure the reader shows something from *rev* (page 1 / first section). */
+  /** Make sure the reader shows something from *rev* (page 1 / first section with text). */
   private async openReaderFor(rev: string): Promise<boolean> {
     const m = await this.manifestFor(rev);
     if (!m) return false;
     const s = this.reader.state();
     if (s.revId === rev && s.kind !== "unavailable") return true;
-    const first = m.units[0];
+    // An ePUB's unit 0 is almost always the cover section: zero text, and an
+    // <img> whose archive-relative src the browser cannot resolve — so opening
+    // it renders a blank pane (82/82 pilot ePUBs look like this). Pages are
+    // always visible (rendered from the source PDF), so skip only textless
+    // sections; fall back to the first unit if none carries text.
+    const first = m.units.find((u) => u.kind === "page" || u.char_count > 0) ?? m.units[0];
     if (!first) {
       this.readerStatus("This book has no readable units yet.");
       return false;
