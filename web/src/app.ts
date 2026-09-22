@@ -965,19 +965,30 @@ export class App {
       this.set("resume-meta", `${rec.word_count} words · ${rec.model_revision} · ${rec.prompt_version}`);
       const text = this.root.querySelector<HTMLElement>("#resume-text")!;
       text.textContent = rec.text;
+      text.classList.remove("muted");
       text.scrollTop = 0;
     } catch (e) {
       this.handleApiError(e);
-      // A missing resume (HTTP 404) is normal while the backfill runs: say so
-      // plainly and clear the previous book's text instead of leaving it
-      // under the error.
-      const msg =
-        e instanceof ApiError && e.status === 404
-          ? "No summary stored for this book yet."
-          : errText(e);
+      // A missing resume (HTTP 404) is normal while the backfill runs: say
+      // so plainly — in the pane the user is looking at, not just in the
+      // small search-status line — and never leave the previous book's meta
+      // claiming a word count over an empty text area.
+      const missing = e instanceof ApiError && e.status === 404;
+      const msg = missing
+        ? "No summary stored for this book yet — the résumé backfill is " +
+          "still running. Use Open book to read the book itself in the meantime."
+        : errText(e);
+      // Still point resumeState at the clicked book: it exists even when its
+      // resume has not been generated yet, so "Open book" must open *this*
+      // book, not the previously loaded one (or nothing).
+      this.resumeState = { rev: revId, title: fallbackTitle };
       this.set("resume-title", fallbackTitle);
+      this.set("resume-meta", "");
       this.set("resume-msg", msg);
-      this.root.querySelector<HTMLElement>("#resume-text")!.textContent = "";
+      const text = this.root.querySelector<HTMLElement>("#resume-text")!;
+      text.textContent = msg;
+      text.classList.toggle("muted", missing);
+      text.scrollTop = 0;
     }
   }
 
@@ -989,6 +1000,10 @@ export class App {
     }
     this.showView("research");
     this.showReaderPane();
+    // Opening a PDF fetches the whole archived source first, which can take
+    // a few seconds — say we are on it so the click never looks dead.
+    // openReaderFor's specific failure messages overwrite this.
+    this.readerStatus(`Opening "${st.title}" …`);
     if (await this.openReaderFor(st.rev)) void this.reader.refresh();
   }
 }
