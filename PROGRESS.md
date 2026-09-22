@@ -2102,16 +2102,41 @@ touching stored resumes until the new one succeeds.
   unchanged by the fix.
 - One `permanent_failed` resume: a single-chunk book that
   generated 99 words (< the 100-word floor, `resume_too_short`)
-  — by design non-transient; operator can bump
-  `resume.max_tokens` and `retry --include-permanent`, or leave
-  that one book without a resume.
+  — by design non-transient. Superseded by the floor change
+  below: at the new 20-word floor that 99-word generation is a
+  valid résumé, so the book now needs
+  `library-rag retry --include-permanent` (it will NOT auto-retry
+  on worker restart: `Jobs.enqueue` is `INSERT OR IGNORE` on the
+  task key, so the permanent_failed row stays put until an
+  explicit retry resets it) once the worker is back on the new
+  code.
+
+### Floor addendum (2026-09-22, operator testing)
+- Operator ask: "i can't accept a book without resumé just cuz
+  it's under 100 words, the floor must be 20 words" —
+  `MIN_RESUME_WORDS` lowered 100 → 20 (6d086c2). The 700–1000
+  word prompt target in `build_resume_messages` is unchanged;
+  only a genuinely truncated generation (< 20 words) now
+  permanently fails with `resume_too_short`, and single-chunk
+  micro-books get short summaries instead of no résumé. The
+  worker's failure message already interpolated the constant (no
+  second edit point). New two-sided regression test in
+  `tests/test_resumes.py` (19 words → permanent_failed + nothing
+  stored; 21 words → succeeded + stored); gate 507 passed,
+  ruff + mypy clean.
 
 ### Next unfinished task
-- Finish the pilot resume backfill (~191 left at this write,
-  ~44 s/job). On completion: `uv run library-rag stop
-  --config <sandbox config>`, relaunch serve on 8100 (serves
-  index-CukkH7fb.js live from disk), smoke `/health` + `/ready`
-  + `POST /resumes/search`, report final counts.
+- Finish the pilot resume backfill (worker stopped for the
+  operator's Summary-button test at ~171 left, ~44 s/job; 119
+  stored + 1 in-flight-at-stop). Sequence on the operator's
+  "done testing": stop serve (8100), relaunch the worker with
+  `--allow-version-mismatch` (the floor change bumped the version
+  hash), run `retry --include-permanent` for the 99-word book.
+  On completion: `uv run library-rag stop --config <sandbox
+  config>`, relaunch serve on 8100 (serves index-CukkH7fb.js
+  live from disk), smoke `/health` + `/ready` +
+  `POST /resumes/search`, report final counts (~292 succeeded /
+  0 failed).
 - Full-library launch remains held on the user's explicit
   approval (M7 §5); M8 adds the `resume` stage to that run
   automatically via the publish hook.
