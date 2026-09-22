@@ -121,6 +121,45 @@ def test_resume_generation_end_to_end(state_db: Database, base_config: Config) -
     assert [h["rev_id"] for h in hits] == ["revR"]
 
 
+def test_resume_floor_is_twenty_words(state_db: Database, base_config: Config) -> None:
+    # The floor is 20, not the 700-1000 prompt target: tiny books can only
+    # yield short summaries, so 21 words is a résumé and 19 words is a
+    # truncated generation that must fail (and store nothing).
+    base_config.answer.fake = True
+    q = _published(state_db, base_config, doc="docF", rev="revF", run="runF")
+    assert enqueue_missing_resumes(state_db, base_config) == 1
+    run_worker(
+        state_db, base_config, once=True, poll_delay=0,
+        qdrant=q, embedder=FakeEmbedder(base_config.embedding.dimensions),
+        model=FakeAnswerModel(["word " * 19]),
+    )
+    row = state_db.query_one("SELECT * FROM jobs WHERE input_id = 'revF'")
+    assert row is not None
+    assert row["state"] == "permanent_failed"
+    assert row["error_category"] == "resume_too_short"
+    assert get_resume(state_db, "revF") is None
+
+    _published(state_db, base_config, doc="docF2", rev="revF2", run="runF2")
+    # Reports both revs (the failed one has no stored resume either), but
+    # enqueue is INSERT OR IGNORE — revF's row stays permanent_failed and
+    # only revF2 lands as a new pending job.
+    assert enqueue_missing_resumes(state_db, base_config) == 2
+    assert state_db.query_one(
+        "SELECT COUNT(*) AS n FROM jobs WHERE stage = 'resume' AND state = 'pending'"
+    )["n"] == 1
+    run_worker(
+        state_db, base_config, once=True, poll_delay=0,
+        qdrant=q, embedder=FakeEmbedder(base_config.embedding.dimensions),
+        model=FakeAnswerModel(["word " * 21]),
+    )
+    row2 = state_db.query_one("SELECT * FROM jobs WHERE input_id = 'revF2'")
+    assert row2 is not None
+    assert row2["state"] == "succeeded"
+    rec = get_resume(state_db, "revF2")
+    assert rec is not None
+    assert rec["word_count"] == 21
+
+
 # --- enqueue backfill ------------------------------------------------------------
 
 

@@ -41,7 +41,9 @@ __all__ = [
 
 # A resume shorter than this is a truncated generation, not a summary; the
 # job fails permanently so the operator bumps resume.max_tokens and retries.
-MIN_RESUME_WORDS = 100
+# 20, not the 700-1000 prompt target: tiny (single-chunk) books can only
+# yield short summaries, and a 20-word resume beats no resume at all.
+MIN_RESUME_WORDS = 20
 
 # Job states that still count as "work in flight" for the enqueue idempotency
 # check (mirrors jobs._NOT_TERMINAL).
