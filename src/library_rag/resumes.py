@@ -119,10 +119,13 @@ def sample_resume_input(db: Database, run_id: str, *, char_budget: int) -> str:
     parts = [head]
     if len(texts) > 2:
         mid_budget = char_budget - len(head) - end_budget
+        # _even_indices(3) is [] — with exactly three chunks there is no
+        # middle between head and tail, so guard before the division.
         indices = _even_indices(len(texts))
-        per = max(128, mid_budget // len(indices))
-        for i in indices:
-            parts.append(texts[i][:per])
+        if indices:
+            per = max(128, mid_budget // len(indices))
+            for i in indices:
+                parts.append(texts[i][:per])
     if len(texts) > 1:
         parts.append(texts[-1][-end_budget:])
     return "\n\n".join(parts)[:char_budget]

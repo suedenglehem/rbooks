@@ -230,6 +230,25 @@ def test_sample_resume_input_uses_head_middle_tail(
     assert sample_resume_input(state_db, "no-such-run", char_budget=10_000) == ""
 
 
+def test_sample_resume_input_tiny_books_do_not_crash(
+    state_db: Database, base_config: Config
+) -> None:
+    # Regression: a run with exactly three chunks killed the worker —
+    # _even_indices(3) is [] and the mid budget was divided by len([]).
+    # Books with one, two, or three chunks degrade to head/tail instead.
+    base_config.embedding.fake = True
+    q = FakeQdrant(base_config.embedding.dimensions)
+    for n, run in ((1, "runT1"), (2, "runT2"), (3, "runT3")):
+        publish_handbuilt(
+            state_db, base_config, q,
+            doc_id=f"docT{n}", rev_id=f"revT{n}", run_id=run,
+            texts=_CHUNKS[:n], title="Tiny Book",
+        )
+        sample = sample_resume_input(state_db, run, char_budget=10_000)
+        assert sample, f"{n}-chunk run produced an empty sample"
+        assert _CHUNKS[0][:4] in sample
+
+
 # --- config ------------------------------------------------------------------------
 
 
