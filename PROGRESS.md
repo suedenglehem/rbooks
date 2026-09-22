@@ -2081,10 +2081,37 @@ durable and gated (`resume.enabled: false` skips it entirely), and
 re-chunking / a prompt-version bump mints fresh jobs without
 touching stored resumes until the new one succeeds.
 
+### Post-verification addendum (2026-09-22 evening)
+- Operator verdict on the web UI: passed ("it was fine"). A
+  "Summary" button was then added to every evidence line in the
+  answer pane (left of the Google button) opening that book's
+  stored resume in the Resumes view, with a graceful
+  "No summary stored for this book yet." on the 404 that is
+  normal while the backfill runs (a87df16, bundle
+  index-CukkH7fb.js).
+- The pilot backfill (worker up, serve down for the local-Qdrant
+  lock) crashed at 100/292 on a `ZeroDivisionError` in
+  `sample_resume_input`: a 3-chunk book makes `_even_indices(3)`
+  return `[]`, and the mid budget was divided by `len([])`.
+  Fixed (guard: degrade to head+tail when there is no middle)
+  with a 1/2/3-chunk regression test, gate 506 passed
+  (ee1f497). The cross-version guard then held the 192
+  remaining jobs (enqueued under the pre-fix hash) until the
+  worker was relaunched with `--allow-version-mismatch` — the
+  documented confirm-after-upgrade flow; job semantics were
+  unchanged by the fix.
+- One `permanent_failed` resume: a single-chunk book that
+  generated 99 words (< the 100-word floor, `resume_too_short`)
+  — by design non-transient; operator can bump
+  `resume.max_tokens` and `retry --include-permanent`, or leave
+  that one book without a resume.
+
 ### Next unfinished task
-- Operator web-UI test of the Resumes tab (serve is up on 8100
-  with the new bundle; the backfill is paused while serve holds
-  the local-Qdrant lock — relaunch the worker after the test).
+- Finish the pilot resume backfill (~191 left at this write,
+  ~44 s/job). On completion: `uv run library-rag stop
+  --config <sandbox config>`, relaunch serve on 8100 (serves
+  index-CukkH7fb.js live from disk), smoke `/health` + `/ready`
+  + `POST /resumes/search`, report final counts.
 - Full-library launch remains held on the user's explicit
   approval (M7 §5); M8 adds the `resume` stage to that run
   automatically via the publish hook.
