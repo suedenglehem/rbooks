@@ -40,6 +40,7 @@ __all__ = [
     "STAGE_EXTRACT",
     "STAGE_OCR",
     "STAGE_PUBLISH",
+    "STAGE_RESUME",
     "ScanReport",
     "detect_format",
     "iter_candidate_paths",
@@ -53,6 +54,7 @@ STAGE_OCR = "ocr"
 STAGE_CHUNK = "chunk"
 STAGE_EMBED = "embed"
 STAGE_PUBLISH = "publish"
+STAGE_RESUME = "resume"
 
 _CANDIDATE_SUFFIXES = {".pdf", ".epub"}
 

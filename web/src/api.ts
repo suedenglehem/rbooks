@@ -162,6 +162,7 @@ export interface IngestStatus {
   revisions: number;
   chunks: number;
   answers: number;
+  resumes: number;
 }
 
 export interface ScanReport {
@@ -176,6 +177,25 @@ export interface ScanReport {
   missing: unknown[];
   changed_during_scan: unknown[];
   jobs_enqueued: number;
+}
+
+export interface ResumeSummary {
+  rev_id: string;
+  doc_id: string;
+  title: string;
+  score: number; // bm25: lower is better
+  excerpt: string;
+}
+
+export interface ResumeRecord {
+  rev_id: string;
+  doc_id: string;
+  title: string | null;
+  text: string;
+  word_count: number;
+  model_revision: string;
+  prompt_version: string;
+  updated_at: number;
 }
 
 // --- token ------------------------------------------------------------------
@@ -303,6 +323,10 @@ export const api = {
     return await res.arrayBuffer();
   },
 
+  searchResumes: (query: string, limit = 20) =>
+    request<{ results: ResumeSummary[] }>("/resumes/search", post("/resumes/search", { query, limit })),
+  resume: (revId: string) =>
+    request<ResumeRecord>(`/resumes/${encodeURIComponent(revId)}`),
   ingestStatus: () => request<IngestStatus>("/ingest/status"),
   scan: () => request<{ reports: ScanReport[] }>("/scan", post("/scan", {})),
   ingestPause: (reason: string) =>

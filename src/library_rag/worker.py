@@ -46,6 +46,7 @@ import os
 import time
 from collections.abc import Callable
 from functools import partial
+from pathlib import Path
 from typing import Any
 
 import pymupdf
@@ -96,9 +97,20 @@ from .indexing import (
     release_publish_lock,
 )
 from .jobs import VERSION_ACK_KEY, Claimed, Jobs, StaleLeaseError, VersionGateError
+from .llm import AnswerModel, AnswerModelError, AnswerModelUnavailableError
 from .log import JobLogCapture, get_logger, log_event, prune_job_logs
 from .normalization import normalize_unit, unit_removed_ranges
-from .scan import STAGE_CHUNK, STAGE_EMBED, STAGE_EXTRACT, STAGE_OCR, STAGE_PUBLISH
+from .resumes import (
+    MIN_RESUME_WORDS,
+    build_resume_messages,
+    enqueue_missing_resumes,
+    make_resume_model,
+    resume_input_version,
+    resume_task_key,
+    sample_resume_input,
+    store_resume,
+)
+from .scan import STAGE_CHUNK, STAGE_EMBED, STAGE_EXTRACT, STAGE_OCR, STAGE_PUBLISH, STAGE_RESUME
 from .versioning import short_version, software_version
 
 __all__ = [
@@ -1019,6 +1031,7 @@ def _run_publish(
             return True
         if result == "published":
             _enqueue_epoch_republishes(db, cfg, jobs, rev_id)
+            _enqueue_resume(db, cfg, jobs, rev_id, run_id)
         log_event(
             log, logging.DEBUG, "publish: done",
             job_id=job.job_id, rev_id=rev_id, result=result,
@@ -1074,6 +1087,133 @@ def _enqueue_epoch_republishes(db: Database, cfg: Config, jobs: Jobs, rev_id: st
             input_id=other["rev_id"],
             input_version=version,
         )
+
+
+def _enqueue_resume(db: Database, cfg: Config, jobs: Jobs, rev_id: str, run_id: str) -> None:
+    """Start the just-published book's resume (gated exactly like the
+    reconcile path: feature on and an answer model configured). Idempotent
+    on the task key — an already-settled resume job is never re-enqueued.
+    """
+    if not cfg.resume.enabled or not cfg.answer.is_configured:
+        return
+    jobs.enqueue(
+        resume_task_key(cfg, rev_id, run_id),
+        STAGE_RESUME,
+        input_id=rev_id,
+        input_version=resume_input_version(cfg, run_id),
+    )
+
+
+def _run_resume(
+    db: Database,
+    cfg: Config,
+    jobs: Jobs,
+    job: Claimed,
+    lease_ttl: float,
+    model: AnswerModel | None,
+) -> bool:
+    """Generate and store the revision's extended summary (M8).
+
+    ``input_version`` is ``<prompt_version>:<run_id>``; the run is fixed at
+    enqueue time, so a re-chunk cannot swap the source text mid-flight. The
+    model is the *answer* model with ``cfg.resume`` generation parameters
+    (see :func:`make_resume_model`); *model* is the injectable test seam.
+    """
+    rev_id = job.input_id or ""
+    rev = db.query_one(
+        "SELECT rev_id, doc_id, is_active, first_path FROM source_revisions WHERE rev_id = ?",
+        (rev_id,),
+    )
+    if rev is None:
+        jobs.fail(job, "missing_source", f"revision {rev_id} not in catalog", transient=False)
+        return True
+    if not rev["is_active"]:
+        log_event(log, logging.DEBUG, "resume: noop (rev inactive)", job_id=job.job_id, rev_id=rev_id)
+        jobs.succeed(job, json.dumps({"rev_id": rev_id, "result": "noop"}, sort_keys=True))
+        return True
+    _, _, run_id = (job.input_version or "").partition(":")
+    run = db.query_one(
+        "SELECT run_id FROM extraction_runs WHERE run_id = ? AND state = 'succeeded'",
+        (run_id,),
+    )
+    if run is None:
+        log_event(log, logging.DEBUG, "resume: deferred (run not settled)", job_id=job.job_id, rev_id=rev_id)
+        jobs.defer(job)  # the run is still extracting (or was never enqueued settled)
+        return True
+    if model is None:
+        model = make_resume_model(cfg)
+    if model is None:
+        jobs.fail(
+            job, "answer_model_not_configured",
+            "no answer model configured for resume generation", transient=False,
+        )
+        return True
+    title = Path(str(rev["first_path"])).stem
+    sample = sample_resume_input(db, str(run_id), char_budget=cfg.resume.input_char_budget)
+    if not sample:
+        jobs.fail(job, "no_sample_text", f"run {run_id} has no chunk text to summarize", transient=False)
+        return True
+    log_event(
+        log, logging.DEBUG, "resume: start",
+        job_id=job.job_id, rev_id=rev_id, run_id=run_id, model=model.model_revision,
+    )
+    try:
+        jobs.heartbeat(job, lease_ttl)  # keep the lease alive across the long generation
+        text = model.complete(build_resume_messages(title, sample))
+    except StaleLeaseError:
+        return False
+    except AnswerModelUnavailableError as exc:
+        log_event(log, logging.DEBUG, "resume: model unavailable", job_id=job.job_id, rev_id=rev_id, detail=str(exc))
+        jobs.fail(job, "answer_model_unavailable", str(exc), transient=True)
+        return True
+    except AnswerModelError as exc:
+        log_event(log, logging.DEBUG, "resume: model error", job_id=job.job_id, rev_id=rev_id, detail=str(exc))
+        jobs.fail(job, "answer_model_error", str(exc), transient=False)
+        return True
+    text = text.strip()
+    if len(text.split()) < MIN_RESUME_WORDS:
+        jobs.fail(
+            job, "resume_too_short",
+            f"generated {len(text.split())} words (< {MIN_RESUME_WORDS}); "
+            "bump resume.max_tokens and retry with --include-permanent",
+            transient=False,
+        )
+        return True
+    word_count = store_resume(
+        db,
+        rev_id=rev_id,
+        doc_id=str(rev["doc_id"]),
+        run_id=str(run_id),
+        title=title,
+        text=text,
+        model_revision=model.model_revision,
+        prompt_version=cfg.resume.prompt_version,
+    )
+    log_event(
+        log, logging.DEBUG, "resume: done",
+        job_id=job.job_id, rev_id=rev_id, run_id=run_id, word_count=word_count,
+    )
+    try:
+        jobs.succeed(
+            job, json.dumps({"rev_id": rev_id, "run_id": run_id, "word_count": word_count}, sort_keys=True)
+        )
+    except StaleLeaseError:
+        return False  # lost the lease mid-generation; the store upserts, so a re-run converges
+    return True
+
+
+def _reconcile_resumes(db: Database, cfg: Config) -> int:
+    """Close the M8 resume gap on worker start (durable, idempotent).
+
+    Every published active revision without a stored resume gets a resume
+    job — the durable answer to the window between a publish job succeeding
+    and the resume job being enqueued (a crash in between). Returns the
+    number of jobs enqueued (0 when every publication has its resume).
+    """
+    enqueued = enqueue_missing_resumes(db, cfg)
+    if enqueued:
+        log_event(log, logging.DEBUG, "reconcile: resume jobs enqueued", enqueued=enqueued)
+    return enqueued
 
 
 def _reconcile_chunks(db: Database, cfg: Config) -> int:
@@ -1214,6 +1354,7 @@ def run_worker(
     reconcile_on_start: bool = True,
     qdrant: QdrantOps | None = None,
     embedder: Embedder | None = None,
+    model: AnswerModel | None = None,
 ) -> int:
     """Claim and run jobs until the queue is drained (*once*) or *stop_event*
     becomes true. Returns the number of jobs brought to a handled state
@@ -1231,7 +1372,9 @@ def run_worker(
     lock on the storage folder for its lifetime, so a second client in the
     same process is refused by its own first lock. The *embedder*, when None,
     is still built per job: it is a stateless HTTP client and holds nothing
-    that can leak.
+    that can leak. The *model* (answer model, resume stage) is likewise a
+    per-job seam: when None each resume job builds it from ``cfg.answer`` /
+    ``cfg.resume``.
 
     Per-job verbose logging: while a job runs, DEBUG records are captured to
     ``<state_root>/job_logs/<job_id>.attempt<N>.log`` in addition to the short
@@ -1251,6 +1394,7 @@ def run_worker(
         if reconcile_on_start:
             _reconcile_chunks(db, cfg)
             _reconcile_index(db, cfg)
+            _reconcile_resumes(db, cfg)
             try:
                 if qdrant.ping():
                     reconcile_publications(db, cfg, qdrant)
@@ -1262,6 +1406,7 @@ def run_worker(
             STAGE_CHUNK: _run_chunk,
             STAGE_EMBED: partial(_run_embed, embedder=embedder),
             STAGE_PUBLISH: partial(_run_publish, qdrant=qdrant),
+            STAGE_RESUME: partial(_run_resume, model=model),
         }
         completed = 0
         while True:

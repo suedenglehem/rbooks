@@ -9,6 +9,8 @@ reader routes (``/books/...``) plus the research surface:
 * ``/answer`` — cited answering with the persisted frozen evidence manifest;
 * ``/answers`` / ``/answers/{id}`` / ``/answers/{id}/citations/{evidence_id}``
   — the answer history and snapshot-based citation resolution;
+* ``/resumes/search`` and ``/resumes/{rev_id}`` — bm25 keyword search over the
+  stored per-book summaries (M8) and a single resume's full record;
 * ``/scan`` and ``/ingest/...`` — the ingestion dashboard controls
   (status, pause, resume, retry, rescan).
 
@@ -48,6 +50,7 @@ from .jobs import Jobs
 from .llm import AnswerModel
 from .reader import active_run
 from .reader import create_app as create_reader_app
+from .resumes import get_resume, search_resumes
 from .retrieval import IndexUnavailableError, Passage, search
 from .scan import scan_roots
 
@@ -89,6 +92,11 @@ class PauseRequest(BaseModel):
 
 class RetryRequest(BaseModel):
     include_permanent: bool = False
+
+
+class ResumeSearchRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=400)
+    limit: int = Field(default=20, ge=1, le=50)
 
 
 def find_web_dist() -> Path | None:
@@ -287,6 +295,19 @@ def create_app(
 
         return resolve_citation(db, cfg, Evidence.from_dict(entry))
 
+    # --- book resumes (M8) -------------------------------------------------------
+
+    @app.post("/resumes/search")
+    def do_resume_search(body: ResumeSearchRequest) -> dict[str, Any]:
+        return {"results": search_resumes(db, body.query, limit=body.limit)}
+
+    @app.get("/resumes/{rev_id}")
+    def one_resume(rev_id: str) -> dict[str, Any]:
+        data = get_resume(db, rev_id)
+        if data is None:
+            raise HTTPException(404, "no stored resume for this revision")
+        return data
+
     # --- ingestion dashboard ------------------------------------------------------
 
     def _status_data() -> dict[str, Any]:
@@ -301,6 +322,7 @@ def create_app(
             "revisions": _count(db, "SELECT COUNT(*) AS n FROM source_revisions"),
             "chunks": _count(db, "SELECT COUNT(*) AS n FROM chunks"),
             "answers": _count(db, "SELECT COUNT(*) AS n FROM answers"),
+            "resumes": _count(db, "SELECT COUNT(*) AS n FROM book_resumes"),
         }
 
     @app.get("/ingest/status")

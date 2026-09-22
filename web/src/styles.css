@@ -68,6 +68,11 @@ main > section {
   padding: 12px 16px 16px;
 }
 
+/* The author display rule above wins over the UA stylesheet's
+   [hidden] { display: none } in the cascade, so view toggling needs
+   its own explicit rule. */
+main > section[hidden] { display: none; }
+
 /* --- header ---------------------------------------------------------------- */
 
 .app-header {
@@ -499,6 +504,44 @@ table.jobs td.num { text-align: right; font-variant-numeric: tabular-nums; }
   word-break: break-word;
 }
 
+/* --- resumes view (M8) --------------------------------------------------------------- */
+
+#resume-query {
+  font: inherit;
+  flex: 1;
+  min-width: 0;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--ink);
+}
+
+#resume-results {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow: auto;
+  flex: 1;
+  min-height: 0;
+}
+
+.resume-hit { cursor: pointer; }
+.resume-hit:hover { border-color: var(--accent); }
+
+.resume-text {
+  flex: 1;
+  min-height: 120px;
+  overflow: auto;
+  white-space: pre-wrap;
+  font-size: 13px;
+  line-height: 1.55;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px;
+}
+
 /* --- narrow screens: tabs instead of compressed panes ---------------------------------- */
 
 @media (max-width: 979px) {
@@ -510,4 +553,8 @@ table.jobs td.num { text-align: right; font-variant-numeric: tabular-nums; }
   #view-research.show-reader .pane-reader { display: flex; }
 
   .pane-query > #results { min-height: 240px; }
+
+  #view-resumes .pane { display: flex; }
+  #resume-results { max-height: 40vh; }
+  .resume-text { max-height: 50vh; }
 }

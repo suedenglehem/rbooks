@@ -1973,3 +1973,118 @@ ships green during the full-run window.
    worker self-writes its pidfile → status verify → re-measure
    first-hour rate, ETA ~41–45 days at ~11–13 jobs/min). Do not
    start it without the user's explicit approval.
+
+## M8 — Extended per-book resumes + keyword search
+
+**Status: gate passed** (505 passed, ruff + mypy clean, dist guard
+green). Feature requested by the operator: an extended English
+summary (~700–1000 words) for every processed book, plus a web-UI
+tab that keyword-searches the stored resumes to find books related
+to a subject.
+
+### Delivered
+- `migrations.py` — M8: `book_resumes` (rev_id PK, doc_id, run_id,
+  title, text, word_count, model_revision, prompt_version,
+  created/updated) + `idx_resumes_doc` + standalone FTS5 table
+  `resumes_fts` (unicode61; bm25-ranked, lower score = better).
+- `config.py` — `ResumeSettings`: `enabled` (true), `max_tokens`
+  (2400), `temperature` (0.3), `timeout_seconds` (300),
+  `prompt_version` ("resume-v1"), `input_char_budget` (16000);
+  ConfigError on invalid values. Model identity always from
+  `cfg.answer`; generation params from `cfg.resume` (longer/looser
+  than cited answering). Documented in `config.example.yaml`.
+- `resumes.py` (new) — `make_resume_model` (LlamaCppAnswerModel
+  with the resume generation params; None when the answer model is
+  unconfigured → per-job `answer_model_not_configured`),
+  `sample_resume_input` (head + ≤16 evenly-spaced middle chunks +
+  tail of the run, bounded to the char budget, reading order),
+  `build_resume_messages` (prompt contract `resume-v1`),
+  `store_resume` (one transaction: FTS delete+reinsert + upsert;
+  returns word count), `enqueue_missing_resumes` (idempotent
+  reconcile/backfill over active revs with active publications,
+  keyed on the latest succeeded run; gated on
+  `resume.enabled and answer.is_configured`), `search_resumes`
+  (OR-of-quoted-terms FTS MATCH, bm25 rank, ~280-char excerpt),
+  `get_resume`.
+- `worker.py` + `scan.py` — `STAGE_RESUME = "resume"`;
+  `_run_resume` handler (run must exist + succeeded, else defer;
+  word count < `MIN_RESUME_WORDS` (100) → permanent
+  `resume_too_short` — operator bumps `resume.max_tokens` and
+  retries with `retry --include-permanent`; model errors →
+  transient/non-transient per the existing LLM error classes);
+  `_reconcile_resumes` reconcile pass; publish hook enqueues the
+  resume job for newly published revisions; `run_worker` gains the
+  `model` kwarg.
+- `api.py` — `POST /resumes/search`
+  (`ResumeSearchRequest(query 1..400, limit 1..50, default 20)`),
+  `GET /resumes/{rev_id}` (404 when none stored);
+  `/ingest/status` reports the `resumes` count.
+- `cli.py` — `library-rag resumes` backfill subcommand (prints the
+  enqueue count; `--json`).
+- `web/` — third top-level view "Resumes" (nav button alongside
+  Research/Ingestion): keyword search box (Enter or button) →
+  ranked result cards (rank + title + bm25 score + excerpt);
+  clicking a card fetches the full resume into the right pane
+  (word count / model / prompt version line) with an "Open book"
+  button that deep-links into the reader at page 1 / first
+  section. **Also fixed a pre-existing latent bug**: the author
+  rule `main > section { display:flex }` beats the UA stylesheet's
+  `[hidden]{display:none}` in the cascade, so the `hidden`
+  attribute was visually inert and both old views rendered
+  stacked; the new `main > section[hidden] { display: none }`
+  rule restores view toggling for all three views. Rebuilt bundle
+  **index-CZW7vhZI.js** + index-BHUCIYHa.css.
+
+### Test commands + results
+| Command                          | Result                            |
+| -------------------------------- | --------------------------------- |
+| `uv run ruff check src tests`    | All checks passed!                |
+| `uv run mypy src`                | Success: no issues found in 49 source files |
+| `uv run pytest`                  | 505 passed (496 → 505: 9 new)     |
+
+New tests (`tests/test_resumes.py`): M8 applies fresh + idempotent
+re-run; end-to-end generation through the real worker loop
+(durable job, scripted model, FTS mirror, title derivation,
+manifest); enqueue idempotency + both gates; search API with real
+bm25 ranking (dense-hit before sparse-hit, lower score better) +
+full record + 404/422; sampling head/middle/tail in reading order;
+ResumeSettings defaults + ConfigError on bad values.
+
+### Live pilot verification (2026-09-22, pilot-sandbox)
+- Pilot state DB migrated to schema v8 (online backup taken first,
+  under the sandbox scratch dir). `library-rag resumes` enqueued
+  **292** jobs (the pilot's 292 published revisions).
+- Worker (new code) processed them against the real vLLM
+  qwen3.8-27b: first landed resumes were 926 / 887 / 911 words —
+  in the 700–1000 band; all six measured so far are 887–1028
+  words and read as faithful, structured English summaries
+  (title/author/contents/arguments/significance).
+- `POST /resumes/search {"query": "drawing"}` returned ranked
+  results (two drawing-instruction books above a political book
+  that merely mentions "drawing"); `GET /resumes/{rev_id}` the
+  full record; `/ingest/status` reports `resumes: 6` at
+  snapshot time.
+- **Local-Qdrant constraint re-confirmed**: the embedded Qdrant
+  client is single-process — serve and the ingest worker cannot
+  run at once (second process fails with "Storage folder … already
+  accessed"). The pilot backfill is therefore paused while serve
+  holds the lock for the operator's web-UI test; the remaining
+  resume jobs are durable pending (286 at snapshot) and resume
+  from where they stopped once the worker is relaunched
+  (reconcile + idempotent enqueue).
+
+### Cost note (full library)
+~34,768 published revisions → ~34,768 resume LLM calls, serial on
+the single vLLM (one resume ≈ 15–30 s of generation at ~900
+tokens) → roughly **+3–5 days** on the full-run ETA. The stage is
+durable and gated (`resume.enabled: false` skips it entirely), and
+re-chunking / a prompt-version bump mints fresh jobs without
+touching stored resumes until the new one succeeds.
+
+### Next unfinished task
+- Operator web-UI test of the Resumes tab (serve is up on 8100
+  with the new bundle; the backfill is paused while serve holds
+  the local-Qdrant lock — relaunch the worker after the test).
+- Full-library launch remains held on the user's explicit
+  approval (M7 §5); M8 adds the `resume` stage to that run
+  automatically via the publish hook.

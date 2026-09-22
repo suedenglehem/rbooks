@@ -96,6 +96,7 @@ from .questions import (
 )
 from .reconcile import Mount, reconcile_catalog
 from .removal import RemovalError, remove_document, resolve_target
+from .resumes import enqueue_missing_resumes
 from .retrieval import IndexUnavailableError, search
 from .scan import scan_roots
 from .versioning import short_version, software_version
@@ -358,6 +359,24 @@ def _reconcile(args: argparse.Namespace) -> int:
             print(msg)
         print(f"pruned {report.pruned_aliases} stale alias(es); "
               f"deleted content: {report.deleted_content}")
+    return EXIT_OK
+
+
+def _resumes(args: argparse.Namespace) -> int:
+    setup_logging(args.log_level, args.log_format)
+    cfg = _require_config(args)
+    db = _open_state(cfg)
+    try:
+        # Backfill / gap-closer: one resume job per published revision that has
+        # no stored resume yet. The ingest worker then generates them; nothing
+        # is produced here (this command only touches the job queue).
+        enqueued = enqueue_missing_resumes(db, cfg)
+    finally:
+        db.close()
+    if args.json:
+        print(json.dumps({"enqueued": enqueued}, indent=2, sort_keys=True))
+    else:
+        print(f"enqueued {enqueued} resume job(s)")
     return EXIT_OK
 
 
@@ -1469,6 +1488,14 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile.add_argument("--config", help="path to config YAML")
     reconcile.add_argument("--json", action="store_true", help="emit the report as JSON")
     reconcile.set_defaults(_func=_reconcile)
+
+    resumes = sub.add_parser(
+        "resumes",
+        help="enqueue resume jobs for published revisions without a stored resume (M8)",
+    )
+    resumes.add_argument("--config", help="path to config YAML")
+    resumes.add_argument("--json", action="store_true", help="emit the report as JSON")
+    resumes.set_defaults(_func=_resumes)
 
     scan = sub.add_parser(
         "scan", help="discover PDFs/EPUBs, register source revisions, enqueue extraction (M2)"

@@ -9,8 +9,10 @@ M2 adds the pipeline slice it needs: ``scan_state`` (scan fast-check cache),
 ``extraction_runs`` and ``source_units``; M3 adds ``chunks``; M4 adds
 ``embedding_batches``, ``index_generations``, ``sparse_corpus_stats`` and
 ``publications``; M5 adds ``answers`` (cited answers with frozen evidence
-manifests). The point of the runner is that the schema *evolves*, so each
-milestone stays a minimal, independently-testable slice.
+manifests); M8 adds ``book_resumes`` (extended per-book summaries) with a
+standalone ``resumes_fts`` FTS5 table for ranked keyword search. The point of
+the runner is that the schema *evolves*, so each milestone stays a minimal,
+independently-testable slice.
 """
 
 from __future__ import annotations
@@ -333,6 +335,36 @@ _MIGRATION_0007: tuple[str, ...] = (
 )
 
 
+# Extended per-book summaries ("resumes"). One row per revision, upserted by
+# the ``resume`` job stage after publication; a standalone FTS5 table mirrors
+# the text so keyword search is ranked (bm25) without touching Qdrant. FTS5
+# stores its own copy (a few MB for the whole library) — deliberately simpler
+# than an external-content table, which would need manual delete-then-insert
+# sync commands on every regeneration.
+_MIGRATION_0008: tuple[str, ...] = (
+    """
+    CREATE TABLE book_resumes (
+        rev_id         TEXT PRIMARY KEY REFERENCES source_revisions(rev_id),
+        doc_id         TEXT NOT NULL REFERENCES documents(doc_id),
+        run_id         TEXT NOT NULL,
+        title          TEXT,
+        text           TEXT NOT NULL,
+        word_count     INTEGER NOT NULL,
+        model_revision TEXT NOT NULL,
+        prompt_version TEXT NOT NULL,
+        created_at     REAL NOT NULL,
+        updated_at     REAL NOT NULL
+    )
+    """,
+    "CREATE INDEX idx_resumes_doc ON book_resumes(doc_id)",
+    """
+    CREATE VIRTUAL TABLE resumes_fts USING fts5(
+        rev_id UNINDEXED, text, tokenize='unicode61'
+    )
+    """,
+)
+
+
 MIGRATIONS: list[Migration] = [
     Migration(1, "catalog_and_jobs", _MIGRATION_0001),
     Migration(2, "pipeline_tables", _MIGRATION_0002),
@@ -341,6 +373,7 @@ MIGRATIONS: list[Migration] = [
     Migration(5, "answers", _MIGRATION_0005),
     Migration(6, "publications_superseded_at", _MIGRATION_0006),
     Migration(7, "jobs_created_by_version", _MIGRATION_0007),
+    Migration(8, "book_resumes", _MIGRATION_0008),
 ]
 
 

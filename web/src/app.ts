@@ -1,6 +1,7 @@
 /**
  * Application shell (PRD §10): a two-pane research interface — query/answer
- * on the left, source reader on the right — plus an ingestion dashboard.
+ * on the left, source reader on the right — plus an ingestion dashboard and
+ * a resumes view (keyword search over the stored per-book summaries, M8).
  * Below 980px the panes collapse into Query/Reader tabs. No framework: plain
  * TypeScript building the DOM, talking to the same-origin research API.
  */
@@ -20,6 +21,7 @@ import type {
   EvidenceLocation,
   Passage,
   PassageSpan,
+  ResumeSummary,
   SearchResponse,
 } from "./api";
 import { Reader } from "./reader";
@@ -88,10 +90,13 @@ export class App {
   // whether bearer auth is enforced. The token widget (field + "Set" button)
   // is only ever shown while a token may be needed.
   private tokenRequired: boolean | null = null;
+  // The resume currently shown in the resumes view (rev + fallback title),
+  // so "Open book" knows which revision to deep-link into the reader.
+  private resumeState: { rev: string; title: string } | null = null;
 
   constructor(private root: HTMLElement) {
     root.innerHTML = "";
-    root.append(this.buildHeader(), el("main", {}, this.buildResearchView(), this.buildIngestView()));
+    root.append(this.buildHeader(), el("main", {}, this.buildResearchView(), this.buildIngestView(), this.buildResumeView()));
 
     const canvas = root.querySelector<HTMLCanvasElement>("#pdf-canvas");
     const epub = root.querySelector<HTMLElement>("#epub-host");
@@ -127,6 +132,7 @@ export class App {
     const views = el("nav", { class: "views" },
       this.navBtn("research", "Research"),
       this.navBtn("ingest", "Ingestion"),
+      this.navBtn("resumes", "Resumes"),
     );
     const tokenWrap = el("div", { class: "token", hidden: "true" },
       el("label", { class: "token-label" }, "API token",
@@ -146,7 +152,7 @@ export class App {
       el("span", { class: "dot-marker" }), label);
   }
 
-  private navBtn(view: "research" | "ingest", label: string): HTMLButtonElement {
+  private navBtn(view: "research" | "ingest" | "resumes", label: string): HTMLButtonElement {
     const b = el("button", { class: "view-btn", "data-view": view }, label);
     b.addEventListener("click", () => this.showView(view));
     return b;
@@ -264,6 +270,36 @@ export class App {
       ));
   }
 
+  private buildResumeView(): HTMLElement {
+    const query = el("input", {
+      type: "search",
+      id: "resume-query",
+      placeholder: "Keywords — e.g. lighthouse, thermodynamics, ledgers…",
+    });
+    query.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        void this.resumeSearch();
+      }
+    });
+    const left = el("div", { class: "pane" },
+      el("div", { class: "controls" }, query, button("Search", "btn primary", () => this.resumeSearch())),
+      el("div", { class: "ingest-msg", id: "resume-msg" }),
+      el("div", { id: "resume-results" }),
+    );
+    const right = el("div", { class: "pane" },
+      el("div", { class: "controls" },
+        el("h3", { class: "section-h", id: "resume-title" }, "No resume selected"),
+        el("span", { class: "spacer" }),
+        button("Open book", "btn", () => this.openResumeBook()),
+      ),
+      el("div", { class: "ingest-msg", id: "resume-meta" }),
+      el("div", { class: "resume-text", id: "resume-text" }),
+    );
+    return el("section", { id: "view-resumes", hidden: "true" },
+      el("div", { class: "research-grid" }, left, right));
+  }
+
   // --- startup / views ---------------------------------------------------------
 
   private async startup(): Promise<void> {
@@ -271,9 +307,10 @@ export class App {
     this.readyTimer = window.setInterval(() => void this.loadReady(), 30000);
   }
 
-  private showView(view: "research" | "ingest"): void {
+  private showView(view: "research" | "ingest" | "resumes"): void {
     this.root.querySelector<HTMLElement>("#view-research")!.hidden = view !== "research";
     this.root.querySelector<HTMLElement>("#view-ingest")!.hidden = view !== "ingest";
+    this.root.querySelector<HTMLElement>("#view-resumes")!.hidden = view !== "resumes";
     for (const b of Array.from(this.root.querySelectorAll<HTMLButtonElement>(".view-btn"))) {
       b.classList.toggle("active", b.dataset.view === view);
     }
@@ -874,5 +911,69 @@ export class App {
       this.handleApiError(e);
       this.set("i-msg", errText(e));
     }
+  }
+
+  // --- resumes (M8) ------------------------------------------------------------------------
+
+  private async resumeSearch(): Promise<void> {
+    const query = this.root.querySelector<HTMLInputElement>("#resume-query")!.value.trim();
+    if (!query) {
+      this.set("resume-msg", "Type a keyword first.");
+      return;
+    }
+    try {
+      const { results } = await api.searchResumes(query);
+      const box = this.root.querySelector<HTMLElement>("#resume-results")!;
+      box.innerHTML = "";
+      if (results.length === 0) {
+        box.append(el("div", { class: "banner" }, "No stored resume mentions that keyword yet."));
+        this.set("resume-msg", "0 matches.");
+        return;
+      }
+      results.forEach((r, i) => box.append(this.resumeItem(r, i + 1)));
+      this.set("resume-msg", `${results.length} match(es) — ranked by keyword relevance.`);
+    } catch (e) {
+      this.handleApiError(e);
+      this.set("resume-msg", errText(e));
+    }
+  }
+
+  private resumeItem(r: ResumeSummary, rank: number): HTMLElement {
+    const item = el("div", { class: "passage resume-hit" },
+      el("div", { class: "passage-head" },
+        el("span", { class: "muted" }, `#${rank}`),
+        el("span", { class: "passage-title" }, r.title),
+        el("span", { class: "muted" }, `score ${r.score.toFixed(3)}`),
+      ),
+      el("div", { class: "passage-text" }, r.excerpt),
+    );
+    item.addEventListener("click", () => void this.openResume(r.rev_id, r.title));
+    return item;
+  }
+
+  private async openResume(revId: string, fallbackTitle: string): Promise<void> {
+    try {
+      const rec = await api.resume(revId);
+      this.resumeState = { rev: rec.rev_id, title: rec.title ?? fallbackTitle };
+      this.set("resume-title", this.resumeState.title);
+      this.set("resume-meta", `${rec.word_count} words · ${rec.model_revision} · ${rec.prompt_version}`);
+      const text = this.root.querySelector<HTMLElement>("#resume-text")!;
+      text.textContent = rec.text;
+      text.scrollTop = 0;
+    } catch (e) {
+      this.handleApiError(e);
+      this.set("resume-msg", errText(e));
+    }
+  }
+
+  private async openResumeBook(): Promise<void> {
+    const st = this.resumeState;
+    if (!st) {
+      this.set("resume-msg", "Pick a resume from the list first.");
+      return;
+    }
+    this.showView("research");
+    this.showReaderPane();
+    if (await this.openReaderFor(st.rev)) void this.reader.refresh();
   }
 }

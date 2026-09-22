@@ -126,6 +126,20 @@ answer:
   temperature: 0.1
   timeout_seconds: 60
 
+# Extended per-book summaries ("resumes", M8): after a revision is published,
+# a `resume` job asks the answer model (identity always from `answer` above)
+# for a 700-1000 word English summary, stored for the web UI's keyword search.
+# Generation parameters are deliberately longer/looser than cited answering.
+# A resume shorter than 100 words fails its job permanently — bump max_tokens
+# and requeue with `library-rag retry --include-permanent`.
+resume:
+  enabled: true
+  max_tokens: 2400
+  temperature: 0.3
+  timeout_seconds: 300
+  prompt_version: resume-v1
+  input_char_budget: 16000
+
 # Short-log + per-job verbose-log configuration. Source of truth for detached
 # worker runs; the --log-level / --log-format CLI flags override these for a
 # single interactive invocation.
