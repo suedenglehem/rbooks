@@ -2125,18 +2125,47 @@ touching stored resumes until the new one succeeds.
   stored; 21 words → succeeded + stored); gate 507 passed,
   ruff + mypy clean.
 
+### Summary-button test addendum (2026-09-22 evening)
+- While serve was up for the operator's live test, two UI bugs
+  were reported: "Open book" in the Resumes view did nothing,
+  and the Summary button "showed nothing" even though a summary
+  looked like ~1000 words (first thought to be epub-specific,
+  then "the same with pdf — flacky, very often shows nothing").
+  Root cause in `openResume`'s 404 path (normal mid-backfill):
+  it hid the notice in the small left-pane status line, left the
+  PREVIOUS book's meta line ("N words · model") over an EMPTY
+  text area, and never updated `resumeState` — so "Open book"
+  later targeted the previously loaded book or hit the null
+  check. `openResumeBook` also gave no feedback during the slow
+  whole-PDF source fetch, so the click looked dead. Fixed: the
+  404 message is written into the right-pane text itself
+  ("No summary stored for this book yet — the résumé backfill is
+  still running. Use Open book to read the book itself in the
+  meantime."), stale meta cleared, `resumeState` pointed at the
+  clicked book, and an "Opening "<title>" …" reader status shown
+  immediately on click (05eee57, bundle index-DjkRTiRs.js). A
+  read-only DB check showed the misses are mostly DATA, not an
+  epub bug: pdf 54/210 (25%) vs epub 67/82 (81%) have stored
+  resumes because the paused backfill (121/292) had not reached
+  most PDFs. The operator must hard-refresh the browser to pick
+  up the new bundle (serve reads web/dist from disk, no restart).
+  Gate: 507 passed, ruff + mypy clean.
+
 ### Next unfinished task
 - Finish the pilot resume backfill (worker stopped for the
-  operator's Summary-button test at ~171 left, ~44 s/job; 119
-  stored + 1 in-flight-at-stop). Sequence on the operator's
-  "done testing": stop serve (8100), relaunch the worker with
-  `--allow-version-mismatch` (the floor change bumped the version
-  hash), run `retry --include-permanent` for the 99-word book.
-  On completion: `uv run library-rag stop --config <sandbox
-  config>`, relaunch serve on 8100 (serves index-CukkH7fb.js
-  live from disk), smoke `/health` + `/ready` +
-  `POST /resumes/search`, report final counts (~292 succeeded /
-  0 failed).
+  operator's Summary-button test: 121 stored, 170 pending, 1
+  permanent_failed of 292; ~44 s/job). Sequence on the
+  operator's "done testing": stop serve (8100);
+  `library-rag retry --include-permanent --config <sandbox
+  config>` (recovers the 99-word book's only permanent_failed —
+  it passes the 20-word floor now); relaunch the worker IN
+  BACKGROUND with `--allow-version-mismatch` (the floor change
+  bumped the version hash), log under the state dir; re-arm the
+  coarse backfill monitor (the jobs column is `error_category`,
+  NOT `error_class`). On completion (pending=0): `uv run
+  library-rag stop --config <sandbox config>`, relaunch serve on
+  8100, smoke `/health` + `/ready` + `POST /resumes/search`,
+  report final counts (~292 succeeded / 0 failed).
 - Full-library launch remains held on the user's explicit
   approval (M7 §5); M8 adds the `resume` stage to that run
   automatically via the publish hook.
