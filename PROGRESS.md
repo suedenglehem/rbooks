@@ -2172,21 +2172,41 @@ touching stored resumes until the new one succeeds.
   up the new bundle (serve reads web/dist from disk, no restart).
   Gate: 507 passed, ruff + mypy clean.
 
+### Backfill addendum (2026-09-22 late night)
+- Operator said "done testing"; the swap ran as planned: serve
+  stopped (8100 free); `library-rag retry --include-permanent`
+  requeued 3 jobs — the 99-word book's resume plus ibm.pdf's
+  permanently-failed embed + publish (a pilot book that had
+  never published); worker relaunched in the background with
+  `--allow-version-mismatch` (appends to worker-m8.log under the
+  state dir); coarse backfill monitor armed (20-min ticks;
+  re-arms at the 30-min expiry cap).
+- One anomaly: sieglove.pdf (rev 5ccbe0fd, Wagner sheet music)
+  hit `answer_model_error` "malformed chat completion response:
+  content is not a string" — a one-off bad vLLM body (HTTP 200,
+  non-string `content`) amid ~173 good generations. Requeued
+  that single job via `retry --include-permanent`; the running
+  worker retried it: succeeded, 215 words stored (short, valid
+  for sheet music, above the 20-word floor). Not systematic for
+  that book.
+- ibm.pdf (rev c59f8aa7) published at 22:55 local; the publish
+  hook minted its own resume job — the pilot total is 293, not
+  292. A duplicate pending publish job for the same rev (a
+  no-op re-publish once it runs) remains as the only non-resume
+  open job.
+- State at save: 187/293 stored, 105 pending + 1 running,
+  0 failed at any stage; ~44 s/job → ETA ~1.5 h.
+
 ### Next unfinished task
-- Finish the pilot resume backfill (worker stopped for the
-  operator's Summary-button test: 121 stored, 170 pending, 1
-  permanent_failed of 292; ~44 s/job). Sequence on the
-  operator's "done testing": stop serve (8100);
-  `library-rag retry --include-permanent --config <sandbox
-  config>` (recovers the 99-word book's only permanent_failed —
-  it passes the 20-word floor now); relaunch the worker IN
-  BACKGROUND with `--allow-version-mismatch` (the floor change
-  bumped the version hash), log under the state dir; re-arm the
-  coarse backfill monitor (the jobs column is `error_category`,
-  NOT `error_class`). On completion (pending=0): `uv run
-  library-rag stop --config <sandbox config>`, relaunch serve on
-  8100, smoke `/health` + `/ready` + `POST /resumes/search`,
-  report final counts (~292 succeeded / 0 failed).
+- Backfill IN FLIGHT (worker running, monitor armed). On
+  completion (monitor prints "BACKFILL COMPLETE: no resume jobs
+  pending/running"): `uv run library-rag stop --config <sandbox
+  config>`; relaunch serve on 8100 (token from serve.env,
+  source it in-shell, never echo it); smoke `/health` +
+  `/ready` + `POST /resumes/search`; report final counts
+  (expect 293 succeeded / 0 failed + the ibm.pdf duplicate
+  publish no-op). Re-arm the monitor on each 30-min expiry
+  until it exits on its own.
 - Full-library launch remains held on the user's explicit
   approval (M7 §5); M8 adds the `resume` stage to that run
   automatically via the publish hook.
