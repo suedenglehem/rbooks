@@ -1377,8 +1377,8 @@ def run_worker(
     that can leak. The *model* (answer model, resume stage) is a shared
     seam: when None it is built ONCE here and shared by every resume job,
     so an :class:`~library_rag.llm.AnswerModelPool` load-balances its
-    round-robin across the whole run — a resume job makes exactly one model
-    call, and a pool minted per job would restart that round-robin at
+    in-flight counts across the whole run — a resume job makes exactly one
+    model call, and a pool minted per job would restart that balance at
     endpoint 0 every time, never using ``answer.extra_endpoints`` (M9).
 
     Per-job verbose logging: while a job runs, DEBUG records are captured to
@@ -1389,7 +1389,7 @@ def run_worker(
     deferral, which clears the category, or a lost lease is not a failure).
     Kept files are capped by :func:`prune_job_logs`.
     """
-    # Built once per run (see docstring): the pool's round-robin must span
+    # Built once per run (see docstring): the pool's load balancing must span
     # the whole worker, not restart on every single-call resume job. Never
     # raises — an unconfigured model stays None and resume jobs fail with
     # answer_model_not_configured as before.

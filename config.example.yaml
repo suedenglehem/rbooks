@@ -125,14 +125,22 @@ answer:
   max_tokens: 1024
   temperature: 0.1
   timeout_seconds: 60
-  # M9: extra endpoints serving the SAME model, load-balanced round-robin with
-  # per-call failover alongside services.answer_host:answer_port. An endpoint
-  # that is down costs its (fast, 10s) connect timeout per affected call and
-  # the pool degrades to the live ones — safe to leave configured while the
-  # machine is off. model_name inherits `answer.model_name` when omitted.
+  # M9: extra endpoints serving the SAME model, load-balanced with per-call
+  # failover alongside services.answer_host:answer_port. An endpoint that is
+  # down costs its (fast, 10s) connect timeout per affected call and the pool
+  # degrades to the live ones — safe to leave configured while the machine is
+  # off. model_name inherits `answer.model_name` when omitted.
+  # Selection is least-inflight per unit of weight (round-robin breaks idle
+  # ties): with every weight at 1, dispatch settles at each endpoint's
+  # relative SPEED, so the faster endpoint naturally carries more. Raise a
+  # weight (default 1, >= 1) to route that endpoint a share beyond its
+  # natural one — the usual move is raising the PRIMARY's weight to keep
+  # batch load off a secondary that also serves interactive traffic.
+  # weight: 1
   # extra_endpoints:
   #   - host: ak
   #     port: 8080
+  #     weight: 1
 
 # Extended per-book summaries ("resumes", M8): after a revision is published,
 # a `resume` job asks the answer model (identity always from `answer` above)

@@ -166,11 +166,29 @@ class LlamaCppAnswerModel:
 class AnswerModelPool:
     """A load-balancing pool of endpoints serving the same model (M9).
 
-    Calls start at a round-robin position and, on :class:`AnswerModelError`
-    (including :class:`AnswerModelUnavailableError`), fail over to the next
-    endpoint for the *same* call. So an endpoint that is down costs its
-    (fast) connect timeout per affected call and the pool degrades to the
-    live ones; if every endpoint fails, the last error is raised.
+    Calls start at the *least-loaded* endpoint — the one with the fewest
+    in-flight calls per unit of weight (``inflight_i / weight_i``, compared
+    by cross-multiplication) — and, on :class:`AnswerModelError` (including
+    :class:`AnswerModelUnavailableError`), fail over to the next endpoint
+    for the *same* call. So an endpoint that is down costs its (fast)
+    connect timeout per affected call and the pool degrades to the live
+    ones; if every endpoint fails, the last error is raised.
+
+    Weights (default 1 for every endpoint) are relative-capacity
+    multipliers on top of each endpoint's observed speed: with all weights
+    1, in steady state dispatch is proportional to speed (the fast
+    endpoint's in-flight count drains faster, so it keeps winning). Raising
+    an endpoint's weight routes it a share *beyond* its natural speed
+    share; the useful direction is raising the primary's weight to shed
+    batch load off a shared secondary (e.g. a machine also serving
+    interactive traffic).
+
+    Idle ties break round-robin: when the ratios are equal (in particular
+    when nothing is in flight) the next round-robin position wins. That
+    keeps the pool's cold-start and idle behavior identical to the
+    original M9 round-robin — including only probing a down endpoint
+    every other call — and lets least-inflight take over once concurrency
+    exceeds the endpoint count.
 
     Thread-safe: the worker may issue completions from several job threads
     (``worker.max_concurrent_jobs``), and each ``httpx.Client`` inside a
@@ -181,30 +199,66 @@ class AnswerModelPool:
     byte-identical to the pre-M9 behavior.
     """
 
-    def __init__(self, models: Sequence[AnswerModel]) -> None:
+    def __init__(
+        self, models: Sequence[AnswerModel], weights: Sequence[int] | None = None
+    ) -> None:
         if not models:
             raise ValueError("AnswerModelPool requires at least one model")
         self._models = list(models)
+        n = len(self._models)
+        if weights is None:
+            weights = (1,) * n
+        if len(weights) != n:
+            raise ValueError("weights must have one entry per model")
+        if any(w < 1 for w in weights):
+            raise ValueError("weights must be >= 1")
+        self._weights = list(weights)
         self._lock = threading.Lock()
-        self._next = 0
+        self._rr = 0
+        self._inflight = [0] * n
         self.model_revision = self._models[0].model_revision
 
     def __len__(self) -> int:
         return len(self._models)
 
+    def inflight(self) -> list[int]:
+        """A snapshot of per-endpoint in-flight call counts (diagnostics)."""
+        with self._lock:
+            return list(self._inflight)
+
+    def _pick_locked(self) -> int:
+        """Least in-flight-per-weight endpoint; round-robin breaks ties.
+
+        The caller holds ``self._lock``. Comparison is
+        ``inflight_i * w_best < inflight_best * w_i`` (strict), so equal
+        ratios keep the earliest candidate in round-robin order.
+        """
+        n = len(self._models)
+        best = self._rr
+        self._rr = (self._rr + 1) % n
+        for offset in range(1, n):
+            i = (best + offset) % n
+            if self._inflight[i] * self._weights[best] < self._inflight[best] * self._weights[i]:
+                best = i
+        return best
+
     def complete(self, messages: Sequence[Message]) -> str:
         n = len(self._models)
         with self._lock:
-            start = self._next
-            self._next = (self._next + 1) % n
+            i = self._pick_locked()
         last_error: AnswerModelError | None = None
-        for offset in range(n):
-            model = self._models[(start + offset) % n]
+        for _ in range(n):
+            with self._lock:
+                self._inflight[i] += 1
             try:
-                return model.complete(messages)
+                return self._models[i].complete(messages)
             except AnswerModelError as exc:
                 last_error = exc
-        assert last_error is not None  # loop ran at least once
+            finally:
+                with self._lock:
+                    self._inflight[i] -= 1
+            i = (i + 1) % n  # reached only when the attempt failed
+        assert last_error is not None  # the loop ran n >= 1 times
         raise last_error
 
 
@@ -226,6 +280,9 @@ def build_answer_pool(
     each built with the caller's generation parameters (the resume stage
     passes its own ``max_tokens``/``temperature``/``timeout_seconds``, which
     is why this builder takes them rather than reading ``cfg.answer``).
+
+    Pool weights come from ``answer.weight`` (primary) and each extra
+    endpoint's ``weight`` — see :class:`AnswerModelPool` for what they do.
     """
     a = cfg.answer
     if not a.is_configured:
@@ -258,7 +315,10 @@ def build_answer_pool(
                 temperature=temperature,
             )
         )
-    return AnswerModelPool(models)
+    return AnswerModelPool(
+        models,
+        weights=[a.weight, *(e.weight for e in a.extra_endpoints)],
+    )
 
 
 def make_answer_model(cfg: Config) -> AnswerModel | None:

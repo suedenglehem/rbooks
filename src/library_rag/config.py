@@ -509,6 +509,11 @@ class AnswerEndpoint(BaseModel):
     # The server-side "model" field for /v1/chat/completions when it differs
     # from the primary's; None inherits ``answer.model_name``.
     model_name: str | None = None
+    # Pool weight (default 1): a relative-capacity multiplier on top of the
+    # endpoint's observed speed. With every weight at 1 the pool dispatches
+    # proportionally to speed; raise it to route this endpoint a share
+    # beyond its natural one.
+    weight: int = 1
 
     @model_validator(mode="after")
     def _check_endpoint(self) -> AnswerEndpoint:
@@ -517,6 +522,10 @@ class AnswerEndpoint(BaseModel):
         if not 1 <= self.port <= 65535:
             raise ConfigError(
                 f"answer.extra_endpoints[].port must be 1-65535 (got {self.port})"
+            )
+        if self.weight < 1:
+            raise ConfigError(
+                f"answer.extra_endpoints[].weight must be >= 1 (got {self.weight})"
             )
         return self
 
@@ -549,6 +558,10 @@ class AnswerSettings(BaseModel):
     # M9: extra endpoints serving the same model, load-balanced with per-call
     # failover alongside the primary (services.answer_host:answer_port).
     extra_endpoints: list[AnswerEndpoint] = Field(default_factory=list)
+    # Pool weight of the primary endpoint (default 1), see
+    # ``AnswerEndpoint.weight``. The usual knob is raising the PRIMARY's
+    # weight to shed batch load off a shared secondary endpoint.
+    weight: int = 1
 
     @model_validator(mode="after")
     def _check_answer(self) -> AnswerSettings:
@@ -558,6 +571,8 @@ class AnswerSettings(BaseModel):
             raise ConfigError("answer.temperature must be in [0, 2)")
         if self.timeout_seconds <= 0:
             raise ConfigError("answer.timeout_seconds must be positive")
+        if self.weight < 1:
+            raise ConfigError(f"answer.weight must be >= 1 (got {self.weight})")
         return self
 
     @property

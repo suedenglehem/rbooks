@@ -2512,3 +2512,39 @@ steady state; a weight would only shave finite-batch tails (~0.3% on the
 per-endpoint `max_inflight` cap (protects interactive Claude Code traffic
 sharing `ak:8080` during long backfills) or weighted least-inflight
 (future-proofs `max_concurrent_jobs` > endpoint count). Decision pending.
+
+### Addendum — least-inflight dispatch with per-endpoint weights (2026-09-23)
+
+Operator decision on the open weights question: **option 2 — weighted
+least-inflight** (replacing pure round-robin in `AnswerModelPool`), plus the
+mid-turn instruction to configure `ak` as the 2×-slower endpoint right away.
+
+**Mechanics:** the pool now tracks in-flight calls per endpoint and picks
+`argmin(inflight_i / weight_i)` by cross-multiplication, with round-robin as
+the idle tie-break (sequential calls still alternate `a,b,a,b` when nothing
+is in flight — M9 behavior preserved; a down primary is still probed every
+other call). At equilibrium (Little's law) `inflight_i / weight_i` is equal,
+so dispatch settles at `weight_i × speed_i`: with all weights 1 the pool is
+pure speed-proportional automatically (measured W_v/W_a ≈ 1.82 → ≈65/35);
+weights are a deliberate distortion on top. **Knob direction:** raise the
+PRIMARY's weight to shed batch load off a secondary that also serves
+interactive traffic (the usual case).
+
+**Config:** new `answer.weight` (primary) and
+`answer.extra_endpoints[].weight` (per extra endpoint), both int, default 1,
+`>= 1` enforced at load (`ConfigError`). Documented in `config.example.yaml`.
+
+**Sandbox config (applied, per operator instruction):** primary vLLM
+`weight: 2`, `ak` `weight: 1` — expected split ≈78/22 (vs ≈65/35 at 1:1
+auto-matching), so `ak`'s share of batch load drops ~half; `ak:8080` also
+carries the interactive `claude-llama-proxy`, which this protects. Takes
+effect on the next worker run; the full-library launch config should mirror
+the same `answer.weight: 2`.
+
+**Tests (6 new, gate green — 530 passed + ruff + mypy + dist guard):**
+least-inflight prefers a free endpoint under concurrency (deterministic
+`_GatedModel` threading, no timing dependence); a weight-2 endpoint wins a
+loaded tie (1/2 < 1/1); in-flight counters release after failover, after an
+all-endpoints-fail call, and after an unexpected non-`AnswerModelError`;
+bad weights rejected (length mismatch, `< 1`); config defaults/parse/
+validation for both weight fields.

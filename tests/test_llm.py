@@ -12,6 +12,7 @@ failure).
 from __future__ import annotations
 
 import socket
+import threading
 from collections.abc import Sequence
 from typing import Any
 
@@ -247,11 +248,124 @@ class _FailingModel:
         raise self._exc
 
 
+class _GatedModel:
+    """Blocks inside ``complete()`` until released; signals on arrival.
+
+    ``arrived`` is set once the call has started — after the pool counted the
+    endpoint in-flight — and ``release`` gates the return. Holding an endpoint
+    busy this way lets a test observe where a concurrent call lands, with no
+    timing dependence.
+    """
+
+    model_revision = "gated-v1"
+
+    def __init__(self, reply: str) -> None:
+        self._reply = reply
+        self.arrived = threading.Event()
+        self.release = threading.Event()
+
+    def complete(self, messages: Sequence[Message]) -> str:
+        self.arrived.set()
+        self.release.wait()
+        return self._reply
+
+
 def test_pool_round_robin_between_endpoints() -> None:
+    # Idle tie-break: with nothing in flight the ratios are all equal, so
+    # sequential calls still alternate endpoints round-robin (M9 behavior).
     a = FakeAnswerModel(["a1", "a2"])
     b = FakeAnswerModel(["b1", "b2"])
     pool = AnswerModelPool([a, b])
     assert [pool.complete(_MSGS) for _ in range(4)] == ["a1", "b1", "a2", "b2"]
+
+
+def test_pool_least_inflight_prefers_free_endpoint() -> None:
+    a = _GatedModel("from-a")
+    b = _GatedModel("from-b")
+    pool = AnswerModelPool([a, b])
+    results: dict[str, str] = {}
+
+    def call(tag: str) -> None:
+        results[tag] = pool.complete(_MSGS)
+
+    t1 = threading.Thread(target=call, args=("t1",))
+    t1.start()
+    a.arrived.wait()  # t1 takes `a` (idle tie -> round-robin position 0)
+    t2 = threading.Thread(target=call, args=("t2",))
+    t2.start()
+    # `a` is in flight and `b` is free, so the concurrent call MUST land on
+    # `b` — this is what lets the faster endpoint carry a bigger share.
+    b.arrived.wait()
+    a.release.set()
+    b.release.set()
+    t1.join()
+    t2.join()
+    assert results == {"t1": "from-a", "t2": "from-b"}
+    assert pool.inflight() == [0, 0]
+
+
+def test_pool_weights_tilt_a_loaded_tie() -> None:
+    # Both endpoints busy: the ratio is inflight/weight, so the weight-2
+    # endpoint (1/2 = 0.5) beats weight 1 (1/1 = 1.0) and gets the next call.
+    a = _GatedModel("from-a")
+    b = _GatedModel("from-b")
+    pool = AnswerModelPool([a, b], weights=[2, 1])
+    results: dict[str, str] = {}
+
+    def call(tag: str) -> None:
+        results[tag] = pool.complete(_MSGS)
+
+    t1 = threading.Thread(target=call, args=("t1",))
+    t1.start()
+    a.arrived.wait()  # t1 takes `a` (idle tie -> round-robin position 0)
+    t2 = threading.Thread(target=call, args=("t2",))
+    t2.start()
+    b.arrived.wait()  # `a` busy -> `b` is the only free endpoint
+    t3 = threading.Thread(target=call, args=("t3",))
+    t3.start()
+    a.release.set()
+    b.release.set()
+    t1.join()
+    t2.join()
+    t3.join()
+    assert results == {"t1": "from-a", "t2": "from-b", "t3": "from-a"}
+    assert pool.inflight() == [0, 0]
+
+
+def test_pool_inflight_released_after_failover() -> None:
+    down = _FailingModel(AnswerModelUnavailableError("connection refused"))
+    up = FakeAnswerModel(["ok [E1]."])
+    pool = AnswerModelPool([down, up])
+    assert pool.complete(_MSGS) == "ok [E1]."
+    # The failed attempt on `down` and the successful one on `up` both
+    # released their counters — no phantom in-flight calls accumulate.
+    assert pool.inflight() == [0, 0]
+
+
+def test_pool_inflight_released_on_unexpected_error() -> None:
+    class _BlowingModel:
+        model_revision = "blowing-v1"
+
+        def complete(self, messages: Sequence[Message]) -> str:
+            raise RuntimeError("boom")
+
+    up = FakeAnswerModel()
+    pool = AnswerModelPool([_BlowingModel(), up])
+    with pytest.raises(RuntimeError, match="boom"):
+        pool.complete(_MSGS)
+    # A non-AnswerModelError is a bug, not a dead endpoint: it propagates
+    # without failover, but the counter still comes back down.
+    assert pool.inflight() == [0, 0]
+    assert up.calls == []
+
+
+def test_pool_rejects_bad_weights() -> None:
+    a = FakeAnswerModel()
+    b = FakeAnswerModel()
+    with pytest.raises(ValueError, match="one entry per model"):
+        AnswerModelPool([a, b], weights=[1])
+    with pytest.raises(ValueError, match=">= 1"):
+        AnswerModelPool([a, b], weights=[2, 0])
 
 
 def test_pool_exposes_len_and_first_model_revision() -> None:
@@ -270,8 +384,9 @@ def test_pool_rejects_empty() -> None:
 def test_pool_fails_over_when_an_endpoint_is_unavailable() -> None:
     down = _FailingModel(AnswerModelUnavailableError("connection refused"))
     # Two scripted replies: call 1 reaches `up` via failover (off the dead
-    # endpoint), and call 2 lands on `up` directly because the round-robin
-    # counter already advanced past the dead endpoint on call 1.
+    # endpoint), and call 2 lands on `up` directly because the idle
+    # tie-break's round-robin position already advanced past the dead
+    # endpoint on call 1.
     up = FakeAnswerModel(["ok [E1].", "ok [E1]."])
     pool = AnswerModelPool([down, up])
     assert pool.complete(_MSGS) == "ok [E1]."

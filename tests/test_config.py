@@ -345,6 +345,25 @@ def test_answer_extra_endpoints_invalid_raise() -> None:
         AnswerEndpoint(host="ak", port=0)
 
 
+def test_answer_weights_default_and_parse() -> None:
+    # Both weights default to 1 (pure speed-proportional dispatch).
+    assert AnswerSettings().weight == 1
+    assert AnswerEndpoint(host="ak", port=8080).weight == 1
+    s = AnswerSettings(
+        model_revision="qwen3.8-27b-fp8@vllm-dual-max",
+        weight=2,
+        extra_endpoints=cast(
+            "list[AnswerEndpoint]", [{"host": "ak", "port": 8080, "weight": 1}]
+        ),
+    )
+    assert s.weight == 2
+    assert s.extra_endpoints[0].weight == 1
+    with pytest.raises(ConfigError, match=r"answer\.weight"):
+        AnswerSettings(model_revision="qwen3.8-27b-fp8@vllm-dual-max", weight=0)
+    with pytest.raises(ConfigError, match=r"extra_endpoints"):
+        AnswerEndpoint(host="ak", port=8080, weight=0)
+
+
 def test_worker_settings_default_and_validation() -> None:
     assert WorkerSettings().max_concurrent_jobs == 1
     with pytest.raises(ConfigError, match=r"max_concurrent_jobs"):
@@ -369,9 +388,11 @@ def test_load_config_answer_pool_and_worker(
                 "answer:",
                 "  model_revision: qwen3.8-27b-fp8@vllm-dual-max",
                 "  model_name: qwen3.8-27b",
+                "  weight: 2",
                 "  extra_endpoints:",
                 "    - host: ak",
                 "      port: 8080",
+                "      weight: 1",
                 "worker:",
                 "  max_concurrent_jobs: 2",
             ]
@@ -379,5 +400,8 @@ def test_load_config_answer_pool_and_worker(
         encoding="utf-8",
     )
     cfg = load_config(cfg_file)
-    assert cfg.answer.extra_endpoints == [AnswerEndpoint(host="ak", port=8080)]
+    assert cfg.answer.weight == 2
+    assert cfg.answer.extra_endpoints == [
+        AnswerEndpoint(host="ak", port=8080, weight=1)
+    ]
     assert cfg.worker.max_concurrent_jobs == 2
