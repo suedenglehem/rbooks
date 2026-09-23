@@ -2745,7 +2745,9 @@ green — 567 passed, ruff + mypy clean)
     a missing path → 404. (A literal NUL byte is not practically
     sendable through an HTTP URL; the guard is unit-tested.)
   - `/library` → 344 books, matching the DB.
-- Still open from "Open": the browser-only UI check (Browse tab
-  visible, PDF click → reader, right-click → résumé pane) and the
-  mount-pull degradation watch — their API sides are the cases
-  verified above.
+- **Operator UI check passed (2026-09-24, "ok for me"):** Browse tab
+  visible, PDF click → reader, right-click → résumé pane all work in
+  the browser. Remaining from "Open": only the mount-pull degradation
+  watch — its API side (`/ready.browse` false, `/browse/*` 404s, app
+  otherwise healthy) is the verified missing-root behavior, and the
+  30 s poll self-healing is the SPA's existing mechanism.
