@@ -2594,6 +2594,48 @@ connects emit no log line).
 starts ak ~2–3 min in; the worker run reclaims the leftover batch3 job
 `01dfe315…` first.
 
+### Addendum — failover-batch4: recovery CAPTURED (2026-09-24 ~01:18–01:31)
+
+**Round ran as planned and drained clean.** Worker started 01:18:47
+(pid 52209); ak confirmed down at start (TCP-refused). Enqueued 20 jobs
+under tag `failover-batch4` (the 10 batch2/3 pairs + 10 fresh pairs,
+chunk-count spread 11–438); the batch3 leftover `01dfe315…` was
+reclaimed at worker start (attempts→3) and completed on vLLM — **the
+batch3 hang is now resolved**. Operator started ak at 01:22:47 (~4 min
+in). The first ak dispatch landed within seconds of the TCP-up; first
+ak 200 at 01:23:51 — a **64 s recovery gap** (includes the generation
+itself). Drain 01:30:47, ~12 min window: **21/21 succeeded, zero
+job-level failures**, total attempts 23 (20×1 + the leftover's 3).
+Per endpoint: **4 ak / 17 vLLM**; the post-recovery split is 4/14 ≈ 29%
+of traffic to ak — right on the weight 1:2 prediction (~33%). Down
+phase: 7 vLLM 200s, all ak dispatches bounced invisibly (refused
+connects log nothing) — the ~2 s per-call bounce cost remains inferred,
+not measured. Full 21-line httpx timeline (all 200) in
+`pilot-sandbox/scratch/worker-failover-batch4.log`.
+
+**Wrap-up hiccup (noted for the runbook):** the first serve relaunch
+crashed with a Qdrant lock error — the drained worker was still
+running and holding the embedded-Qdrant folder (serve and worker cannot
+coexist; single-process local storage). Stopped the worker with its
+explicit pids (graceful SIGTERM sufficed; queue was drained), then
+serve relaunched cleanly. **State at save: serve is UP on
+0.0.0.0:8100** (pid in `scratch/serve.pid`), no worker running, ak up.
+Smoke green: `/ready` → qdrant true, browse true; `POST
+/resumes/search` 200; `GET /browse/dir` lists the books tree.
+
+**Open findings updated:** (1) CLOSED — the recovery test is now
+captured (above); (2) kept — the 2 s connect budget does NOT protect
+against a HUNG read (endpoint accepts TCP, then stalls); that is the
+300 s resume read timeout's job; (3) kept — per-call ~2 s bounce cost
+of ak-first dispatches while down is inferred, not measured (failed
+connects emit no log line).
+
+**M9 failover/recovery validation is complete** — no unfinished tasks
+on this thread. The full-library launch remains gated on explicit
+operator go; its config must mirror the sandbox (ak:8080
+extra_endpoint, answer weight 2, max_concurrent_jobs 2,
+resume.max_tokens 8192, browse block).
+
 ## M10 — Filesystem browse tab (2026-09-24)
 
 **Status: gate passed (567 passed, ruff + mypy clean).** Operator
