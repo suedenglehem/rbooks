@@ -2665,10 +2665,12 @@ missing mount must degrade the feature, never the app.
   (dist guard green).
 - `config.example.yaml` — documented `browse:` section (commented,
   off).
-- Live operator config (`config.yaml`, gitignored — not committed):
-  `browse:` enabled with the operator's root and the four-case
-  file_types list; verified loading (`browse: True
-  /mnt/models_sas_ssd/books ['.pdf', '.epub']`).
+- Live operator config: `browse:` enabled with the operator's root and
+  the four-case file_types list. Initially appended to the repo-root
+  `config.yaml` (gitignored) on the assumption that it was the live
+  config; the addendum below corrects that — the live config is
+  `pilot-sandbox/scratch/config.sandbox.yaml`, where the block was
+  appended afterwards (backup `config.sandbox.yaml.pre-m10`).
 
 ### Tests (31 new: 22 in test_browse.py, 9 in test_config.py; gate
 green — 567 passed, ruff + mypy clean)
@@ -2703,3 +2705,47 @@ green — 567 passed, ruff + mypy clean)
 - Default-off reverted-check (no `browse` section at all): app boots
   identically, no nav button, `/browse/*` 404s — covered by the
   disabled-by-default route tests.
+
+### Addendum (2026-09-24 ~01:00) — config mix-up corrected, live E2E done
+
+- **The live operator config is NOT the repo-root `config.yaml`.** It
+  is `/mnt/models_sas_ssd/library-rag/pilot-sandbox/scratch/
+  config.sandbox.yaml` (all roots under `pilot-sandbox/`, source_roots
+  `[/mnt/models_sas_ssd/books]`, app on 0.0.0.0:8100, answer pool
+  vLLM:8091 weight 2 + ak:8080 weight 1). The repo-root `config.yaml`'s
+  state_root (`/mnt/models_sata_ssd/library-rag/state`) was empty —
+  created fresh at 00:47 by a serve I had launched against it, which
+  is why the first E2E drill-down showed zero indexed files. The real
+  catalog lives in the pilot-sandbox state DB (344 docs / 54270 chunks
+  / 335 resumes / one leftover batch3 running job).
+- **Re-point steps taken:** appended the `browse:` block to
+  `config.sandbox.yaml` (backup `config.sandbox.yaml.pre-m10`, secret
+  token line untouched); stopped the wrong serve (pids 42071/42074,
+  `--config config.yaml`); verified the two sata dirs I had created
+  (`state/`, `qdrant/`) held only the empty-shell DB + qdrant meta and
+  deleted them (the pre-existing `scratch/` left alone); relaunched
+  `serve --config …/config.sandbox.yaml` from the repo root (log in
+  `serve.log`, untracked); updated the stale `scratch/serve.pid` (was
+  31136, now 44926 — `ingest_worker.pid` 79597 is also stale, no
+  worker running).
+- **Live E2E (serve on 0.0.0.0:8100, 344-doc catalog) — all green:**
+  - Startup log: only the expected non-loopback token warning; no
+    sentinel/mount errors, no browse warning.
+  - `/ready` → `browse: true`, `token_required: false`, qdrant /
+    embedding / answer all true.
+  - Root listing: 26 dirs, relative paths; drill-down through segment
+    names with spaces, brackets and commas works (URL-encoded).
+  - Indexed row (a deep-nested epub): `rev_id`, title and size
+    (359265) match the DB's active revision exactly;
+    `GET /resumes/{rev}` returns the stored 928-word résumé — the
+    right-click path verified end-to-end.
+  - Unindexed dir (`incoming/`): 6 pdf rows, all `rev_id: null` with
+    on-disk sizes — the "not in the index yet" display.
+  - Containment: `../x`, `/etc`, `bd/../../etc` → 400; a file path and
+    a missing path → 404. (A literal NUL byte is not practically
+    sendable through an HTTP URL; the guard is unit-tested.)
+  - `/library` → 344 books, matching the DB.
+- Still open from "Open": the browser-only UI check (Browse tab
+  visible, PDF click → reader, right-click → résumé pane) and the
+  mount-pull degradation watch — their API sides are the cases
+  verified above.
