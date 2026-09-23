@@ -2429,3 +2429,51 @@ mirror the sandbox (`extra_endpoints` ak:8080,
 for `ak` to contribute real output rather than only
 failover traffic, the `ak` server-side condition above must
 be addressed first.
+
+### Addendum — root cause 3 resolved: `--reasoning-budget 4096` on `ak` (2026-09-23)
+
+Operator pointed at `ak`'s launch script (`/cygdrive/d/llama.cpp/claude.sh`,
+Cygwin shell on Windows) and asked for its arguments to be fixed so the
+project can use the endpoint properly.
+
+**Diagnosis corrected.** The earlier "context ceiling" reading was a
+misread: `llamacpp:n_tokens_max` is a *largest observed sequence length*
+counter (prompt + generation), not a context limit — on the freshly
+restarted, idle server it read 0. The request `max_tokens` WAS honored
+all along (probe: `finish_reason: length`, `completion_tokens` exactly
+8192, content 0 chars, reasoning 30,828 chars). The real condition:
+the Qwen3.8-27B thinking mode spends the entire `max_tokens` budget
+inside the reasoning trace, leaving nothing for content.
+
+**Fix (server-side, on `ak`):** added `--reasoning-budget 4096` to
+`claude.sh` — a hard per-request cap on thinking tokens (this build
+supports it: `-1` unrestricted, `0` immediate end, `N` cap). A 4096
+thinking cap leaves ≥ 4096 of the 8192 resume budget for content
+(~1.5k tokens needed for 700–1000 words). Also merged a duplicate
+`--alias` line: the old script passed `--alias qwen3.8-27b` and a later
+`--alias local-metrics`, and only the last one took effect (the model
+was served as `local-metrics` only); now `--alias qwen3.8-27b,local-metrics`
+so both names resolve. Pre-fix backup: `claude.sh.bak-20260923` on `ak`.
+The operator restarted the server with the fixed script (project rule:
+`ak`'s server is never restarted from the client side).
+
+**Shared-server note:** `ak:8080` also serves the `claude-llama-proxy`
+(127.0.0.1:8787) used for interactive Claude Code sessions, so the
+4096 thinking cap applies there too. Revert path if that feels tight:
+bump `--reasoning-budget` to 8192 (one line) and raise the sandbox
+`resume.max_tokens` accordingly.
+
+**Verified with exactly one production-shape request** (same book as
+the probe, job 32472 "Billy Crystal - 700 Sundays", `max_tokens` 8192,
+temperature 0.3, no `/no_think`): 200, `finish_reason: stop`, 144.9 s;
+usage 3,322 prompt + 5,468 completion; reasoning 17,544 chars (≈3.5k
+tokens — under the 4096 cap); **content 6,588 chars ≈ 1,000 words,
+non-empty and well-formed** (proper book summary, head and tail
+intact). The model now thinks within budget and finishes naturally
+before `max_tokens`.
+
+**Consequence:** `ak` now produces real content — the dual-endpoint
+design delivers its intended ~2× throughput for LLM-bound stages, with
+in-call failover as a safety net rather than the only reason jobs
+succeed. The full-library launch config is unchanged, but `ak` will
+now contribute output, not just failover traffic.
