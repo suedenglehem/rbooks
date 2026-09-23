@@ -45,6 +45,7 @@ import logging
 import os
 import time
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -1361,9 +1362,10 @@ def run_worker(
     (terminal, or deferred — deferrals keep the *once* drain loop from
     busy-spinning on a not-ready job).
 
-    Stopping mid-loop is graceful by construction: at most the current job's
-    current unit is in flight; everything already committed is durable and
-    resumable (PRD §7 SIGTERM).
+    Stopping mid-loop is graceful by construction: at most the in-flight
+    jobs' current units are in flight (one in the sequential default, up to
+    ``worker.max_concurrent_jobs`` otherwise); everything already committed
+    is durable and resumable (PRD §7 SIGTERM).
 
     *qdrant*/*embedder* are injectable seams for tests (and the CLI). When
     *qdrant* is None the worker opens ONE client for the whole run — the
@@ -1409,44 +1411,93 @@ def run_worker(
             STAGE_RESUME: partial(_run_resume, model=model),
         }
         completed = 0
-        while True:
-            if stop_event is not None and stop_event():
-                break
-            job = jobs.claim(name, lease_ttl)
-            if job is None:
-                if once:
+        concurrency = max(1, int(cfg.worker.max_concurrent_jobs))
+        if concurrency == 1:
+            while True:
+                if stop_event is not None and stop_event():
                     break
-                if poll_delay > 0:
-                    _sleep_interruptible(poll_delay, stop_event)
-                continue
-            handler = handlers.get(job.stage)
-            if handler is None:
-                jobs.fail(job, "unknown_stage", f"stage {job.stage!r} has no handler", transient=False)
-                completed += 1  # permanent_failed is a terminal state
-                continue
-            job_log = cfg.paths.state_root / "job_logs" / f"{job.job_id}.attempt{job.attempts}.log"
-            with JobLogCapture(job_log):
-                handled = handler(db, cfg, jobs, job, lease_ttl)
-            row = db.query_one(
-                "SELECT state, error_category FROM jobs WHERE job_id = ?", (job.job_id,)
-            )
-            keep = row is not None and (
-                row["state"] == "permanent_failed"
-                or (row["state"] == "retryable_failed" and bool(row["error_category"]))
-            )
-            if keep:
-                prune_job_logs(
-                    cfg.paths.state_root / "job_logs",
-                    limit=cfg.logging.job_log_retention,
-                )
-            else:
-                job_log.unlink(missing_ok=True)
-            if handled:
-                completed += 1
+                job = jobs.claim(name, lease_ttl)
+                if job is None:
+                    if once:
+                        break
+                    if poll_delay > 0:
+                        _sleep_interruptible(poll_delay, stop_event)
+                    continue
+                if _handle_claimed(db, cfg, jobs, handlers, lease_ttl, job):
+                    completed += 1
+            return completed
+        # >1 (M9): run claimed jobs on a thread pool so several LLM
+        # endpoints (``answer.extra_endpoints``) can drain the queue at once.
+        # Safe by construction: ``jobs.claim`` is a single transaction on the
+        # shared, lock-protected database connection, and each handler's
+        # lease fencing is per-job.
+        with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="job") as ex:
+            inflight: set[Future[bool]] = set()
+            while True:
+                if stop_event is not None and stop_event():
+                    break
+                for f in [f for f in inflight if f.done()]:
+                    if f.result():  # re-raises handler errors, as the sequential path does
+                        completed += 1
+                    inflight.discard(f)
+                if len(inflight) >= concurrency:
+                    if poll_delay > 0:
+                        _sleep_interruptible(poll_delay, stop_event)
+                    continue
+                job = jobs.claim(name, lease_ttl)
+                if job is None:
+                    if once:
+                        break
+                    if poll_delay > 0:
+                        _sleep_interruptible(poll_delay, stop_event)
+                    continue
+                inflight.add(ex.submit(_handle_claimed, db, cfg, jobs, handlers, lease_ttl, job))
+            for f in inflight:
+                if f.result():
+                    completed += 1
         return completed
     finally:
         if own is not None:
             own.close()
+
+
+def _handle_claimed(
+    db: Database,
+    cfg: Config,
+    jobs: Jobs,
+    handlers: dict[str, Callable[..., bool]],
+    lease_ttl: float,
+    job: Claimed,
+) -> bool:
+    """Run one claimed job's handler with per-job log capture and retention.
+
+    Returns whether the job reached a handled state (terminal, or deferred).
+    Shared by both execution branches of :func:`run_worker`; the sequential
+    path (``worker.max_concurrent_jobs = 1``) calls it exactly as the
+    pre-M9 loop body ran inline.
+    """
+    handler = handlers.get(job.stage)
+    if handler is None:
+        jobs.fail(job, "unknown_stage", f"stage {job.stage!r} has no handler", transient=False)
+        return True  # permanent_failed is a terminal state
+    job_log = cfg.paths.state_root / "job_logs" / f"{job.job_id}.attempt{job.attempts}.log"
+    with JobLogCapture(job_log):
+        handled = handler(db, cfg, jobs, job, lease_ttl)
+    row = db.query_one(
+        "SELECT state, error_category FROM jobs WHERE job_id = ?", (job.job_id,)
+    )
+    keep = row is not None and (
+        row["state"] == "permanent_failed"
+        or (row["state"] == "retryable_failed" and bool(row["error_category"]))
+    )
+    if keep:
+        prune_job_logs(
+            cfg.paths.state_root / "job_logs",
+            limit=cfg.logging.job_log_retention,
+        )
+    else:
+        job_log.unlink(missing_ok=True)
+    return handled
 
 
 def _sleep_interruptible(delay: float, stop_event: Callable[[], bool] | None) -> None:

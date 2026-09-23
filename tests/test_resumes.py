@@ -8,6 +8,8 @@ enqueue backfill, the web-UI API surface, and the resume generation settings.
 from __future__ import annotations
 
 import json
+import threading
+from collections.abc import Sequence
 
 import pytest
 from fastapi.testclient import TestClient
@@ -18,7 +20,7 @@ from library_rag.config import Config, ConfigError, ResumeSettings, Services
 from library_rag.db import Database, db_path_for
 from library_rag.embeddings import FakeEmbedder
 from library_rag.indexing import FakeQdrant
-from library_rag.llm import FakeAnswerModel
+from library_rag.llm import FakeAnswerModel, Message
 from library_rag.migrations import MIGRATIONS, migrate
 from library_rag.resumes import (
     enqueue_missing_resumes,
@@ -317,3 +319,39 @@ def test_resume_settings_invalid_values_raise(base_config: Config) -> None:
         resume=ResumeSettings(max_tokens=3000, temperature=0.5),
     )
     assert cfg.resume.max_tokens == 3000
+
+
+# --- M9: concurrent drain --------------------------------------------------------
+
+
+def test_resume_drain_is_concurrent_when_configured(state_db: Database, base_config: Config) -> None:
+    """Two queued resumes must be generated at the same time when
+    ``worker.max_concurrent_jobs = 2`` — a barrier in complete() can only be
+    released if both job threads are inside it simultaneously. Sequential
+    execution (the default) would hit the barrier's 5s timeout and fail."""
+    base_config.answer.fake = True
+    base_config.worker.max_concurrent_jobs = 2
+    q = _published(state_db, base_config, doc="docC1", rev="revC1", run="runC1")
+    _published(state_db, base_config, doc="docC2", rev="revC2", run="runC2")
+    assert enqueue_missing_resumes(state_db, base_config) == 2
+    barrier = threading.Barrier(2, timeout=5.0)
+
+    class _BarrierModel(FakeAnswerModel):
+        def complete(self, messages: Sequence[Message]) -> str:
+            barrier.wait()
+            return super().complete(messages)
+
+    # One scripted ~780-word reply per job: the bare FakeAnswerModel
+    # default is 5 words, below the 20-word resume floor, and would fail
+    # both jobs with resume_too_short before the barrier even mattered.
+    handled = run_worker(
+        state_db, base_config, once=True, poll_delay=0,
+        qdrant=q, embedder=FakeEmbedder(base_config.embedding.dimensions),
+        model=_BarrierModel([_scripted_resume(), _scripted_resume()]),
+    )
+    assert handled == 2
+    states = [
+        r["state"]
+        for r in state_db.query("SELECT state FROM jobs WHERE stage = 'resume'")
+    ]
+    assert sorted(states) == ["succeeded", "succeeded"]

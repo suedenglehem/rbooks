@@ -7,12 +7,15 @@ from pathlib import Path
 import pytest
 
 from library_rag.config import (
+    AnswerEndpoint,
+    AnswerSettings,
     Config,
     ConfigError,
     LoggingSettings,
     Paths,
     PilotSettings,
     Services,
+    WorkerSettings,
     load_config,
 )
 
@@ -317,3 +320,62 @@ def test_load_config_invalid_logging_raises(roots: dict[str, Path], tmp_path: Pa
     )
     with pytest.raises(ConfigError, match=r"logging\.level"):
         load_config(cfg_file)
+
+
+# --- M9: answer.extra_endpoints + worker ----------------------------------------
+
+
+def test_answer_extra_endpoints_default_and_parse() -> None:
+    assert AnswerSettings().extra_endpoints == []
+    s = AnswerSettings(
+        model_revision="qwen3.8-27b-fp8@vllm-dual-max",
+        extra_endpoints=[{"host": "ak", "port": 8080}],
+    )
+    assert s.extra_endpoints == [AnswerEndpoint(host="ak", port=8080)]
+    # model_name inherits the primary's when omitted.
+    assert s.extra_endpoints[0].model_name is None
+
+
+def test_answer_extra_endpoints_invalid_raise() -> None:
+    with pytest.raises(ConfigError, match=r"extra_endpoints"):
+        AnswerEndpoint(host="", port=80)
+    with pytest.raises(ConfigError, match=r"extra_endpoints"):
+        AnswerEndpoint(host="ak", port=0)
+
+
+def test_worker_settings_default_and_validation() -> None:
+    assert WorkerSettings().max_concurrent_jobs == 1
+    with pytest.raises(ConfigError, match=r"max_concurrent_jobs"):
+        WorkerSettings(max_concurrent_jobs=0)
+
+
+def test_load_config_answer_pool_and_worker(
+    roots: dict[str, Path], tmp_path: Path
+) -> None:
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(
+        "\n".join(
+            [
+                "paths:",
+                "  source_roots: []",
+                f"  archive_root: {roots['archive_root']}",
+                f"  artifact_root: {roots['artifact_root']}",
+                f"  state_root: {roots['state_root']}",
+                f"  qdrant_root: {roots['qdrant_root']}",
+                f"  model_root: {roots['model_root']}",
+                f"  scratch_root: {roots['scratch_root']}",
+                "answer:",
+                "  model_revision: qwen3.8-27b-fp8@vllm-dual-max",
+                "  model_name: qwen3.8-27b",
+                "  extra_endpoints:",
+                "    - host: ak",
+                "      port: 8080",
+                "worker:",
+                "  max_concurrent_jobs: 2",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    cfg = load_config(cfg_file)
+    assert cfg.answer.extra_endpoints == [AnswerEndpoint(host="ak", port=8080)]
+    assert cfg.worker.max_concurrent_jobs == 2

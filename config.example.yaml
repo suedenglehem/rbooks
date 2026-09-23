@@ -125,6 +125,14 @@ answer:
   max_tokens: 1024
   temperature: 0.1
   timeout_seconds: 60
+  # M9: extra endpoints serving the SAME model, load-balanced round-robin with
+  # per-call failover alongside services.answer_host:answer_port. An endpoint
+  # that is down costs its (fast, 10s) connect timeout per affected call and
+  # the pool degrades to the live ones — safe to leave configured while the
+  # machine is off. model_name inherits `answer.model_name` when omitted.
+  # extra_endpoints:
+  #   - host: ak
+  #     port: 8080
 
 # Extended per-book summaries ("resumes", M8): after a revision is published,
 # a `resume` job asks the answer model (identity always from `answer` above)
@@ -139,6 +147,13 @@ resume:
   timeout_seconds: 300
   prompt_version: resume-v1
   input_char_budget: 16000
+
+# Ingest-worker execution (M9). max_concurrent_jobs is the worker's job thread
+# pool: 1 (default) is the original strictly-sequential loop; >1 runs several
+# claimed jobs at once, which is what lets multiple LLM endpoints
+# (answer.extra_endpoints) drain a backfill in parallel.
+worker:
+  max_concurrent_jobs: 1
 
 # Short-log + per-job verbose-log configuration. Source of truth for detached
 # worker runs; the --log-level / --log-format CLI flags override these for a

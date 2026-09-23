@@ -2197,16 +2197,141 @@ touching stored resumes until the new one succeeds.
 - State at save: 187/293 stored, 105 pending + 1 running,
   0 failed at any stage; ~44 s/job → ETA ~1.5 h.
 
+### Backfill complete (2026-09-23 late night)
+- The last book was 362.PDF (rev 7f10c579): under the old code
+  it had permanently failed on its single attempt with
+  `answer_model_error` — a vLLM 200 whose `message.content` was
+  `null` (the thinking model spent `max_tokens` inside the
+  reasoning trace), misclassified as a permanent malformed
+  response. The hardening fix (see M9) requeues it as transient;
+  under the new code it succeeded on the first attempt in 30 s
+  — 846 words stored.
+- Final state (state DB, verified): **293/293 resume jobs
+  succeeded, 293 resumes stored, 0 failed**; the ibm.pdf
+  duplicate no-op publish job also completed — **15438/15438
+  jobs of every stage succeeded, zero non-terminal, zero
+  failed** anywhere in the pilot.
+- Worker stopped gracefully (`stop`); serve relaunched on 8100;
+  smoke green: `/health` ok, `/ready` all true (qdrant,
+  embedding, answer), `POST /resumes/search` ranked results
+  with excerpts, `GET /resumes/{rev}` full record (750 words,
+  `qwen3.8-27b-fp8@vllm-dual-max`, `resume-v1`), unknown rev →
+  404. The web UI Resumes tab works end-to-end on the live
+  sandbox.
+- Pilot résumé coverage is now 100%. The web-UI test the
+  operator wanted is fully exercisable (all 293 books have
+  resumés; search + "Open book" deep-link verified).
+
 ### Next unfinished task
-- Backfill IN FLIGHT (worker running, monitor armed). On
-  completion (monitor prints "BACKFILL COMPLETE: no resume jobs
-  pending/running"): `uv run library-rag stop --config <sandbox
-  config>`; relaunch serve on 8100 (token from serve.env,
-  source it in-shell, never echo it); smoke `/health` +
-  `/ready` + `POST /resumes/search`; report final counts
-  (expect 293 succeeded / 0 failed + the ibm.pdf duplicate
-  publish no-op). Re-arm the monitor on each 30-min expiry
-  until it exits on its own.
-- Full-library launch remains held on the user's explicit
-  approval (M7 §5); M8 adds the `resume` stage to that run
-  automatically via the publish hook.
+- **Full-library launch remains HELD on the user's explicit
+  approval** (M7 §5) — do not self-launch. M8 adds the
+  `resume` stage to that run automatically via the publish
+  hook; M9 (second LLM endpoint + worker concurrency 2 +
+  thinking-model hardening) is deployed to the sandbox and in
+  the tree, so the full run will use both endpoints and drain
+  the LLM-bound tail at roughly twice the rate, with the
+  null-content retry protecting against thinking-budget
+  exhaustion.
+- The full-library config must mirror the sandbox's M9
+  settings: `answer.extra_endpoints` (host `ak`, port 8080,
+  model renamed to match the primary) and
+  `worker.max_concurrent_jobs: 2`.
+
+## M9 — Second LLM endpoint + worker concurrency (2026-09-23)
+
+**Status: deployed to pilot sandbox, gate passed** (521 passed,
+ruff + mypy clean). Operator offered a second vLLM serving the
+same model (`qwen3.8-27b`, FP8) on `http://ak:8080` ("you may
+use a second vllm for processing, when it's available. right
+now it IS available"). Design goal: drain LLM-bound backfills
+(future: the full library's ~34,768 résumé calls) at roughly
+twice the rate, without breaking the single-endpoint
+deployments — an endpoint that is off must cost nothing but a
+fast connect timeout.
+
+### Delivered
+- `llm.py` — `AnswerModelPool`: round-robin over N endpoints
+  serving the same model; on any `AnswerModelError` (including
+  `AnswerModelUnavailableError`) fails over to the next
+  endpoint for the SAME call; raises the last error if every
+  endpoint fails; thread-safe (lock-protected round-robin
+  counter, safe to share across the worker's job threads);
+  rejects an empty pool. `build_answer_pool(cfg, *,
+  timeout_seconds, max_tokens, temperature)` — never raises:
+  unconfigured → `None`, `answer.fake` → `FakeAnswerModel`, no
+  extra endpoints → the bare primary (byte-identical to the
+  pre-M9 path), otherwise the pool. `make_answer_model` is now
+  a thin wrapper over it.
+- `resumes.py` — `make_resume_model` likewise wraps
+  `build_answer_pool` with `cfg.resume` generation params, so
+  the `resume` stage load-balances across the pool too (it is
+  the LLM-heavy stage M9 exists for).
+- `config.py` — `AnswerEndpoint` model (`host`, `port`,
+  optional `model_name` — inherits `answer.model_name` when
+  omitted; validator rejects empty host / port out of range),
+  `AnswerSettings.extra_endpoints` (default empty), and a new
+  top-level `WorkerSettings` section: `max_concurrent_jobs`
+  (default `1`, validated `>= 1`). `config.example.yaml`
+  documents both.
+- `worker.py` — `run_worker` accepts `worker.max_concurrent_jobs`:
+  `1` keeps the original strictly-sequential loop (extracted
+  unchanged into the shared per-job handler `_handle_claimed`,
+  so the default path's behavior is byte-identical); `> 1`
+  claims jobs into a `ThreadPoolExecutor(max_workers=N)` and
+  runs their handlers concurrently, draining futures as they
+  complete, still respecting `once` and `stop_event`. Safe by
+  construction: `jobs.claim` is one transaction on the
+  shared, lock-protected SQLite connection, and every handler's
+  lease fencing is per-job.
+- `indexing.py` — `RealQdrantOps` gains a `threading.RLock()`;
+  every public client method is guarded with a small `@_locked`
+  decorator. qdrant-client's embedded (local) mode has no
+  internal locking, and concurrent publish jobs would otherwise
+  interleave client calls; the remote backend is fine with the
+  lock too (it holds for one request).
+- Thinking-model hardening (the fix that unblocked 362.PDF,
+  the pilot's last résumé): `LlamaCppAnswerModel.complete`
+  now classifies a 200 response with `message.content: null`
+  as `AnswerModelUnavailableError` ("model returned null
+  content (thinking budget exhausted?)") — transient, so the
+  job retries with backoff and the pool can fail over —
+  instead of the permanent `AnswerModelError` it was before.
+  A non-null non-string content is still permanent (a broken
+  server, not a budget condition). This is a per-call budget
+  mode of qwen3.8-27b under vLLM: it spends `max_tokens`
+  inside the reasoning trace and emits `content: null`.
+- Tests: `tests/test_llm.py` (pool round-robin, per-call
+  failover on unavailable AND on malformed, last-error when
+  all fail, len/revision, empty rejected; the null-content
+  regression with the 362.PDF history in the comment; factory
+  builds a pool only when `extra_endpoints` is configured),
+  `tests/test_config.py` (endpoint/worker validation: port
+  range, empty host, `max_concurrent_jobs < 1`),
+  `tests/test_resumes.py` (the resume stage picks up
+  pool-scripted failures via `FakeAnswerModel` script pops —
+  a pool failure still ends in the right job state).
+- Deployed to the pilot sandbox: `config.sandbox.yaml` (never
+  committed) carries `answer.extra_endpoints: [{host: ak,
+  port: 8080}]` and `worker.max_concurrent_jobs: 2`. The
+  worker ran the new code for the final drain; 362.PDF
+  succeeded on it in 30 s (primary `127.0.0.1:8091` answered
+  that call — no failover was needed, but the pool was live).
+  `ak:8080` was verified serving the same `model_name`.
+  Sandbox recovery note: if `ak` is off at generation time,
+  the pool degrades to the primary (one fast connect timeout
+  per affected call) — no config change required.
+
+### Known behavior
+- The round-robin counter advances once per `complete` call
+  even when it fails over, so a dead endpoint is retried on
+  average once per N calls — the intended probe cadence.
+- Concurrency `> 1` means the worker no longer bounds total
+  Qdrant traffic to one job; the `RealQdrantOps` lock
+  serializes the client, not the load. Embed-stage jobs are
+  unchanged (they hit the 8 bge-m3 servers, not the pool).
+- `max_tokens: 1024` (answer) and `2400` (resume) leave
+  thinking models with a real chance of burning the budget in
+  reasoning; the null-content retry absorbs that at the cost
+  of one backoff per occurrence. If a book's résumé keeps
+  coming back null, raise `resume.max_tokens` — the
+  `resume_too_short` floor (20 words) still guards quality.

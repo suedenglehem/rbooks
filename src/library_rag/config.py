@@ -496,6 +496,31 @@ class RetrievalSettings(BaseModel):
         return self
 
 
+class AnswerEndpoint(BaseModel):
+    """An extra answer-model endpoint serving the same model (M9).
+
+    Load-balanced alongside the primary ``services.answer_host:answer_port``;
+    the pool fails over per call, so an endpoint that is down costs its
+    (fast) connect timeout and the pool degrades to the live ones.
+    """
+
+    host: str
+    port: int
+    # The server-side "model" field for /v1/chat/completions when it differs
+    # from the primary's; None inherits ``answer.model_name``.
+    model_name: str | None = None
+
+    @model_validator(mode="after")
+    def _check_endpoint(self) -> AnswerEndpoint:
+        if not self.host:
+            raise ConfigError("answer.extra_endpoints[].host must be non-empty")
+        if not 1 <= self.port <= 65535:
+            raise ConfigError(
+                f"answer.extra_endpoints[].port must be 1-65535 (got {self.port})"
+            )
+        return self
+
+
 class AnswerSettings(BaseModel):
     """Answer-model (LLM) settings for cited answering (PRD §12).
 
@@ -521,6 +546,9 @@ class AnswerSettings(BaseModel):
     # The prompt contract version; persisted with every answer so a saved
     # answer can be explained (and re-repaired) under the same rules.
     prompt_version: str = "m5-v1"
+    # M9: extra endpoints serving the same model, load-balanced with per-call
+    # failover alongside the primary (services.answer_host:answer_port).
+    extra_endpoints: list[AnswerEndpoint] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _check_answer(self) -> AnswerSettings:
@@ -596,6 +624,31 @@ class PilotSettings(BaseModel):
         return v
 
 
+class WorkerSettings(BaseModel):
+    """Ingest-worker execution settings (M9).
+
+    ``max_concurrent_jobs`` is the size of the worker's job thread pool.
+    ``1`` (default) is the original strictly-sequential loop, byte-identical
+    in behavior; ``> 1`` claims ``max_concurrent_jobs`` jobs and runs their
+    handlers concurrently, so multiple LLM endpoints (see
+    ``answer.extra_endpoints``) can drain a backfill at once. The state
+    database connection is shared-thread-safe and ``jobs.claim`` is
+    transactional, so concurrent claims are safe; ``RealQdrantOps`` (the
+    embedded/local Qdrant client, which has no internal locking) is guarded
+    by its own lock to match.
+    """
+
+    max_concurrent_jobs: int = 1
+
+    @model_validator(mode="after")
+    def _check_worker(self) -> WorkerSettings:
+        if self.max_concurrent_jobs < 1:
+            raise ConfigError(
+                f"worker.max_concurrent_jobs must be >= 1 (got {self.max_concurrent_jobs})"
+            )
+        return self
+
+
 class LoggingSettings(BaseModel):
     """Short-log + per-job verbose-log configuration (PRD §14).
 
@@ -642,6 +695,7 @@ class Config(BaseModel):
     retrieval: RetrievalSettings = Field(default_factory=RetrievalSettings)
     answer: AnswerSettings = Field(default_factory=AnswerSettings)
     resume: ResumeSettings = Field(default_factory=ResumeSettings)
+    worker: WorkerSettings = Field(default_factory=WorkerSettings)
     pilot: PilotSettings = Field(default_factory=PilotSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
 

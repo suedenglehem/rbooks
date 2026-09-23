@@ -18,12 +18,7 @@ from .config import Config
 from .db import Database
 from .identity import make_task_key
 from .jobs import Jobs
-from .llm import (
-    AnswerModel,
-    FakeAnswerModel,
-    LlamaCppAnswerModel,
-    Message,
-)
+from .llm import AnswerModel, Message, build_answer_pool
 from .scan import STAGE_RESUME
 
 __all__ = [
@@ -55,26 +50,18 @@ _TOKEN = re.compile(r"[\w]+", re.UNICODE)
 def make_resume_model(cfg: Config) -> AnswerModel | None:
     """Build the answer model with resume-generation parameters.
 
-    Mirrors :func:`library_rag.llm.make_answer_model` — the model identity
-    (host, port, name, revision) always comes from ``cfg.answer`` — but the
-    generation parameters come from ``cfg.resume``: a resume is a longer,
-    looser generation than a cited answer, and
-    :class:`LlamaCppAnswerModel` fixes those at construction. Returns
-    ``None`` when no answer model is configured; the caller then fails the
-    job per-job (``answer_model_not_configured``), not at config load.
+    Thin wrapper over :func:`library_rag.llm.build_answer_pool` — the model
+    identity (host, port, name, revision, and the M9 ``extra_endpoints``
+    pool) always comes from ``cfg.answer`` — but the generation parameters
+    come from ``cfg.resume``: a resume is a longer, looser generation than a
+    cited answer, and :class:`~library_rag.llm.LlamaCppAnswerModel` fixes
+    those at construction. Returns ``None`` when no answer model is
+    configured; the caller then fails the job per-job
+    (``answer_model_not_configured``), not at config load.
     """
-    a = cfg.answer
-    if not a.is_configured:
-        return None
-    if a.fake:
-        return FakeAnswerModel()
-    assert a.model_revision is not None
     r = cfg.resume
-    return LlamaCppAnswerModel(
-        host=cfg.services.answer_host,
-        port=cfg.services.answer_port,
-        model_name=a.model_name or a.model_revision,
-        model_revision=a.model_revision,
+    return build_answer_pool(
+        cfg,
         timeout_seconds=r.timeout_seconds,
         max_tokens=r.max_tokens,
         temperature=r.temperature,

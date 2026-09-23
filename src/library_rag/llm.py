@@ -14,6 +14,7 @@ is unavailable* (transient; search and other commands must keep working) from
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Sequence
 from typing import Protocol, runtime_checkable
 
@@ -24,10 +25,12 @@ from .config import Config
 __all__ = [
     "AnswerModel",
     "AnswerModelError",
+    "AnswerModelPool",
     "AnswerModelUnavailableError",
     "FakeAnswerModel",
     "LlamaCppAnswerModel",
     "Message",
+    "build_answer_pool",
     "make_answer_model",
 ]
 
@@ -133,22 +136,88 @@ class LlamaCppAnswerModel:
         try:
             body = resp.json()
             content = body["choices"][0]["message"]["content"]
-            if not isinstance(content, str):
-                raise TypeError("content is not a string")
         except (AttributeError, IndexError, KeyError, TypeError, ValueError) as exc:
             raise AnswerModelError(
                 f"malformed chat completion response: {exc}"
             ) from exc
+        if content is None:
+            # Thinking models (qwen3.8-27b) that spend max_tokens inside the
+            # reasoning trace return 200 with content: null. That is a
+            # per-call budget condition, not a broken server — transient, so
+            # the job retries with backoff and the pool can fail over.
+            raise AnswerModelUnavailableError(
+                "model returned null content (thinking budget exhausted?)"
+            )
+        if not isinstance(content, str):
+            raise AnswerModelError(
+                "malformed chat completion response: content is not a string"
+            )
         return content
 
 
-def make_answer_model(cfg: Config) -> AnswerModel | None:
-    """Build the configured answer model, or ``None`` when none is configured.
+class AnswerModelPool:
+    """A load-balancing pool of endpoints serving the same model (M9).
+
+    Calls start at a round-robin position and, on :class:`AnswerModelError`
+    (including :class:`AnswerModelUnavailableError`), fail over to the next
+    endpoint for the *same* call. So an endpoint that is down costs its
+    (fast) connect timeout per affected call and the pool degrades to the
+    live ones; if every endpoint fails, the last error is raised.
+
+    Thread-safe: the worker may issue completions from several job threads
+    (``worker.max_concurrent_jobs``), and each ``httpx.Client`` inside a
+    :class:`LlamaCppAnswerModel` is itself safe to share across threads.
+
+    A single-element pool is never constructed — :func:`build_answer_pool`
+    returns the bare model instead, so the no-extra-endpoints path is
+    byte-identical to the pre-M9 behavior.
+    """
+
+    def __init__(self, models: Sequence[AnswerModel]) -> None:
+        if not models:
+            raise ValueError("AnswerModelPool requires at least one model")
+        self._models = list(models)
+        self._lock = threading.Lock()
+        self._next = 0
+        self.model_revision = self._models[0].model_revision
+
+    def __len__(self) -> int:
+        return len(self._models)
+
+    def complete(self, messages: Sequence[Message]) -> str:
+        n = len(self._models)
+        with self._lock:
+            start = self._next
+            self._next = (self._next + 1) % n
+        last_error: AnswerModelError | None = None
+        for offset in range(n):
+            model = self._models[(start + offset) % n]
+            try:
+                return model.complete(messages)
+            except AnswerModelError as exc:
+                last_error = exc
+        assert last_error is not None  # loop ran at least once
+        raise last_error
+
+
+def build_answer_pool(
+    cfg: Config,
+    *,
+    timeout_seconds: float,
+    max_tokens: int,
+    temperature: float,
+) -> AnswerModel | None:
+    """Build the answer model: primary endpoint, plus a pool when configured.
 
     Unlike :func:`library_rag.embeddings.make_embedder`, this never raises:
     the answer model is optional (search and the reader must keep working
     without it), and an unconfigured model is reported as a failed answer
     with an explicit reason, not a config crash.
+
+    ``answer.extra_endpoints`` (M9) adds endpoints serving the same model,
+    each built with the caller's generation parameters (the resume stage
+    passes its own ``max_tokens``/``temperature``/``timeout_seconds``, which
+    is why this builder takes them rather than reading ``cfg.answer``).
     """
     a = cfg.answer
     if not a.is_configured:
@@ -156,11 +225,43 @@ def make_answer_model(cfg: Config) -> AnswerModel | None:
     if a.fake:
         return FakeAnswerModel()
     assert a.model_revision is not None
-    return LlamaCppAnswerModel(
+    model_name = a.model_name or a.model_revision
+    primary = LlamaCppAnswerModel(
         host=cfg.services.answer_host,
         port=cfg.services.answer_port,
-        model_name=a.model_name or a.model_revision,
+        model_name=model_name,
         model_revision=a.model_revision,
+        timeout_seconds=timeout_seconds,
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
+    if not a.extra_endpoints:
+        return primary
+    models = [primary]
+    for e in a.extra_endpoints:
+        models.append(
+            LlamaCppAnswerModel(
+                host=e.host,
+                port=e.port,
+                model_name=e.model_name or model_name,
+                model_revision=a.model_revision,
+                timeout_seconds=timeout_seconds,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+        )
+    return AnswerModelPool(models)
+
+
+def make_answer_model(cfg: Config) -> AnswerModel | None:
+    """Build the configured answer model, or ``None`` when none is configured.
+
+    Thin wrapper over :func:`build_answer_pool` with the ``answer`` stage's
+    generation parameters.
+    """
+    a = cfg.answer
+    return build_answer_pool(
+        cfg,
         timeout_seconds=a.timeout_seconds,
         max_tokens=a.max_tokens,
         temperature=a.temperature,

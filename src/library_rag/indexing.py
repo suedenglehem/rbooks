@@ -31,11 +31,13 @@ pinned Qdrant release has no server-side BM25 index.
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
+import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Protocol, cast, runtime_checkable
+from typing import Any, Protocol, cast, runtime_checkable
 
 from qdrant_client import QdrantClient
 from qdrant_client import models as m
@@ -229,6 +231,24 @@ _PAYLOAD_INDEX_FIELDS: tuple[tuple[str, m.PayloadSchemaType], ...] = (
 )
 
 
+def _locked(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Serialize a :class:`RealQdrantOps` method on its client lock (M9).
+
+    qdrant-client's local (embedded) mode has no internal locking, and the
+    worker may now run publish jobs concurrently (``worker.max_concurrent_jobs``),
+    so every client call is guarded by the ops object's reentrant lock. The
+    remote backend is fine with it too — the calls were always atomic-ish
+    anyway, and the lock only ever holds for one request.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(self: RealQdrantOps, *args: Any, **kwargs: Any) -> Any:
+        with self._lock:
+            return fn(self, *args, **kwargs)
+
+    return wrapper
+
+
 class RealQdrantOps:
     """Thin wrapper over ``qdrant_client.QdrantClient`` (server pinned v1.12.4).
 
@@ -253,12 +273,18 @@ class RealQdrantOps:
                 host=cfg.services.qdrant_host, port=cfg.services.qdrant_port, timeout=timeout
             )
         self.collection = COLLECTION
+        # qdrant-client's embedded (local) mode has no internal locking; the
+        # worker's concurrent job threads (M9) share one RealQdrantOps, so
+        # every client call is serialized here.
+        self._lock = threading.RLock()
 
     # -- lifecycle -------------------------------------------------------------
+    @_locked
     def close(self) -> None:
         """Release the client (local mode drops its storage flock on close)."""
         self._client.close()
 
+    @_locked
     def ping(self) -> bool:
         try:
             self._client.get_collections()
@@ -266,12 +292,14 @@ class RealQdrantOps:
         except Exception:
             return False
 
+    @_locked
     def collection_exists(self) -> bool:
         try:
             return bool(self._client.collection_exists(self.collection))
         except Exception:
             return False
 
+    @_locked
     def ensure_collection(self, *, dimensions: int) -> None:
         if self._client.collection_exists(self.collection):
             self._check_dimensions(dimensions)
@@ -314,6 +342,7 @@ class RealQdrantOps:
                 )
 
     # -- writes -----------------------------------------------------------------
+    @_locked
     def upsert(self, points: Sequence[QdrantPoint]) -> None:
         if not points:
             return
@@ -335,6 +364,7 @@ class RealQdrantOps:
             wait=True,
         )
 
+    @_locked
     def set_active(self, f: IndexFilter, active: bool) -> None:
         cf = f.to_qdrant()
         if cf is None:
@@ -347,6 +377,7 @@ class RealQdrantOps:
             wait=True,
         )
 
+    @_locked
     def delete(self, f: IndexFilter) -> None:
         cf = f.to_qdrant()
         if cf is None:
@@ -358,10 +389,12 @@ class RealQdrantOps:
         )
 
     # -- reads -------------------------------------------------------------------
+    @_locked
     def count(self, f: IndexFilter) -> int:
         cf = f.to_qdrant()
         return int(self._client.count(self.collection, count_filter=cf).count)
 
+    @_locked
     def ids(self, f: IndexFilter) -> frozenset[str]:
         out: set[str] = set()
         cf = f.to_qdrant()
@@ -380,6 +413,7 @@ class RealQdrantOps:
                 break
         return frozenset(out)
 
+    @_locked
     def dense_search(self, vector: Sequence[float], limit: int, f: IndexFilter) -> list[Hit]:
         res = self._client.query_points(
             collection_name=self.collection,
@@ -391,6 +425,7 @@ class RealQdrantOps:
         )
         return [Hit(str(r.id), float(r.score), dict(r.payload or {})) for r in res.points]
 
+    @_locked
     def sparse_search(
         self, indices: Sequence[int], values: Sequence[float], limit: int, f: IndexFilter
     ) -> list[Hit]:

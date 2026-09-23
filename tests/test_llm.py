@@ -16,9 +16,10 @@ from typing import Any
 
 import pytest
 
-from library_rag.config import Config
+from library_rag.config import AnswerEndpoint, Config
 from library_rag.llm import (
     AnswerModelError,
+    AnswerModelPool,
     AnswerModelUnavailableError,
     FakeAnswerModel,
     LlamaCppAnswerModel,
@@ -92,6 +93,22 @@ def test_make_answer_model_configured_builds_client(base_config: Config) -> None
     assert model.model_revision == "qwen2.5-7b@abc"
 
 
+def test_make_answer_model_without_extra_endpoint_stays_bare(base_config: Config) -> None:
+    base_config.answer.model_revision = "qwen2.5-7b@abc"
+    model = make_answer_model(base_config)
+    assert isinstance(model, LlamaCppAnswerModel)
+    assert not isinstance(model, AnswerModelPool)
+
+
+def test_make_answer_model_with_extra_endpoint_builds_pool(base_config: Config) -> None:
+    base_config.answer.model_revision = "qwen2.5-7b@abc"
+    base_config.answer.extra_endpoints = [AnswerEndpoint(host="ak", port=8080)]
+    model = make_answer_model(base_config)
+    assert isinstance(model, AnswerModelPool)
+    assert len(model) == 2
+    assert model.model_revision == "qwen2.5-7b@abc"
+
+
 # --- LlamaCppAnswerModel -----------------------------------------------------------
 
 
@@ -142,6 +159,24 @@ def test_llama_cpp_contracted_payload_and_content(monkeypatch: pytest.MonkeyPatc
     }
 
 
+def test_llama_cpp_null_content_is_transient(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A thinking model (qwen3.8-27b) that spends max_tokens inside the
+    # reasoning trace returns 200 with content: null. That is a per-call
+    # budget condition, not a broken server: it must be *unavailable*
+    # (transient → job retries with backoff, pool can fail over), not a
+    # permanent malformed-response failure. Regression: 362.PDF burned its
+    # two retry attempts on exactly this before the backfill finished.
+    model = _model()
+    client = _FakeClient(
+        _FakeResponse(200, {"choices": [{"message": {"content": None}}]})
+    )
+    monkeypatch.setattr(model, "_client", client)
+    with pytest.raises(AnswerModelUnavailableError, match="null content"):
+        model.complete([{"role": "user", "content": "hi"}])
+
+
 def test_llama_cpp_http_error_is_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
     model = _model()
     client = _FakeClient(_FakeResponse(500, {}))
@@ -169,3 +204,72 @@ def test_llama_cpp_malformed_body_is_a_permanent_model_error(
         model.complete([{"role": "user", "content": "hi"}])
     # A malformed body is a model error, not an availability problem.
     assert not isinstance(excinfo.value, AnswerModelUnavailableError)
+
+
+# --- AnswerModelPool (M9) ----------------------------------------------------------
+
+_MSGS: list[dict[str, str]] = [{"role": "user", "content": "hi"}]
+
+
+class _FailingModel:
+    """Always raises the given error; counts the calls it was asked to make."""
+
+    model_revision = "failing-v1"
+
+    def __init__(self, exc: AnswerModelError) -> None:
+        self._exc = exc
+        self.calls = 0
+
+    def complete(self, messages: list[dict[str, str]]) -> str:
+        self.calls += 1
+        raise self._exc
+
+
+def test_pool_round_robin_between_endpoints() -> None:
+    a = FakeAnswerModel(["a1", "a2"])
+    b = FakeAnswerModel(["b1", "b2"])
+    pool = AnswerModelPool([a, b])
+    assert [pool.complete(_MSGS) for _ in range(4)] == ["a1", "b1", "a2", "b2"]
+
+
+def test_pool_exposes_len_and_first_model_revision() -> None:
+    a = FakeAnswerModel()
+    b = FakeAnswerModel()
+    pool = AnswerModelPool([a, b])
+    assert len(pool) == 2
+    assert pool.model_revision == a.model_revision
+
+
+def test_pool_rejects_empty() -> None:
+    with pytest.raises(ValueError, match="at least one"):
+        AnswerModelPool([])
+
+
+def test_pool_fails_over_when_an_endpoint_is_unavailable() -> None:
+    down = _FailingModel(AnswerModelUnavailableError("connection refused"))
+    # Two scripted replies: call 1 reaches `up` via failover (off the dead
+    # endpoint), and call 2 lands on `up` directly because the round-robin
+    # counter already advanced past the dead endpoint on call 1.
+    up = FakeAnswerModel(["ok [E1].", "ok [E1]."])
+    pool = AnswerModelPool([down, up])
+    assert pool.complete(_MSGS) == "ok [E1]."
+    assert down.calls == 1
+    assert pool.complete(_MSGS) == "ok [E1]."
+
+
+def test_pool_fails_over_on_malformed_responses_too() -> None:
+    broken = _FailingModel(AnswerModelError("malformed chat completion response"))
+    up = FakeAnswerModel(["ok [E1]."])
+    pool = AnswerModelPool([broken, up])
+    assert pool.complete(_MSGS) == "ok [E1]."
+    assert broken.calls == 1
+
+
+def test_pool_raises_last_error_when_every_endpoint_fails() -> None:
+    e1 = _FailingModel(AnswerModelUnavailableError("first down"))
+    e2 = _FailingModel(AnswerModelError("second broken"))
+    pool = AnswerModelPool([e1, e2])
+    with pytest.raises(AnswerModelError, match="second broken"):
+        pool.complete(_MSGS)
+    assert e1.calls == 1
+    assert e2.calls == 1
