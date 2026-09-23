@@ -42,6 +42,7 @@ from starlette.requests import ClientDisconnect
 
 from . import __version__
 from .answers import answer_query, get_answer, list_answers, resolve_citation
+from .browse import BrowseError, BrowseNotFound, list_browse_dir
 from .config import Config
 from .db import Database
 from .embeddings import Embedder
@@ -142,6 +143,15 @@ def create_app(
     app: FastAPI = create_reader_app(cfg, db)
     app.title = "library-rag research app"
 
+    # Browse (M10) availability is soft: enabled AND the configured root
+    # actually exists. A pulled mount degrades the feature (404s, tab
+    # hidden via /ready) instead of blocking startup — checked here, at
+    # app creation, the same layer where find_web_dist() touches the FS.
+    browse_root = cfg.browse.root
+    browse_available = bool(
+        cfg.browse.enabled and browse_root is not None and browse_root.is_dir()
+    )
+
     @app.middleware("http")
     async def _security(
         request: Request, call_next: Callable[[Request], Awaitable[Any]]
@@ -187,6 +197,9 @@ def create_app(
             "token_required": bool(
                 cfg.services.require_api_token and cfg.services.api_token
             ),
+            # The web UI shows the Browse nav button only when this is true;
+            # the 30 s poll makes a returning mount reappear on its own.
+            "browse": browse_available,
         }
 
     # --- library ----------------------------------------------------------------
@@ -307,6 +320,21 @@ def create_app(
         if data is None:
             raise HTTPException(404, "no stored resume for this revision")
         return data
+
+    # --- browse (M10) -------------------------------------------------------------
+
+    @app.get("/browse/dir")
+    def browse_dir(path: str = "") -> dict[str, Any]:
+        if not browse_available or browse_root is None:
+            # Flag off, root unconfigured, or mount pulled — the SPA hides
+            # the tab via /ready; direct calls 404.
+            raise HTTPException(404, "browse is not available")
+        try:
+            return list_browse_dir(db, browse_root, path, cfg.browse.file_types)
+        except BrowseNotFound as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except BrowseError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     # --- ingestion dashboard ------------------------------------------------------
 

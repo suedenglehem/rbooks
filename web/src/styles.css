@@ -542,6 +542,68 @@ table.jobs td.num { text-align: right; font-variant-numeric: tabular-nums; }
   padding: 10px;
 }
 
+/* --- browse view (M10) --------------------------------------------------------------- */
+
+#view-browse .browse {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 860px;
+}
+
+.browse-crumbs { display: flex; align-items: center; flex-wrap: wrap; gap: 2px; }
+
+.browse-crumb {
+  font: inherit;
+  font-size: 13px;
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 6px;
+}
+.browse-crumb:hover { background: var(--pane); }
+.browse-crumb-sep { color: var(--muted); font-size: 13px; }
+
+#browse-entries {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--pane);
+  overflow: auto;
+  max-height: 62vh;
+}
+
+.browse-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 10px;
+  font-size: 13px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--line);
+}
+.browse-row:last-child { border-bottom: none; }
+.browse-row:hover { background: var(--bg); }
+.browse-row.dir .browse-name { font-weight: 600; }
+.browse-row.not-indexed { color: var(--muted); }
+
+.browse-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.browse-hint {
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  white-space: nowrap;
+}
+
 /* --- narrow screens: tabs instead of compressed panes ---------------------------------- */
 
 @media (max-width: 979px) {

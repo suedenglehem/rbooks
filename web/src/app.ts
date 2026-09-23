@@ -1,9 +1,10 @@
 /**
  * Application shell (PRD §10): a two-pane research interface — query/answer
- * on the left, source reader on the right — plus an ingestion dashboard and
- * a resumes view (keyword search over the stored per-book summaries, M8).
- * Below 980px the panes collapse into Query/Reader tabs. No framework: plain
- * TypeScript building the DOM, talking to the same-origin research API.
+ * on the left, source reader on the right — plus an ingestion dashboard, a
+ * resumes view (keyword search over the stored per-book summaries, M8), and
+ * a filesystem browse of the configured books root (M10). Below 980px the
+ * panes collapse into Query/Reader tabs. No framework: plain TypeScript
+ * building the DOM, talking to the same-origin research API.
  */
 import {
   api,
@@ -17,6 +18,7 @@ import type {
   AnswerRow,
   Book,
   BookManifest,
+  BrowseEntry,
   Evidence,
   EvidenceLocation,
   Passage,
@@ -73,6 +75,18 @@ function timeAgo(ts: number): string {
   return `${Math.floor(h / 24)}d ago`;
 }
 
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  let v = n / 1024;
+  let unit = "KB";
+  for (const next of ["MB", "GB", "TB"] as const) {
+    if (v < 1024) break;
+    v /= 1024;
+    unit = next;
+  }
+  return `${v >= 100 ? Math.round(v) : v.toFixed(1)} ${unit}`;
+}
+
 // --- app ---------------------------------------------------------------------
 
 export class App {
@@ -93,10 +107,18 @@ export class App {
   // The resume currently shown in the resumes view (rev + fallback title),
   // so "Open book" knows which revision to deep-link into the reader.
   private resumeState: { rev: string; title: string } | null = null;
+  // Browse (M10): the relative directory currently listed ("" = the root).
+  private browsePath = "";
+  // The view on screen, so a /ready poll can react when Browse becomes
+  // unavailable (mount pulled) while its tab is open.
+  private currentView: "research" | "ingest" | "resumes" | "browse" = "research";
 
   constructor(private root: HTMLElement) {
     root.innerHTML = "";
-    root.append(this.buildHeader(), el("main", {}, this.buildResearchView(), this.buildIngestView(), this.buildResumeView()));
+    root.append(
+      this.buildHeader(),
+      el("main", {}, this.buildResearchView(), this.buildIngestView(), this.buildResumeView(), this.buildBrowseView()),
+    );
 
     const canvas = root.querySelector<HTMLCanvasElement>("#pdf-canvas");
     const epub = root.querySelector<HTMLElement>("#epub-host");
@@ -129,10 +151,16 @@ export class App {
       this.dot("embedding", "Embeddings"),
       this.dot("answer", "Answer model"),
     );
+    // The Browse button starts hidden: loadReady shows it only when the
+    // server reports browse available (/ready.browse), and the 30 s poll
+    // hides it again if the mount goes away.
+    const browseBtn = this.navBtn("browse", "Browse");
+    browseBtn.hidden = true;
     const views = el("nav", { class: "views" },
       this.navBtn("research", "Research"),
       this.navBtn("ingest", "Ingestion"),
       this.navBtn("resumes", "Resumes"),
+      browseBtn,
     );
     const tokenWrap = el("div", { class: "token", hidden: "true" },
       el("label", { class: "token-label" }, "API token",
@@ -152,7 +180,7 @@ export class App {
       el("span", { class: "dot-marker" }), label);
   }
 
-  private navBtn(view: "research" | "ingest" | "resumes", label: string): HTMLButtonElement {
+  private navBtn(view: "research" | "ingest" | "resumes" | "browse", label: string): HTMLButtonElement {
     const b = el("button", { class: "view-btn", "data-view": view }, label);
     b.addEventListener("click", () => this.showView(view));
     return b;
@@ -300,6 +328,18 @@ export class App {
       el("div", { class: "research-grid" }, left, right));
   }
 
+  private buildBrowseView(): HTMLElement {
+    return el("section", { id: "view-browse", hidden: "true" },
+      el("div", { class: "browse" },
+        el("div", { class: "browse-bar" },
+          el("div", { class: "browse-crumbs", id: "browse-crumbs" })),
+        el("div", { class: "muted small" },
+          "Click a file to open it in the reader · right-click a file for its stored summary."),
+        el("div", { class: "ingest-msg", id: "browse-msg" }),
+        el("div", { id: "browse-entries" }),
+      ));
+  }
+
   // --- startup / views ---------------------------------------------------------
 
   private async startup(): Promise<void> {
@@ -307,14 +347,17 @@ export class App {
     this.readyTimer = window.setInterval(() => void this.loadReady(), 30000);
   }
 
-  private showView(view: "research" | "ingest" | "resumes"): void {
+  private showView(view: "research" | "ingest" | "resumes" | "browse"): void {
+    this.currentView = view;
     this.root.querySelector<HTMLElement>("#view-research")!.hidden = view !== "research";
     this.root.querySelector<HTMLElement>("#view-ingest")!.hidden = view !== "ingest";
     this.root.querySelector<HTMLElement>("#view-resumes")!.hidden = view !== "resumes";
+    this.root.querySelector<HTMLElement>("#view-browse")!.hidden = view !== "browse";
     for (const b of Array.from(this.root.querySelectorAll<HTMLButtonElement>(".view-btn"))) {
       b.classList.toggle("active", b.dataset.view === view);
     }
     if (view === "ingest") void this.loadIngest();
+    else if (view === "browse") void this.loadBrowse();
     else void this.loadReady();
   }
 
@@ -346,6 +389,17 @@ export class App {
         // config flips back on re-enables the field without a reload.)
         this.root.querySelector<HTMLElement>(".token")!.hidden = true;
         if (getToken()) setToken("");
+      }
+      // Browse tab follows the server's own availability word, so a
+      // returning mount re-creates the button without a reload.
+      const browseBtn = this.root.querySelector<HTMLButtonElement>('[data-view="browse"]');
+      if (browseBtn) browseBtn.hidden = !r.browse;
+      if (!r.browse && this.currentView === "browse") {
+        this.setBrowseMsg(
+          "Browse is not available right now — the configured root is " +
+            "missing (mount pulled?) or the feature was disabled. The tab " +
+            "reappears automatically when it is back.",
+        );
       }
     } catch {
       this.setReady("qdrant", false);
@@ -1010,5 +1064,112 @@ export class App {
     // openReaderFor's specific failure messages overwrite this.
     this.readerStatus(`Opening "${st.title}" …`);
     if (await this.openReaderFor(st.rev)) void this.reader.refresh();
+  }
+
+  // --- browse (M10) ------------------------------------------------------------------
+
+  /** List one level of the books root. The client only ever sends relative
+   *  segments the server itself returned, so there is nothing to sanitize. */
+  private async loadBrowse(): Promise<void> {
+    const box = this.root.querySelector<HTMLElement>("#browse-entries")!;
+    try {
+      const { path, entries } = await api.browseDir(this.browsePath);
+      this.browsePath = path; // server-normalized
+      this.renderBrowseCrumbs();
+      box.innerHTML = "";
+      if (entries.length === 0) {
+        box.append(el("div", { class: "muted" }, "Empty directory."));
+      }
+      for (const e of entries) box.append(this.browseEntryRow(e));
+      this.setBrowseMsg("");
+    } catch (e) {
+      this.handleApiError(e);
+      this.setBrowseMsg(errText(e));
+    }
+  }
+
+  private renderBrowseCrumbs(): void {
+    const box = this.root.querySelector<HTMLElement>("#browse-crumbs")!;
+    box.innerHTML = "";
+    const parts = this.browsePath === "" ? [] : this.browsePath.split("/");
+    const crumbs: { label: string; path: string }[] = [{ label: "root", path: "" }];
+    let acc = "";
+    for (const seg of parts) {
+      acc = acc === "" ? seg : `${acc}/${seg}`;
+      crumbs.push({ label: seg, path: acc });
+    }
+    crumbs.forEach((c, i) => {
+      if (i > 0) box.append(el("span", { class: "browse-crumb-sep" }, "/"));
+      const b = el("button", { class: "browse-crumb", type: "button" }, c.label);
+      b.addEventListener("click", () => {
+        if (c.path === this.browsePath) return;
+        this.browsePath = c.path;
+        void this.loadBrowse();
+      });
+      box.append(b);
+    });
+  }
+
+  private browseEntryRow(e: BrowseEntry): HTMLElement {
+    const name = e.is_dir ? `${e.name}/` : e.name;
+    const size = e.size_bytes !== null ? formatBytes(e.size_bytes) : null;
+    const hint = e.is_dir
+      ? "folder"
+      : e.rev_id
+        ? "indexed"
+        : "not indexed yet";
+    const row = el(
+      "div",
+      {
+        class: e.is_dir ? "browse-row dir" : e.rev_id ? "browse-row file" : "browse-row file not-indexed",
+        title: e.is_dir
+          ? "Open folder"
+          : e.rev_id
+            ? "Click: open in the reader · right-click: stored summary"
+            : "Not in the index yet — the next scan will pick it up",
+      },
+      el("span", { class: "browse-name" }, name),
+      el("span", { class: "spacer" }),
+      size ? el("span", { class: "muted small" }, size) : null,
+      el("span", { class: "browse-hint" }, hint),
+    );
+    if (e.is_dir) {
+      row.addEventListener("click", () => {
+        this.browsePath = e.path;
+        void this.loadBrowse();
+      });
+    } else if (e.rev_id) {
+      const rev = e.rev_id; // narrowed for the closures (e is a property bag)
+      row.addEventListener("click", () => void this.openBrowseFile(e));
+      row.addEventListener("contextmenu", (ev) => {
+        ev.preventDefault();
+        this.showView("resumes");
+        void this.openResume(rev, e.title ?? e.name);
+      });
+    } else {
+      const note = `"${e.name}" is not in the index yet — it will appear after the next scan.`;
+      row.addEventListener("click", () => this.setBrowseMsg(note));
+      row.addEventListener("contextmenu", (ev) => {
+        ev.preventDefault();
+        this.setBrowseMsg(note);
+      });
+    }
+    return row;
+  }
+
+  private async openBrowseFile(e: BrowseEntry): Promise<void> {
+    if (e.rev_id === null) {
+      this.setBrowseMsg(`"${e.name}" is not in the index yet — it will appear after the next scan.`);
+      return;
+    }
+    this.showView("research");
+    this.showReaderPane();
+    this.readerStatus(`Opening "${e.title ?? e.name}" …`);
+    if (await this.openReaderFor(e.rev_id)) void this.reader.refresh();
+  }
+
+  private setBrowseMsg(msg: string): void {
+    const m = this.root.querySelector<HTMLElement>("#browse-msg");
+    if (m) m.textContent = msg;
   }
 }

@@ -198,6 +198,18 @@ export interface ResumeRecord {
   updated_at: number;
 }
 
+// M10: one level of the configured books root. `path` is relative to the
+// root; the server never accepts absolute paths or escapes. Files carry the
+// catalog's active rev when indexed (null fields = "not in the index yet").
+export interface BrowseEntry {
+  name: string;
+  path: string;
+  is_dir: boolean;
+  size_bytes: number | null;
+  rev_id: string | null;
+  title: string | null;
+}
+
 // --- token ------------------------------------------------------------------
 
 let token = readStoredToken();
@@ -284,6 +296,7 @@ export const api = {
       embedding_model: boolean;
       answer_model: boolean;
       token_required: boolean;
+      browse: boolean;
     }>("/ready"),
   library: () => request<{ books: Book[] }>("/library"),
 
@@ -327,6 +340,10 @@ export const api = {
     request<{ results: ResumeSummary[] }>("/resumes/search", post("/resumes/search", { query, limit })),
   resume: (revId: string) =>
     request<ResumeRecord>(`/resumes/${encodeURIComponent(revId)}`),
+  browseDir: (path: string) =>
+    request<{ path: string; entries: BrowseEntry[] }>(
+      `/browse/dir?path=${encodeURIComponent(path)}`,
+    ),
   ingestStatus: () => request<IngestStatus>("/ingest/status"),
   scan: () => request<{ reports: ScanReport[] }>("/scan", post("/scan", {})),
   ingestPause: (reason: string) =>

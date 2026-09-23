@@ -183,6 +183,19 @@ resume:
   prompt_version: resume-v1
   input_char_budget: 16000
 
+# Filesystem browse (M10): a web-UI tab that navigates the books root by hand.
+# Listing is relative to `root`; directories are always shown (drill-down),
+# files only when their suffix (case-insensitive) is in `file_types`. A file
+# already in the catalog shows its stored résumé on right-click and opens in
+# the reader on click; a file not in the index yet is shown, muted. OFF by
+# default — enable it with an absolute root (e.g. one of the source_roots
+# above). A root that disappears (mount pulled) degrades the feature only:
+# the tab hides itself and /browse/* 404s until the directory exists again.
+# browse:
+#   enabled: true
+#   root: /mnt/models_sas_ssd/books
+#   file_types: [.pdf, .epub, .PDF, .EPUB]
+
 # Ingest-worker execution (M9). max_concurrent_jobs is the worker's job thread
 # pool: 1 (default) is the original strictly-sequential loop; >1 runs several
 # claimed jobs at once, which is what lets multiple LLM endpoints

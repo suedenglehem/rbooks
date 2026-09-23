@@ -10,6 +10,7 @@ import pytest
 from library_rag.config import (
     AnswerEndpoint,
     AnswerSettings,
+    BrowseSettings,
     Config,
     ConfigError,
     LoggingSettings,
@@ -416,3 +417,83 @@ def test_load_config_answer_pool_and_worker(
         AnswerEndpoint(host="ak", port=8080, weight=1)
     ]
     assert cfg.worker.max_concurrent_jobs == 2
+
+
+# --- browse (M10) -------------------------------------------------------------
+
+
+def test_browse_settings_defaults() -> None:
+    b = BrowseSettings()
+    assert b.enabled is False
+    assert b.root is None
+    assert b.file_types == [".pdf", ".epub"]
+
+
+def test_config_browse_defaults_off(base_config: Config) -> None:
+    assert base_config.browse.enabled is False
+    assert base_config.browse.root is None
+
+
+def test_browse_enabled_requires_root() -> None:
+    with pytest.raises(ConfigError, match=r"browse.enabled requires browse.root"):
+        BrowseSettings(enabled=True)
+
+
+def test_browse_root_must_be_absolute() -> None:
+    with pytest.raises(ConfigError, match=r"browse.root must be absolute"):
+        BrowseSettings(enabled=True, root=Path("books"))
+
+
+def test_browse_disabled_with_root_is_fine() -> None:
+    b = BrowseSettings(root=Path("/mnt/books"))
+    assert b.enabled is False
+    assert b.root == Path("/mnt/books")
+
+
+def test_browse_file_types_must_not_be_empty() -> None:
+    with pytest.raises(ConfigError, match=r"browse.file_types must not be empty"):
+        BrowseSettings(file_types=[])
+
+
+def test_browse_file_types_must_be_dotted_suffixes() -> None:
+    for bad in ("pdf", ".", "no-dot", ""):
+        with pytest.raises(ConfigError, match=r"dotted suffixes"):
+            BrowseSettings(file_types=[bad])
+    # whitespace is trimmed, case is folded — these are valid
+    assert BrowseSettings(file_types=[" .PDF "] ).file_types == [".pdf"]
+
+
+def test_browse_file_types_normalized_and_deduped() -> None:
+    b = BrowseSettings(
+        enabled=True,
+        root=Path("/mnt/books"),
+        file_types=[".PDF", ".pdf", ".EPUB", ".epub", ".PDF"],
+    )
+    assert b.file_types == [".pdf", ".epub"]
+
+
+def test_load_config_browse_from_file(roots: dict[str, Path], tmp_path: Path) -> None:
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(
+        "\n".join(
+            [
+                "paths:",
+                "  source_roots: []",
+                f"  archive_root: {roots['archive_root']}",
+                f"  artifact_root: {roots['artifact_root']}",
+                f"  state_root: {roots['state_root']}",
+                f"  qdrant_root: {roots['qdrant_root']}",
+                f"  model_root: {roots['model_root']}",
+                f"  scratch_root: {roots['scratch_root']}",
+                "browse:",
+                "  enabled: true",
+                "  root: /mnt/models_sas_ssd/books",
+                "  file_types: [.pdf, .epub, .PDF, .EPUB]",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    cfg = load_config(cfg_file)
+    assert cfg.browse.enabled is True
+    assert cfg.browse.root == Path("/mnt/models_sas_ssd/books")
+    assert cfg.browse.file_types == [".pdf", ".epub"]

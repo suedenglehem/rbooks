@@ -87,6 +87,7 @@ def test_health_and_ready(client: TestClient) -> None:
         "embedding_model": True,
         "answer_model": True,
         "token_required": False,  # switch off by default → no token widget
+        "browse": False,  # off by default → feature hidden
     }
 
 
@@ -100,6 +101,7 @@ def test_ready_reports_down_qdrant(library: Library) -> None:
         "embedding_model": True,
         "answer_model": True,
         "token_required": False,
+        "browse": False,
     }
 
 

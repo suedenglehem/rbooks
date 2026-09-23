@@ -2593,3 +2593,113 @@ connects emit no log line).
 `failover-batch4`, ak down at start, ~20 jobs (~14 min window), operator
 starts ak ~2–3 min in; the worker run reclaims the leftover batch3 job
 `01dfe315…` first.
+
+## M10 — Filesystem browse tab (2026-09-24)
+
+**Status: gate passed (567 passed, ruff + mypy clean).** Operator
+request: a web-UI tab that navigates the books tree by hand — root set
+in configuration (`/mnt/models_sas_ssd/books` in our case), paths shown
+relative to the root, drill down to pdf/epub (the file types to show
+are also configured: `[.pdf, .epub, .PDF, .EPUB]`), left-click a file
+opens it in the reader, right-click opens its summary. The whole
+feature is enable/disable-able in configuration (off by default), and a
+missing mount must degrade the feature, never the app.
+
+### Design
+- Browse is a lens on the existing catalog + filesystem, not a new
+  reader. `GET /browse/dir?path=<rel>` lists one level of the
+  configured root: directories are always listed (drill-down), files
+  are filtered by the configured `file_types` (case-insensitive
+  match), and each file row carries the *active* revision's
+  `rev_id` + title + `size_bytes` when the path is indexed.
+- Left-click file → the existing reader pane (`openReaderFor(rev)`);
+  right-click → the existing Resumes pane via `GET /resumes/{rev}`
+  (M8's endpoint, whose 404 "no summary stored yet" handling is
+  reused). A file not in the index opens with a plain "not in the
+  index yet" message — no raw-file endpoint (the reader/archive
+  routes already serve bytes with auth). Breadcrumb navigation; the
+  client only ever sends relative segments the server gave it.
+- Containment: the request path must be relative (null bytes and
+  absolute paths rejected up front); the joined path is
+  containment-checked against the root's `realpath`, which kills
+  `..` escapes and symlinks pointing out of the tree; symlinked
+  entries are skipped in listings entirely — the same stance as
+  `scan.follow_symlinks: False`. Reuses `_is_within` (commonpath
+  based).
+- Path → revision lookup: one batched `IN (...)` query per listed
+  directory joining `path_aliases` to the doc's *active*
+  `source_revisions` row — a stale duplicate alias must still show
+  the document's current revision (the same rule `/library` applies).
+- Soft availability: `create_app` computes `browse_available =
+  enabled and root.is_dir()` (app-creation FS check, like
+  `find_web_dist()`); `/ready` reports the flag, the SPA shows the
+  Browse nav button only when it is true (the 30 s poll self-heals
+  the button when a mount returns), `/browse/*` 404s when
+  unavailable, and `_serve` prints a stderr warning when enabled but
+  the root is missing.
+- Auth: nothing new — the existing bearer middleware covers
+  `/browse/*` automatically (it is not in the open/static carve-outs).
+
+### Delivered
+- `src/library_rag/browse.py` (NEW) — pure module:
+  `resolve_browse_path` (containment), `lookup_active_revisions`
+  (batched path→active-revision join), `list_browse_dir` (one-level
+  listing: dirs first then files, case-insensitive type filter,
+  symlink skip, on-disk size for unindexed files, catalog
+  rev_id/title/size for indexed ones).
+- `src/library_rag/config.py` — `BrowseSettings` (off by default;
+  `enabled` requires `root`, `root` must be absolute, `file_types`
+  validated dotted suffixes, normalized lowercase and deduped —
+  `[.pdf, .epub, .PDF, .EPUB]` loads as `[".pdf", ".epub"]`) and
+  `Config.browse`.
+- `src/library_rag/api.py` — `GET /browse/dir` (400 malformed /
+  escapes root, 404 not-a-directory or feature unavailable),
+  `browse_available` computed at app creation, `browse` flag added
+  to `/ready`.
+- `src/library_rag/cli.py` — `_serve` stderr warning when browse is
+  enabled but the configured root does not exist.
+- `web/src/api.ts` / `app.ts` / `styles.css` — Browse view: nav
+  button shown only when `ready.browse`, breadcrumb bar, directory
+  drill-down, file rows (click → reader, right-click → resume pane,
+  unindexed files rendered muted); rebuilt `web/dist` with vite
+  (dist guard green).
+- `config.example.yaml` — documented `browse:` section (commented,
+  off).
+- Live operator config (`config.yaml`, gitignored — not committed):
+  `browse:` enabled with the operator's root and the four-case
+  file_types list; verified loading (`browse: True
+  /mnt/models_sas_ssd/books ['.pdf', '.epub']`).
+
+### Tests (31 new: 22 in test_browse.py, 9 in test_config.py; gate
+green — 567 passed, ruff + mypy clean)
+- `tests/test_browse.py` (22): containment — `..` escapes (including
+  after a descent), absolute path, symlink pointing out of the root,
+  null byte; an in-tree symlink resolves fine. Listings —
+  file_types filter case-insensitive, a directory named like a file
+  stays a directory, drill-down relative paths, empty dir, symlinks
+  skipped, not-a-directory/missing → `BrowseNotFound`. Stale alias
+  row: a duplicate path whose own rev went inactive still shows the
+  document's ACTIVE revision (rev_id + size + title). Route level —
+  listing shape, drill-down, `../x` and `/etc` → 400, file/missing
+  → 404, `/ready.browse` true, disabled-by-default → false + 404,
+  missing root degrades → false + 404 (app otherwise healthy).
+- `tests/test_config.py` (9, browse section): defaults (off, no
+  root), enabled-without-root rejected, non-absolute root rejected,
+  disabled-with-root fine, empty file_types rejected, non-dotted
+  suffixes rejected, whitespace+case normalization
+  (`" .PDF "` → `.pdf`), dedupe preserving order, load-from-file
+  with the four-case list.
+- `tests/test_api.py` — the two exact-shape `/ready` assertions gain
+  the `browse` key.
+
+### Open
+- Live E2E (serve 8100 currently DOWN): rides on the
+  failover-batch4 relaunch, gated on the operator restarting ak.
+  Verify `/ready.browse` true, root listing with relative paths,
+  drill-down, containment → 400, UI Browse tab visible (and hidden
+  with `browse.enabled: false`), PDF click → reader, right-click →
+  résumé pane, mount-pull degradation (tab disappears within one 30 s
+  poll, `/browse/dir` 404s, app otherwise healthy).
+- Default-off reverted-check (no `browse` section at all): app boots
+  identically, no nav button, `/browse/*` 404s — covered by the
+  disabled-by-default route tests.

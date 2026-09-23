@@ -632,6 +632,50 @@ class ResumeSettings(BaseModel):
         return self
 
 
+class BrowseSettings(BaseModel):
+    """Filesystem browser for the web UI (M10).
+
+    ``enabled`` (default False) gates the whole feature: when off the
+    ``/browse/*`` routes 404 and the SPA hides the Browse tab. When on,
+    ``root`` (required, absolute) is the single root the browser is allowed
+    to list; the UI shows paths relative to it. ``file_types`` is the list
+    of file suffixes (leading dot) listed as files — directories are always
+    listed for drill-down. Matching is case-insensitive against on-disk
+    names, so ``.PDF`` and ``.pdf`` are the same entry; the validator
+    normalizes to lowercase and collapses duplicates.
+
+    Config loading stays side-effect-free: ``root`` existence is NOT checked
+    here (or at load time). It is checked at app creation and exposed as
+    ``/ready.browse``, so a missing mount degrades the feature (404s, tab
+    hidden) instead of blocking startup.
+    """
+
+    enabled: bool = False
+    root: Path | None = None
+    file_types: list[str] = Field(default_factory=lambda: [".pdf", ".epub"])
+
+    @model_validator(mode="after")
+    def _check_browse(self) -> BrowseSettings:
+        if self.enabled and self.root is None:
+            raise ConfigError("browse.enabled requires browse.root")
+        if self.root is not None and not self.root.is_absolute():
+            raise ConfigError(f"browse.root must be absolute: {self.root!r}")
+        if not self.file_types:
+            raise ConfigError("browse.file_types must not be empty")
+        norm: list[str] = []
+        for ft in self.file_types:
+            ft = str(ft).strip().lower()
+            if not ft.startswith(".") or len(ft) < 2:
+                raise ConfigError(
+                    f"browse.file_types entries must be dotted suffixes "
+                    f"like '.pdf' (got {ft!r})"
+                )
+            if ft not in norm:
+                norm.append(ft)
+        self.file_types = norm
+        return self
+
+
 class PilotSettings(BaseModel):
     """M6 pilot controls (PRD §12).
 
@@ -725,6 +769,7 @@ class Config(BaseModel):
     retrieval: RetrievalSettings = Field(default_factory=RetrievalSettings)
     answer: AnswerSettings = Field(default_factory=AnswerSettings)
     resume: ResumeSettings = Field(default_factory=ResumeSettings)
+    browse: BrowseSettings = Field(default_factory=BrowseSettings)
     worker: WorkerSettings = Field(default_factory=WorkerSettings)
     pilot: PilotSettings = Field(default_factory=PilotSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)

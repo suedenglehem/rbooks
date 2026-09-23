@@ -666,6 +666,18 @@ def _serve(args: argparse.Namespace) -> int:
             "exposure; set services.require_api_token: true to enforce it.",
             file=sys.stderr,
         )
+    if cfg.browse.enabled:
+        root = cfg.browse.root
+        if root is None or not root.is_dir():
+            # A pulled mount must not block startup: the app degrades (the
+            # Browse tab is hidden via /ready, /browse/dir 404s) and the
+            # 30 s poll restores the feature when the root comes back.
+            print(
+                f"warning: browse.enabled is true but browse.root "
+                f"{root} is not an existing directory — the Browse tab is "
+                "disabled until it exists (e.g. the mount is back).",
+                file=sys.stderr,
+            )
     db = _open_state(cfg)
     try:
         qdrant, embedder, model = _index_and_models(cfg, db)
