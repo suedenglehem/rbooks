@@ -2548,3 +2548,48 @@ loaded tie (1/2 < 1/1); in-flight counters release after failover, after an
 all-endpoints-fail call, and after an unexpected non-`AnswerModelError`;
 bad weights rejected (length mismatch, `< 1`); config defaults/parse/
 validation for both weight fields.
+
+### Addendum — connect-phase timeout + failover/recovery test rounds (2026-09-23)
+
+**Shipped (commit `d8abe4d`, pushed):** `services.connect_timeout_seconds`
+(default 2.0, `> 0` enforced) wired as the connect-phase budget of
+`httpx.Timeout` on both LLM pools (primary `AnswerModelPool` + resume pool);
+read phase keeps `answer`/`resume` `timeout_seconds`. Config validation +
+pool connect-timeout tests; gate green (pytest + ruff + mypy + dist guard).
+Sandbox embed block also reverted to local `127.0.0.1:8081` after the ak
+4-replica embedder test (203 calls / 51-51-51-50 / zero failures; backup at
+`config.sandbox.yaml.pre-ak-embed`).
+
+**failover-batch2** (10 resume jobs, tag `failover-batch2`, ak DOWN from start
+— TCP-refused at 17:09:02): 10/10 succeeded, all attempts=1, 10 vLLM 200s,
+**zero** `ak:8080` lines. ak came up ~17:15 (first successful TCP connect
+17:14:59) but the last dispatch decision landed ~17:15:0x — the batch drained
+within ~60 s of recovery. **Recovery side NOT captured** (timing).
+
+**failover-batch3** (same 10 pairs, tag `failover-batch3`, ak down from
+17:19:56): 9/10 succeeded (vLLM, attempts=1). Operator started ak mid-batch;
+the 10th job (rev `01dfe315…`) dispatched to ak and **ak HUNG processing the
+call** (operator: "ak is getting stuck while processing a job"). Job reached
+attempts=2 (reclaim; a vLLM 200 landed 17:27:39 for the retry) when the
+operator ordered a stop; worker SIGTERM was ignored (graceful-shutdown
+handler blocked on the hung call) → SIGKILL 17:27:52. Job left in `running`
+with an expired lease — the next worker start reclaims and completes it
+(idempotent upsert).
+
+**State at save:** no library-rag processes running; **serve 8100 is DOWN**
+(stopped before batch2, not yet relaunched); ak llama-server was hung —
+operator is restarting it (server-side issue, outside this repo).
+
+**Open findings:** (1) the recovery test (secondary comes back mid-batch) is
+STILL not captured — batch2/batch3 both drained before recovery delivered a
+successful ak call; (2) new: the 2 s connect budget does NOT protect against
+a HUNG read (endpoint accepts TCP, then stalls) — that is the 300 s resume
+read timeout's job, and it will eventually reclaim; (3) per-call ~2 s bounce
+cost of ak-first dispatches while down is inferred, not measured (failed
+connects emit no log line).
+
+**Next unfinished task:** after operator restarts ak — relaunch serve (no
+`--allow-version-mismatch`) + smoke; run the recovery round properly:
+`failover-batch4`, ak down at start, ~20 jobs (~14 min window), operator
+starts ak ~2–3 min in; the worker run reclaims the leftover batch3 job
+`01dfe315…` first.
