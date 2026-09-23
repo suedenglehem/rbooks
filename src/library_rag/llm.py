@@ -152,6 +152,14 @@ class LlamaCppAnswerModel:
             raise AnswerModelError(
                 "malformed chat completion response: content is not a string"
             )
+        if not content.strip():
+            # The same budget condition as null content, from a different
+            # server: llama.cpp returns content: "" when the reasoning trace
+            # eats the max_tokens budget (vLLM returns null instead).
+            # Transient -> retry + failover, never a permanent model error.
+            raise AnswerModelUnavailableError(
+                "model returned empty content (thinking budget exhausted?)"
+            )
         return content
 
 

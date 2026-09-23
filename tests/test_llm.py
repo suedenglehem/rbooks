@@ -179,6 +179,26 @@ def test_llama_cpp_null_content_is_transient(
         model.complete([{"role": "user", "content": "hi"}])
 
 
+@pytest.mark.parametrize("content", ["", "   \n  "], ids=["empty", "whitespace"])
+def test_llama_cpp_empty_content_is_transient(
+    monkeypatch: pytest.MonkeyPatch, content: str
+) -> None:
+    # Same budget condition as null content, different server: llama.cpp
+    # (ak) returns 200 with content: "" when the reasoning trace eats the
+    # max_tokens budget, where vLLM returns null. Must be *unavailable*
+    # (transient -> retry + pool failover), never a permanent failure.
+    # Regression: 2026-09-23 dual-LLM regen — every resume job routed to
+    # ak permanent-failed with resume_too_short (0 words) under the old
+    # check, because "" passed the isinstance(str) gate.
+    model = _model()
+    client = _FakeClient(
+        _FakeResponse(200, {"choices": [{"message": {"content": content}}]})
+    )
+    monkeypatch.setattr(model, "_client", client)
+    with pytest.raises(AnswerModelUnavailableError, match="empty content"):
+        model.complete([{"role": "user", "content": "hi"}])
+
+
 def test_llama_cpp_http_error_is_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
     model = _model()
     client = _FakeClient(_FakeResponse(500, {}))
