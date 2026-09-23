@@ -16,6 +16,7 @@ import threading
 from collections.abc import Sequence
 from typing import Any
 
+import httpx
 import pytest
 
 from library_rag.config import AnswerEndpoint, Config
@@ -103,6 +104,17 @@ def test_make_answer_model_without_extra_endpoint_stays_bare(base_config: Config
     assert not isinstance(model, AnswerModelPool)
 
 
+def test_make_answer_model_wires_configured_connect_timeout(base_config: Config) -> None:
+    # services.connect_timeout_seconds reaches the httpx client's connect
+    # phase — the knob that keeps a dead/dropping endpoint from pinning a
+    # pool thread for the full generation timeout.
+    base_config.answer.model_revision = "qwen2.5-7b@abc"
+    base_config.services.connect_timeout_seconds = 0.75
+    model = make_answer_model(base_config)
+    assert isinstance(model, LlamaCppAnswerModel)
+    assert model._client.timeout.connect == 0.75
+
+
 def test_make_answer_model_with_extra_endpoint_builds_pool(base_config: Config) -> None:
     base_config.answer.model_revision = "qwen2.5-7b@abc"
     base_config.answer.extra_endpoints = [AnswerEndpoint(host="ak", port=8080)]
@@ -138,8 +150,45 @@ class _FakeClient:
         return self.response
 
 
+class _RaisingClient:
+    """Stands in for ``httpx.Client``: ``post`` always raises the given error."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    def post(self, url: str, json: dict[str, Any]) -> Any:
+        raise self._exc
+
+
 def test_llama_cpp_dead_port_is_unavailable() -> None:
     model = _model(port=_dead_port())
+    with pytest.raises(AnswerModelUnavailableError, match="unreachable"):
+        model.complete([{"role": "user", "content": "hi"}])
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.ConnectTimeout("connect timed out"),
+        httpx.ReadTimeout("read timed out"),
+    ],
+    ids=["connect-timeout", "read-timeout"],
+)
+def test_llama_cpp_phase_timeouts_are_unavailable(
+    monkeypatch: pytest.MonkeyPatch, exc: httpx.TimeoutException
+) -> None:
+    # A phase timeout must map to *unavailable* (transient -> pool failover
+    # and job retry), never a permanent model error. The connect case is the
+    # 2026-09-23 failover-batch1 regression: ak:8080 sat behind a stateful
+    # firewall that DROPPED packets while its llama-server was stopped, so
+    # the connect phase hung until its budget (services.
+    # connect_timeout_seconds) expired instead of failing fast with
+    # ECONNREFUSED. The read case is a wedged server that accepts but never
+    # answers.
+    model = _model()
+    monkeypatch.setattr(
+        model, "_client", _RaisingClient(exc)
+    )
     with pytest.raises(AnswerModelUnavailableError, match="unreachable"):
         model.complete([{"role": "user", "content": "hi"}])
 
@@ -277,6 +326,33 @@ def test_pool_round_robin_between_endpoints() -> None:
     b = FakeAnswerModel(["b1", "b2"])
     pool = AnswerModelPool([a, b])
     assert [pool.complete(_MSGS) for _ in range(4)] == ["a1", "b1", "a2", "b2"]
+
+
+def test_pool_round_robin_across_three_endpoints() -> None:
+    # Selection is n-agnostic: with nothing in flight, the idle tie-break
+    # walks ALL endpoints round-robin, so adding endpoints is a config-only
+    # change (the pool's identity invariant: the same model behind every
+    # endpoint).
+    a = FakeAnswerModel(["a [E1]."])
+    b = FakeAnswerModel(["b [E1]."])
+    c = FakeAnswerModel(["c [E1]."])
+    pool = AnswerModelPool([a, b, c])
+    assert [pool.complete(_MSGS) for _ in range(3)] == ["a [E1].", "b [E1].", "c [E1]."]
+    assert pool.inflight() == [0, 0, 0]
+
+
+def test_pool_failover_walks_the_full_ring() -> None:
+    # Failover walks the whole ring: with two dead endpoints ahead of it,
+    # the call still reaches the third. A down endpoint costs its connect
+    # budget per probe, and recovery is automatic — there is no "marked
+    # down" state to get out of sync.
+    d1 = _FailingModel(AnswerModelUnavailableError("first down"))
+    d2 = _FailingModel(AnswerModelUnavailableError("second down"))
+    up = FakeAnswerModel(["ok [E1]."])
+    pool = AnswerModelPool([d1, d2, up])
+    assert pool.complete(_MSGS) == "ok [E1]."
+    assert d1.calls == 1
+    assert d2.calls == 1
 
 
 def test_pool_least_inflight_prefers_free_endpoint() -> None:

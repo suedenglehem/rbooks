@@ -241,6 +241,17 @@ def test_services_embed_ports_default_and_validation() -> None:
         Services(embed_ports=[8081, 70000])
 
 
+def test_services_connect_timeout_default_and_validation() -> None:
+    # 2s connect budget: LAN connects are sub-millisecond, so this only
+    # bounds how long a dead/dropping endpoint can pin a pool thread
+    # before failover (the read phase keeps answer/resume.timeout_seconds).
+    assert Services().connect_timeout_seconds == 2.0
+    with pytest.raises(ConfigError, match=r"connect_timeout_seconds"):
+        Services(connect_timeout_seconds=0)
+    with pytest.raises(ConfigError, match=r"connect_timeout_seconds"):
+        Services(connect_timeout_seconds=-1.5)
+
+
 def test_logging_settings_defaults() -> None:
     ls = LoggingSettings()
     assert ls.level == "INFO"

@@ -190,6 +190,14 @@ class Services(BaseModel):
     # which the web UI shows in the reader pane next to the content. Off by
     # default — a deployed app must not leak server filesystem layout.
     show_path_to_original: bool = False
+    # Connect-phase timeout (seconds) for the LLM answer endpoints (the
+    # answer model and the resume pool). Deliberately separate from the
+    # generation timeouts (``answer.timeout_seconds`` /
+    # ``resume.timeout_seconds``), which bound the whole request: a LAN
+    # connect is sub-millisecond, so this only caps how long a dead or
+    # packet-dropping endpoint (e.g. a stopped llama-server behind a
+    # stateful firewall) can pin a pool thread before failover kicks in.
+    connect_timeout_seconds: float = 2.0
 
     @field_validator("app_host", "qdrant_host", "answer_host", "embed_host")
     @classmethod
@@ -205,6 +213,13 @@ class Services(BaseModel):
         for port in ports:
             if not 1 <= port <= 65535:
                 raise ConfigError(f"port must be 1-65535 (got {port})")
+        return v
+
+    @field_validator("connect_timeout_seconds")
+    @classmethod
+    def _valid_connect_timeout(cls, v: float) -> float:
+        if v <= 0:
+            raise ConfigError("services.connect_timeout_seconds must be positive")
         return v
 
 

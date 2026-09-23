@@ -105,15 +105,22 @@ class LlamaCppAnswerModel:
         timeout_seconds: float,
         max_tokens: int,
         temperature: float,
+        connect_timeout_seconds: float = 2.0,
     ) -> None:
         self.model_revision = model_revision
         self._url = f"http://{host}:{port}/v1/chat/completions"
         self._model = model_name
         self._max_tokens = max_tokens
         self._temperature = temperature
-        # The connect phase fails fast on a dead loopback port; the read
-        # phase is where generation time actually lives.
-        self._client = httpx.Client(timeout=httpx.Timeout(timeout_seconds, connect=10.0))
+        # The connect phase gets its own short budget (services.
+        # connect_timeout_seconds): a dead endpoint — including one whose
+        # firewall DROPS packets instead of RSTing the closed port — must
+        # fail over within ~2s, not hold a pool thread for the full
+        # generation timeout. The read phase is where generation time
+        # actually lives and keeps ``timeout_seconds``.
+        self._client = httpx.Client(
+            timeout=httpx.Timeout(timeout_seconds, connect=connect_timeout_seconds)
+        )
 
     def complete(self, messages: Sequence[Message]) -> str:
         payload = {
@@ -291,6 +298,7 @@ def build_answer_pool(
         return FakeAnswerModel()
     assert a.model_revision is not None
     model_name = a.model_name or a.model_revision
+    connect_timeout = cfg.services.connect_timeout_seconds
     primary = LlamaCppAnswerModel(
         host=cfg.services.answer_host,
         port=cfg.services.answer_port,
@@ -299,6 +307,7 @@ def build_answer_pool(
         timeout_seconds=timeout_seconds,
         max_tokens=max_tokens,
         temperature=temperature,
+        connect_timeout_seconds=connect_timeout,
     )
     if not a.extra_endpoints:
         return primary
@@ -313,6 +322,7 @@ def build_answer_pool(
                 timeout_seconds=timeout_seconds,
                 max_tokens=max_tokens,
                 temperature=temperature,
+                connect_timeout_seconds=connect_timeout,
             )
         )
     return AnswerModelPool(

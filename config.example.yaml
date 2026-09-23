@@ -32,9 +32,36 @@ services:
   # On this machine: vLLM qwen3.8-27b (FP8, TP=2) on :8091.
   answer_host: 127.0.0.1
   answer_port: 8091
+  # Connect-phase timeout (seconds) for the LLM answer endpoints (answer model
+  # and the resume pool). Kept separate from the generation timeouts
+  # (answer.timeout_seconds / resume.timeout_seconds): a LAN connect is
+  # sub-millisecond, so this only caps how long a dead or packet-dropping
+  # endpoint (e.g. a stopped llama-server behind a stateful firewall) can
+  # pin a pool thread before per-call failover kicks in. Default: 2.0.
+  # connect_timeout_seconds: 2.0
   # llama.cpp embedding-model server (OpenAI-compatible /v1/embeddings).
+  # SINGLE-HOST by design: every port in the pool lives on this ONE
+  # embed_host — `embed_ports` are replicas of the same model on the same
+  # machine (e.g. one llama-server per GPU), not endpoints on different
+  # machines. There is no multi-host support; to use a second machine, point
+  # embed_host at it and (re)bind its replicas' ports there.
+  #
+  # `embed_port` (default 8081) is the single-replica shorthand. `embed_ports`
+  # replaces it with an explicit list, e.g. [8081, 8082, 8083, 8084].
+  # Requests round-robin across the ports; a request that fails on one
+  # endpoint (5xx, timeout) is retried on the next replica in rotation.
+  #
+  # Note: the embedder uses a flat 120 s per-request timeout with NO
+  # connect-phase budget (unlike the LLM pool above, which honors
+  # connect_timeout_seconds). A dead or packet-dropping replica therefore
+  # costs up to 120 s per bounced request before failover moves on.
   embed_host: 127.0.0.1
   embed_port: 8081
+  # embed_ports:
+  #   - 8081
+  #   - 8082
+  #   - 8083
+  #   - 8084
   # FastAPI app bind. Keep loopback unless the operator opts into LAN exposure
   # (which then requires api_token). Avoid :8000/:8081/:8091 (occupied).
   app_host: 127.0.0.1
