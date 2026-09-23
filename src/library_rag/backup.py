@@ -660,6 +660,7 @@ __all__ = [
     "CONFIG_NAME",
     "MANIFEST_NAME",
     "MANIFEST_VERSION",
+    "QDRANT_LOCK_NAME",
     "BackupError",
     "CheckResult",
     "acquire_qdrant_lock",

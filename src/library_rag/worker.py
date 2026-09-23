@@ -1374,9 +1374,12 @@ def run_worker(
     lock on the storage folder for its lifetime, so a second client in the
     same process is refused by its own first lock. The *embedder*, when None,
     is still built per job: it is a stateless HTTP client and holds nothing
-    that can leak. The *model* (answer model, resume stage) is likewise a
-    per-job seam: when None each resume job builds it from ``cfg.answer`` /
-    ``cfg.resume``.
+    that can leak. The *model* (answer model, resume stage) is a shared
+    seam: when None it is built ONCE here and shared by every resume job,
+    so an :class:`~library_rag.llm.AnswerModelPool` load-balances its
+    round-robin across the whole run — a resume job makes exactly one model
+    call, and a pool minted per job would restart that round-robin at
+    endpoint 0 every time, never using ``answer.extra_endpoints`` (M9).
 
     Per-job verbose logging: while a job runs, DEBUG records are captured to
     ``<state_root>/job_logs/<job_id>.attempt<N>.log`` in addition to the short
@@ -1386,6 +1389,12 @@ def run_worker(
     deferral, which clears the category, or a lost lease is not a failure).
     Kept files are capped by :func:`prune_job_logs`.
     """
+    # Built once per run (see docstring): the pool's round-robin must span
+    # the whole worker, not restart on every single-call resume job. Never
+    # raises — an unconfigured model stays None and resume jobs fail with
+    # answer_model_not_configured as before.
+    if model is None:
+        model = make_resume_model(cfg)
     name = worker_name()
     jobs = Jobs(db)
     own: RealQdrantOps | None = None

@@ -123,6 +123,35 @@ def test_resume_generation_end_to_end(state_db: Database, base_config: Config) -
     assert [h["rev_id"] for h in hits] == ["revR"]
 
 
+def test_resume_model_built_once_and_shared(
+    state_db: Database, base_config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # M9 regression: run_worker must build the resume model ONCE and share
+    # it across jobs. A pool minted per job would restart its round-robin at
+    # endpoint 0 for every (single-call) resume job and never use
+    # ``answer.extra_endpoints`` (the 2026-09-23 "no traffic on ak" bug).
+    base_config.answer.fake = True
+    q = _published(state_db, base_config, doc="docA", rev="revA", run="runA")
+    _published(state_db, base_config, doc="docB", rev="revB", run="runB")
+    assert enqueue_missing_resumes(state_db, base_config) == 2
+    text = _scripted_resume()
+    built: list[FakeAnswerModel] = []
+
+    def _builder(cfg: Config) -> FakeAnswerModel:
+        m = FakeAnswerModel([text, text])
+        built.append(m)
+        return m
+
+    monkeypatch.setattr("library_rag.worker.make_resume_model", _builder)
+    handled = run_worker(
+        state_db, base_config, once=True, poll_delay=0,
+        qdrant=q, embedder=FakeEmbedder(base_config.embedding.dimensions),
+    )
+    assert handled == 2
+    assert len(built) == 1  # once per run, not once per job
+    assert len(built[0].calls) == 2  # the shared instance served both jobs
+
+
 def test_resume_floor_is_twenty_words(state_db: Database, base_config: Config) -> None:
     # The floor is 20, not the 700-1000 prompt target: tiny books can only
     # yield short summaries, so 21 words is a résumé and 19 words is a
@@ -146,9 +175,10 @@ def test_resume_floor_is_twenty_words(state_db: Database, base_config: Config) -
     # enqueue is INSERT OR IGNORE — revF's row stays permanent_failed and
     # only revF2 lands as a new pending job.
     assert enqueue_missing_resumes(state_db, base_config) == 2
-    assert state_db.query_one(
+    pending = state_db.query_one(
         "SELECT COUNT(*) AS n FROM jobs WHERE stage = 'resume' AND state = 'pending'"
-    )["n"] == 1
+    )
+    assert pending is not None and pending["n"] == 1
     run_worker(
         state_db, base_config, once=True, poll_delay=0,
         qdrant=q, embedder=FakeEmbedder(base_config.embedding.dimensions),

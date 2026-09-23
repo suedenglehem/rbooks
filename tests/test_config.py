@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -327,9 +328,10 @@ def test_load_config_invalid_logging_raises(roots: dict[str, Path], tmp_path: Pa
 
 def test_answer_extra_endpoints_default_and_parse() -> None:
     assert AnswerSettings().extra_endpoints == []
+    # The dict form is the YAML shape; pydantic validates it into models.
     s = AnswerSettings(
         model_revision="qwen3.8-27b-fp8@vllm-dual-max",
-        extra_endpoints=[{"host": "ak", "port": 8080}],
+        extra_endpoints=cast("list[AnswerEndpoint]", [{"host": "ak", "port": 8080}]),
     )
     assert s.extra_endpoints == [AnswerEndpoint(host="ak", port=8080)]
     # model_name inherits the primary's when omitted.

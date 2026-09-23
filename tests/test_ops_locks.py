@@ -162,6 +162,7 @@ def test_descendant_pids_finds_grandchild() -> None:
     proc = subprocess.Popen(
         [sys.executable, "-c", code], stdout=subprocess.PIPE, text=True
     )
+    assert proc.stdout is not None
     grandchild = int(proc.stdout.readline())
     try:
         out = descendant_pids(proc.pid)
@@ -186,6 +187,7 @@ def test_find_flock_holders(tmp_path: Path) -> None:
         stdout=subprocess.PIPE,
         text=True,
     )
+    assert proc.stdout is not None
     try:
         proc.stdout.readline()  # 'locked'
         _wait_for_holders(lock, [proc.pid])
@@ -205,6 +207,7 @@ def test_force_release_refuses_foreign_holder(base_config: Config, tmp_path: Pat
         stdout=subprocess.PIPE,
         text=True,
     )
+    assert proc.stdout is not None
     try:
         proc.stdout.readline()
         _wait_for_holders(lock_dir / ".lock", [proc.pid])
@@ -237,6 +240,7 @@ def test_force_release_kills_stuck_worker(base_config: Config, tmp_path: Path) -
     lock_dir.mkdir()
     (lock_dir / ".lock").touch()
     proc = subprocess.Popen([str(worker), "ingest", str(lock_dir)], stdout=subprocess.PIPE, text=True)
+    assert proc.stdout is not None
     try:
         proc.stdout.readline()
         _wait_for_holders(lock_dir / ".lock", [proc.pid])

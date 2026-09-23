@@ -12,6 +12,7 @@ failure).
 from __future__ import annotations
 
 import socket
+from collections.abc import Sequence
 from typing import Any
 
 import pytest
@@ -23,6 +24,7 @@ from library_rag.llm import (
     AnswerModelUnavailableError,
     FakeAnswerModel,
     LlamaCppAnswerModel,
+    Message,
     make_answer_model,
 )
 
@@ -220,7 +222,7 @@ class _FailingModel:
         self._exc = exc
         self.calls = 0
 
-    def complete(self, messages: list[dict[str, str]]) -> str:
+    def complete(self, messages: Sequence[Message]) -> str:
         self.calls += 1
         raise self._exc
 
