@@ -2335,3 +2335,97 @@ fast connect timeout.
   of one backoff per occurrence. If a book's résumé keeps
   coming back null, raise `resume.max_tokens` — the
   `resume_too_short` floor (20 words) still guards quality.
+
+### Addendum — dual-LLM test batch of 20 ePUBs (2026-09-23, post-reboot)
+
+Operator ordered a 20-ePUB test batch run through both LLMs
+(local vLLM `127.0.0.1:8091` + `http://ak:8080`). The batch
+surfaced and fixed two client-side bugs, then exposed one
+server-side condition on `ak` that no client change can fix.
+
+**Root cause 1 — per-job pool minting starved the second
+endpoint (fixed, 3fd4587).** The CLI ingest path called
+`run_worker` with no model, so each resume job minted a fresh
+`AnswerModelPool`; a single-call job's round-robin always
+started at endpoint 0 (the primary), so `ak` never received a
+request ("no traffic on ak"). Fix: `run_worker` builds the
+resume model once per run and shares it across the job
+threads. Regression test:
+`test_resume_model_built_once_and_shared`.
+
+**Root cause 2 — empty-string content from thinking models
+(fixed, 9ae74c0).** `ak`'s llama.cpp returns 200 with
+`content: ""` (vLLM returns `content: null`) when the
+thinking trace exhausts `max_tokens`. `""` passed the
+`isinstance(str)` gate → 0 words → permanent
+`resume_too_short` with no retry. Fix in
+`LlamaCppAnswerModel.complete`: empty/whitespace content is
+now `AnswerModelUnavailableError` (transient → in-call pool
+failover + backoff retry). Round-1 arithmetic proof: 9 ak
+calls burned exactly 2400 predicted tokens each
+(7200/3=2400 per the earlier 3-job probe) — the whole
+budget in reasoning.
+
+**Round 1 (20 ePUBs, sandbox `resume.max_tokens` 2400 → 8192
+in `config.sandbox.yaml`):** 9 succeeded (all primary), 9
+permanent-failed `resume_too_short` (all routed to `ak` at
+2400 — pre-9ae74c0 behavior replayed by the requeue tag),
+2 permanent-failed `no_sample_text` (two ePUBs with no
+extractable text — correct terminal behavior, not re-run).
+`ak` received 9 real requests; its Prometheus metrics
+moved 74 → 10860 tokens, confirming live traffic.
+
+**Round 2 (the 9 re-queued under `dual-llm-regen2:{run_id}`
+task keys, new tags because terminal jobs never re-execute):**
+9/9 succeeded, word counts 826–1026 (band respected). The
+worker log shows 12 model calls for 9 jobs: 3 requests to
+`ak` still came back empty at 8192, and each was followed
+~25 s later by a primary call (04:59:41→05:00:08,
+05:04:41→05:05:06, 05:07:30→05:07:55) — the committed
+in-call failover worked exactly as designed; the jobs
+succeeded on vLLM. `ak` metrics across round 2: prompt
+26746→30080, predicted 21861→52139 (+30278 predicted /
+3 requests ≈ 10092/request — more than the 8192 requested).
+
+**Root cause 3 (server-side, on `ak`; NOT fixable from the
+client):** `ak`'s llama-server does not honor the request
+`max_tokens` as a generation cap. Its metrics show a
+`n_tokens_max 11634` context ceiling and ~10092 predicted
+tokens per request (≈1111 prompt + thinking trace running to
+the context edge, zero visible content). The Qwen3 `/no_think`
+prompt toggle was probed with the exact round-2 request for
+'Billy Crystal - 700 Sundays' but the probe was aborted per
+operator instruction (stop burning tokens on `ak`) before a
+response — no verdict. Recommendations for `ak` (any one):
+raise `--ctx-size`, confirm `/no_think` is honored by the
+served checkpoint, or set a server-side reasoning budget.
+Until then the dual-endpoint design still delivers its value:
+`ak` absorbs load, and any budget exhaustion fails over in-
+call with one extra ~25 s of latency.
+
+**Batch net:** 18/20 books have freshly regenerated resumes
+(826–1026 words); 2 are unsummarizable (no extractable
+text). `book_resumes` total 331 (round-2 rows are upserts on
+existing revs, so the total is unchanged by design).
+
+**SHA deduplication (operator request, verified existing
+since M1):** no new code needed. `scan.py` computes a
+`stream_hash` per file and `register_source` enforces
+`UNIQUE(doc_id, sha256)` with `path_aliases` for renamed
+copies; a renamed identical file re-registers to the existing
+source instead of reprocessing. Pilot check: 40/40 files in
+the test batch have unique SHAs; the two "Piano" books are
+genuinely different files (bytes differ).
+
+**Final state:** worker stopped cleanly after the drain
+("ingest: 9 job(s) completed"); queue at 0 non-terminal;
+serve relaunched on 8100 (`/ready` all true,
+`POST /resumes/search` ranking verified); sandbox config
+keeps `resume.max_tokens: 8192`. Gate at 9ae74c0: 524
+passed, ruff + mypy clean (94 files). Full-library launch
+still held on explicit operator approval; its config must
+mirror the sandbox (`extra_endpoints` ak:8080,
+`max_concurrent_jobs: 2`, `resume.max_tokens: 8192`) and,
+for `ak` to contribute real output rather than only
+failover traffic, the `ak` server-side condition above must
+be addressed first.
