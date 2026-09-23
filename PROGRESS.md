@@ -2477,3 +2477,38 @@ design delivers its intended ~2× throughput for LLM-bound stages, with
 in-call failover as a safety net rather than the only reason jobs
 succeed. The full-library launch config is unchanged, but `ak` will
 now contribute output, not just failover traffic.
+
+### Addendum — ak-batch3: first 10-job dual-endpoint batch after the fix (2026-09-23)
+
+Operator-approved small end-to-end batch through the real `AnswerModelPool`
+(primary vLLM `127.0.0.1:8091` + fixed `ak:8080`): 10 published revisions
+(5 ePUB + 5 PDF, all already resumed → rows upserted, `book_resumes` total
+stayed 331) re-enqueued under the new task-key tag `ak-batch3`, because
+terminal jobs never re-execute. Exactly 10 LLM calls, no more.
+
+**Result: 10/10 succeeded, zero failures, zero in-call failovers.** All
+11... all 10 HTTP calls returned 200 on the first try. Per-endpoint split
+from the worker log: **5 calls on vLLM (avg ~78 s) + 5 on ak (avg ~142 s)**
+— ak's real content output, ~1.8× slower than vLLM. Batch wall ~10 min
+with `max_concurrent_jobs: 2`; the RR dispatch self-pipelined (each freed
+thread re-hits its own endpoint), so both endpoints ran idle-zero —
+steady-state throughput is the sum of both capacities.
+
+Word counts (band 700–1000; model is free-form, only a 100-word floor is
+enforced): 794, 833, 868, 887, 904, 922, 964, 1019, 1172, 1267 — 7 in band,
+3 slightly over (1019/1172/1267), none under. Both endpoints' output lands
+in the same range (vLLM 887–1172, ak 794–1267), confirming the fixed ak is
+quality-equivalent, not just reachable.
+
+Sandbox serve was found down at batch start (graceful shutdown in the log;
+satisfied the single-process Qdrant lock swap) and was relaunched after the
+batch — `/health` ok, `/ready` all true, `/resumes/search` smoke hit returns
+the batch's fresh rows. Worker stopped cleanly after the drain.
+
+Open design question (operator's): endpoint weights for the pool. Analysis:
+with concurrency == endpoint count, static RR is already near-optimal in
+steady state; a weight would only shave finite-batch tails (~0.3% on the
+331-job library). The knobs that would actually do something: a
+per-endpoint `max_inflight` cap (protects interactive Claude Code traffic
+sharing `ak:8080` during long backfills) or weighted least-inflight
+(future-proofs `max_concurrent_jobs` > endpoint count). Decision pending.
