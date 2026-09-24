@@ -4,6 +4,7 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+serve.log
 
 # Frontend (web/): dependencies are never committed; the built bundle (web/dist)
 # IS committed because the server serves it and the M5 gate wants a self-hosted UI.
