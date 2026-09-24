@@ -140,6 +140,22 @@ export class App {
       }
       void this.reader.refresh();
     });
+
+    // Browser "back" keeps the user inside this app. Without the guard
+    // entry, the first back press would leave this document entirely
+    // (returning to whatever page preceded it) and no web API can cancel
+    // that navigation. So on load we seed one guard entry; every
+    // popstate — back OR forward — lands on Research when we are anywhere
+    // else, does nothing when we are already there, and re-arms a fresh
+    // guard entry behind the new position. Back therefore can never
+    // cross out of the site: only closing the tab or typing a new URL
+    // does. (Forward is absorbed the same way.)
+    history.pushState({ nav: "home" }, "");
+    window.addEventListener("popstate", () => {
+      if (this.currentView !== "research") this.showView("research");
+      history.pushState({ nav: "home" }, "");
+    });
+
     void this.startup();
   }
 
