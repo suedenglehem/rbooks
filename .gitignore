@@ -5,6 +5,7 @@ __pycache__/
 .venv/
 venv/
 serve.log
+serve.pid
 
 # Frontend (web/): dependencies are never committed; the built bundle (web/dist)
 # IS committed because the server serves it and the M5 gate wants a self-hosted UI.
@@ -32,9 +33,9 @@ archive/
 artifacts/
 qdrant/
 scratch/
-models/
 
 # Editor / OS
 .DS_Store
+*.swp
 .idea/
 .vscode/
