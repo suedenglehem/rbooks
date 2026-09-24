@@ -43,7 +43,8 @@ class ConfigError(Exception):
 class Paths(BaseModel):
     """Operator-supplied storage roots.
 
-    - source_roots: read-only directories that are scanned for PDF/EPUB files.
+    - source_roots: read-only directories scanned for the configured
+      file types (``Config.file_types``).
     - archive_root: content-addressed store of authoritative originals (HDD).
     - artifact_root: page/section/chunk embedding artifacts (HDD).
     - state_root: SQLite state DB (SSD).
@@ -638,11 +639,11 @@ class BrowseSettings(BaseModel):
     ``enabled`` (default False) gates the whole feature: when off the
     ``/browse/*`` routes 404 and the SPA hides the Browse tab. When on,
     ``root`` (required, absolute) is the single root the browser is allowed
-    to list; the UI shows paths relative to it. ``file_types`` is the list
-    of file suffixes (leading dot) listed as files — directories are always
-    listed for drill-down. Matching is case-insensitive against on-disk
-    names, so ``.PDF`` and ``.pdf`` are the same entry; the validator
-    normalizes to lowercase and collapses duplicates.
+    to list; the UI shows paths relative to it. Only files whose suffix is in
+    the GLOBAL ``Config.file_types`` are listed as files — directories are
+    always listed for drill-down. (The former ``browse.file_types`` was moved
+    to top-level ``file_types`` so the same list also governs what the
+    scanner processes; a leftover ``browse.file_types`` key is ignored.)
 
     Config loading stays side-effect-free: ``root`` existence is NOT checked
     here (or at load time). It is checked at app creation and exposed as
@@ -652,7 +653,6 @@ class BrowseSettings(BaseModel):
 
     enabled: bool = False
     root: Path | None = None
-    file_types: list[str] = Field(default_factory=lambda: [".pdf", ".epub"])
 
     @model_validator(mode="after")
     def _check_browse(self) -> BrowseSettings:
@@ -660,19 +660,6 @@ class BrowseSettings(BaseModel):
             raise ConfigError("browse.enabled requires browse.root")
         if self.root is not None and not self.root.is_absolute():
             raise ConfigError(f"browse.root must be absolute: {self.root!r}")
-        if not self.file_types:
-            raise ConfigError("browse.file_types must not be empty")
-        norm: list[str] = []
-        for ft in self.file_types:
-            ft = str(ft).strip().lower()
-            if not ft.startswith(".") or len(ft) < 2:
-                raise ConfigError(
-                    f"browse.file_types entries must be dotted suffixes "
-                    f"like '.pdf' (got {ft!r})"
-                )
-            if ft not in norm:
-                norm.append(ft)
-        self.file_types = norm
         return self
 
 
@@ -757,10 +744,27 @@ class LoggingSettings(BaseModel):
         return self
 
 
+#: File types (lowercased dotted suffixes) the extraction pipeline can
+#: process — the suffixes :func:`library_rag.scan.detect_format` recognizes
+#: and :class:`library_rag.catalog.Format` names. ``Config.file_types`` is
+#: validated against this set: the scanner only processes what an extractor
+#: can actually read, so an unsupported entry fails at load rather than
+#: surfacing later as thousands of ``invalid`` scan reports. Adding a new
+#: extractor means adding its suffix here.
+SUPPORTED_FILE_TYPES: frozenset[str] = frozenset({".pdf", ".epub"})
+
+
 class Config(BaseModel):
     """Top-level application configuration."""
 
     paths: Paths
+    # File types (lowercased dotted suffixes) that are *processed*: the
+    # scanner discovers only these, Browse lists only these as files, and the
+    # Rag-page "books on disk" diagnostic counts only these. Validated against
+    # SUPPORTED_FILE_TYPES and normalized (trimmed, lowercased, deduped, order
+    # preserved). Moved here from ``browse.file_types`` (M11), which governed
+    # only the UI listing.
+    file_types: list[str] = Field(default_factory=lambda: [".pdf", ".epub"])
     services: Services = Field(default_factory=Services)
     extraction: ExtractionSettings = Field(default_factory=ExtractionSettings)
     chunking: ChunkingSettings = Field(default_factory=ChunkingSettings)
@@ -790,6 +794,29 @@ class Config(BaseModel):
         for label, p in self.mount_sentinels.items():
             if p and not Path(p).is_absolute():
                 raise ConfigError(f"mount sentinel for {label!r} must be absolute: {p!r}")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_file_types(self) -> Config:
+        if not self.file_types:
+            raise ConfigError("file_types must not be empty")
+        norm: list[str] = []
+        for ft in self.file_types:
+            ft = str(ft).strip().lower()
+            if not ft.startswith(".") or len(ft) < 2:
+                raise ConfigError(
+                    f"file_types entries must be dotted suffixes "
+                    f"like '.pdf' (got {ft!r})"
+                )
+            if ft not in SUPPORTED_FILE_TYPES:
+                supported = ", ".join(sorted(SUPPORTED_FILE_TYPES))
+                raise ConfigError(
+                    f"file_types entry {ft!r} is not a supported file type "
+                    f"(supported: {supported})"
+                )
+            if ft not in norm:
+                norm.append(ft)
+        self.file_types = norm
         return self
 
 

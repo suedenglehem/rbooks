@@ -56,8 +56,6 @@ STAGE_EMBED = "embed"
 STAGE_PUBLISH = "publish"
 STAGE_RESUME = "resume"
 
-_CANDIDATE_SUFFIXES = {".pdf", ".epub"}
-
 
 @dataclass
 class ScanReport:
@@ -77,13 +75,19 @@ class ScanReport:
 
 
 def iter_candidate_paths(
-    root: Path, ignore_dirs: frozenset[str] | set[str], ignore_files: frozenset[str] | set[str]
+    root: Path,
+    ignore_dirs: frozenset[str] | set[str],
+    ignore_files: frozenset[str] | set[str],
+    suffixes: frozenset[str] | set[str],
 ) -> list[Path]:
-    """Stream candidate (PDF/EPUB) files under *root*, pruned like the scanner.
+    """Stream candidate files under *root* (suffixes in *suffixes*), pruned
+    like the scanner.
 
-    Shared by :func:`scan_root` and the M6 pilot survey so both see exactly
-    the same tree: configured ignore sets applied, symlinks never followed,
-    deterministic (sorted) order. Returns the list of candidate paths.
+    Shared by :func:`scan_root`, the M6 pilot survey, and the other coverage
+    walkers so all see exactly the same tree: configured ignore sets applied,
+    symlinks never followed, deterministic (sorted) order. ``suffixes`` is the
+    global ``Config.file_types`` (lowercased dotted suffixes) — the only types
+    the pipeline processes. Returns the list of candidate paths.
     """
     found: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
@@ -99,7 +103,7 @@ def iter_candidate_paths(
             p = Path(dirpath) / name
             if p.is_symlink():
                 continue
-            if p.suffix.lower() not in _CANDIDATE_SUFFIXES:
+            if p.suffix.lower() not in suffixes:
                 continue
             found.append(p)
     return found
@@ -207,7 +211,9 @@ def scan_root(db: Database, cfg: Config, root: Path, jobs: Jobs | None = None) -
         return report
 
     visible: set[str] = set()
-    for p in iter_candidate_paths(root, cfg.scan.ignore_dirs, cfg.scan.ignore_files):
+    for p in iter_candidate_paths(
+        root, cfg.scan.ignore_dirs, cfg.scan.ignore_files, frozenset(cfg.file_types)
+    ):
         norm = normalize_path(p)
         visible.add(norm)
         _process_file(db, cfg, jobs, p, report)

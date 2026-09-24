@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -426,7 +426,6 @@ def test_browse_settings_defaults() -> None:
     b = BrowseSettings()
     assert b.enabled is False
     assert b.root is None
-    assert b.file_types == [".pdf", ".epub"]
 
 
 def test_config_browse_defaults_off(base_config: Config) -> None:
@@ -450,26 +449,44 @@ def test_browse_disabled_with_root_is_fine() -> None:
     assert b.root == Path("/mnt/books")
 
 
-def test_browse_file_types_must_not_be_empty() -> None:
-    with pytest.raises(ConfigError, match=r"browse.file_types must not be empty"):
-        BrowseSettings(file_types=[])
+# --- global file_types --------------------------------------------------------
 
 
-def test_browse_file_types_must_be_dotted_suffixes() -> None:
+def _cfg_over(base_config: Config, **overrides: Any) -> Config:
+    """Re-validate a full config with a few top-level fields overridden."""
+    data: dict[str, Any] = base_config.model_dump()
+    data.update(overrides)
+    return Config.model_validate(data)
+
+
+def test_file_types_default(base_config: Config) -> None:
+    # Global, default [.pdf, .epub]: the types with a working extractor.
+    assert base_config.file_types == [".pdf", ".epub"]
+
+
+def test_file_types_must_not_be_empty(base_config: Config) -> None:
+    with pytest.raises(ConfigError, match=r"file_types must not be empty"):
+        _cfg_over(base_config, file_types=[])
+
+
+def test_file_types_must_be_dotted_suffixes(base_config: Config) -> None:
     for bad in ("pdf", ".", "no-dot", ""):
         with pytest.raises(ConfigError, match=r"dotted suffixes"):
-            BrowseSettings(file_types=[bad])
-    # whitespace is trimmed, case is folded — these are valid
-    assert BrowseSettings(file_types=[" .PDF "] ).file_types == [".pdf"]
+            _cfg_over(base_config, file_types=[bad])
 
 
-def test_browse_file_types_normalized_and_deduped() -> None:
-    b = BrowseSettings(
-        enabled=True,
-        root=Path("/mnt/books"),
-        file_types=[".PDF", ".pdf", ".EPUB", ".epub", ".PDF"],
+def test_file_types_rejects_unsupported(base_config: Config) -> None:
+    # No extractor for .txt: fail at load time, not as thousands of
+    # "invalid" scan reports later.
+    with pytest.raises(ConfigError, match=r"not a supported file type"):
+        _cfg_over(base_config, file_types=[".pdf", ".txt"])
+
+
+def test_file_types_normalized_and_deduped(base_config: Config) -> None:
+    cfg = _cfg_over(
+        base_config, file_types=[" .PDF ", ".pdf", ".EPUB", ".epub", ".PDF"]
     )
-    assert b.file_types == [".pdf", ".epub"]
+    assert cfg.file_types == [".pdf", ".epub"]
 
 
 def test_load_config_browse_from_file(roots: dict[str, Path], tmp_path: Path) -> None:
@@ -485,15 +502,45 @@ def test_load_config_browse_from_file(roots: dict[str, Path], tmp_path: Path) ->
                 f"  qdrant_root: {roots['qdrant_root']}",
                 f"  model_root: {roots['model_root']}",
                 f"  scratch_root: {roots['scratch_root']}",
+                "file_types: [.pdf, .epub, .PDF, .EPUB]",
                 "browse:",
                 "  enabled: true",
                 "  root: /mnt/models_sas_ssd/books",
-                "  file_types: [.pdf, .epub, .PDF, .EPUB]",
             ]
         ),
         encoding="utf-8",
     )
     cfg = load_config(cfg_file)
+    assert cfg.file_types == [".pdf", ".epub"]
     assert cfg.browse.enabled is True
     assert cfg.browse.root == Path("/mnt/models_sas_ssd/books")
-    assert cfg.browse.file_types == [".pdf", ".epub"]
+
+
+def test_load_config_legacy_browse_file_types_ignored(
+    roots: dict[str, Path], tmp_path: Path
+) -> None:
+    # The key moved to the top level; a leftover browse.file_types is
+    # silently ignored rather than an error (existing configs keep loading).
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(
+        "\n".join(
+            [
+                "paths:",
+                "  source_roots: []",
+                f"  archive_root: {roots['archive_root']}",
+                f"  artifact_root: {roots['artifact_root']}",
+                f"  state_root: {roots['state_root']}",
+                f"  qdrant_root: {roots['qdrant_root']}",
+                f"  model_root: {roots['model_root']}",
+                f"  scratch_root: {roots['scratch_root']}",
+                "browse:",
+                "  enabled: true",
+                "  root: /mnt/books",
+                "  file_types: [.txt]",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    cfg = load_config(cfg_file)
+    assert cfg.file_types == [".pdf", ".epub"]
+    assert cfg.browse.enabled is True

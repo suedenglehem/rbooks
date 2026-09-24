@@ -191,7 +191,7 @@ def run_latency(
     # Jobs handle is required — scan_roots/process_paths only enqueue extract
     # jobs when one is passed, so the backlog actually reaches the worker.
     candidates = iter_candidate_paths(
-        root, cfg.scan.ignore_dirs, cfg.scan.ignore_files
+        root, cfg.scan.ignore_dirs, cfg.scan.ignore_files, frozenset(cfg.file_types)
     )[:ingest_count]
     report = process_paths(db, cfg, Jobs(db), candidates)
     enqueued = report.jobs_enqueued

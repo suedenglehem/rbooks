@@ -28,6 +28,7 @@ from psutil import virtual_memory
 
 from .config import Config
 from .db import Database, db_path_for
+from .scan import iter_candidate_paths
 
 __all__ = [
     "catalog_stats",
@@ -52,9 +53,17 @@ def catalog_stats(db: Database, cfg: Config) -> dict[str, Any]:
     "Processed" means the book's active revision has been extracted (it has
     chunks); "published" means it is in the live searchable index (an active
     publication). Both are reported so the operator can see the gap between
-    extracted and searchable. Storage sizes are best-effort: the originals come
-    from the catalog (exact, one query), the derived roots (state / qdrant /
-    artifacts) are measured with ``du`` in parallel and fall back to 0.
+    extracted and searchable.
+
+    The ``disk_*`` fields count book files actually present in the configured
+    source roots — the on-disk repository total (with a per-extension
+    breakdown), walked with the scanner's own pruning and the global
+    ``file_types`` so it is exactly what a scan would discover.
+    ``disk_unprocessed`` is the on-disk total minus the processed count.
+
+    Storage sizes are best-effort: the originals come from the catalog (exact,
+    one query), the derived roots (state / qdrant / artifacts) are measured
+    with ``du`` in parallel and fall back to 0.
     """
     books = _count(db, "SELECT COUNT(DISTINCT doc_id) AS n FROM documents")
     processed = _count(
@@ -86,19 +95,27 @@ def catalog_stats(db: Database, cfg: Config) -> dict[str, Any]:
         if cfg.services.qdrant_path
         else cfg.paths.qdrant_root
     )
-    derived = _du_many(
-        {
-            "state": cfg.paths.state_root,
-            "qdrant": qdrant_dir,
-            "artifacts": cfg.paths.artifact_root,
-        }
-    )
+    # All four probes are blocking (du walks, os.walk over the source roots),
+    # so they run in one pool: total cost ≈ the slowest, not the sum.
+    du_targets = {
+        "state": cfg.paths.state_root,
+        "qdrant": qdrant_dir,
+        "artifacts": cfg.paths.artifact_root,
+    }
+    with ThreadPoolExecutor(max_workers=len(du_targets) + 1) as pool:
+        disk_fut = pool.submit(_disk_book_counts, cfg)
+        du_futs = {name: pool.submit(_du, p) for name, p in du_targets.items()}
+        derived = {name: fut.result() for name, fut in du_futs.items()}
+        disk = disk_fut.result()
     return {
         "books": books,
         "processed_books": processed,
         "published_books": published,
         "chunks": chunks,
         "books_bytes": books_bytes,
+        "disk_books": disk["total"],
+        "disk_by_ext": disk["by_ext"],
+        "disk_unprocessed": max(0, disk["total"] - processed),
         "derived_bytes": derived,
         "space_occupied_bytes": books_bytes + sum(derived.values()),
         "db_path": str(db_path),
@@ -147,13 +164,27 @@ def _du(path: Path) -> int:
         return 0
 
 
-def _du_many(paths: dict[str, Path]) -> dict[str, int]:
-    """Measure several trees in parallel (each ``du`` is blocking)."""
-    if not paths:
-        return {}
-    with ThreadPoolExecutor(max_workers=len(paths)) as pool:
-        futures = {name: pool.submit(_du, p) for name, p in paths.items()}
-        return {name: fut.result() for name, fut in futures.items()}
+def _disk_book_counts(cfg: Config) -> dict[str, Any]:
+    """Count book files on disk, in the configured source roots.
+
+    Walks with the scanner's own pruning (ignore sets, symlinks never
+    followed) and the global ``file_types``, so the total is exactly what a
+    scan would discover. ``{"total": n, "by_ext": {".pdf": a, ".epub": b}}``;
+    a missing or unmounted root contributes nothing.
+    """
+    by_ext: dict[str, int] = {}
+    total = 0
+    suffixes = frozenset(cfg.file_types)
+    for root in cfg.paths.source_roots:
+        if not root.is_dir():
+            continue
+        for p in iter_candidate_paths(
+            root, cfg.scan.ignore_dirs, cfg.scan.ignore_files, suffixes
+        ):
+            ext = p.suffix.lower() or "(none)"
+            by_ext[ext] = by_ext.get(ext, 0) + 1
+            total += 1
+    return {"total": total, "by_ext": by_ext}
 
 
 # --- logs --------------------------------------------------------------------

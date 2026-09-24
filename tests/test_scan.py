@@ -164,6 +164,26 @@ def test_ignores_symlinks_and_ignored_dirs(state_db: Database, base_config: Conf
     assert _one(state_db, "SELECT COUNT(*) AS n FROM documents")["n"] == 1
 
 
+def test_scan_respects_global_file_types(
+    state_db: Database, base_config: Config, src: Path
+) -> None:
+    """Only suffixes in the global file_types setting are discovered — an
+    .epub is invisible to a scan configured with file_types=[".pdf"]
+    (suffix filtering happens before any content hashing)."""
+    make_pdf(src / "A.pdf", ["a page of text " * 5])
+    (src / "B.epub").write_bytes(b"EPUB fake")  # never hashed, never invalid
+    jobs = Jobs(state_db)
+
+    cfg = base_config.model_copy(deep=True)
+    cfg.file_types = [".pdf"]
+    report = _scan(state_db, cfg, jobs)
+
+    assert report.discovered == 1
+    assert report.new_documents == 1
+    assert report.jobs_enqueued == 1
+    assert jobs.counts() == {"pending": 1}
+
+
 def test_mount_unavailable_sentinel_and_missing_root(
     state_db: Database, base_config: Config, src: Path
 ) -> None:

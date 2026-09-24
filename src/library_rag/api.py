@@ -346,7 +346,7 @@ def create_app(
             # the tab via /ready; direct calls 404.
             raise HTTPException(404, "browse is not available")
         try:
-            return list_browse_dir(db, browse_root, path, cfg.browse.file_types)
+            return list_browse_dir(db, browse_root, path, cfg.file_types)
         except BrowseNotFound as exc:
             raise HTTPException(404, str(exc)) from exc
         except BrowseError as exc:

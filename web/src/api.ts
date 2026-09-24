@@ -218,6 +218,11 @@ export interface SystemCatalog {
   published_books: number;
   chunks: number;
   books_bytes: number;
+  // On-disk repository (source roots): total book files found, per extension,
+  // and how many of them are not processed yet (disk total - processed).
+  disk_books: number;
+  disk_by_ext: Record<string, number>;
+  disk_unprocessed: number;
   derived_bytes: Record<string, number>; // state / qdrant / artifacts
   space_occupied_bytes: number;
   db_path: string;

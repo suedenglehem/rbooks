@@ -98,6 +98,10 @@ def test_catalog_stats_counts(state_db: Database, base_config: Config) -> None:
     assert stats["books_bytes"] == 300
     assert stats["space_occupied_bytes"] >= 300
     assert set(stats["derived_bytes"]) == {"state", "qdrant", "artifacts"}
+    # The source root does not exist on disk: nothing to count there.
+    assert stats["disk_books"] == 0
+    assert stats["disk_by_ext"] == {}
+    assert stats["disk_unprocessed"] == 0
     # The state DB exists and is non-empty after the seeds above.
     assert stats["db_size_bytes"] > 0
     assert stats["db_drive_total_bytes"] > stats["db_drive_free_bytes"] >= 0
@@ -112,6 +116,35 @@ def test_catalog_stats_empty_db(state_db: Database, base_config: Config) -> None
     assert stats["chunks"] == 0
     assert stats["books_bytes"] == 0
     assert stats["space_occupied_bytes"] >= 0
+    assert stats["disk_books"] == 0
+    assert stats["disk_by_ext"] == {}
+    assert stats["disk_unprocessed"] == 0
+
+
+def test_catalog_stats_disk_walk(state_db: Database, base_config: Config) -> None:
+    # "Books on disk" must be exactly what a scan would discover: the global
+    # file_types, the scanner's ignore sets, symlinks never followed.
+    src = base_config.paths.source_roots[0]
+    (src / ".git").mkdir(parents=True)
+    (src / "a.pdf").write_bytes(b"%PDF")
+    (src / "A.PDF").write_bytes(b"%PDF")  # case-folds into the same bucket
+    (src / "b.epub").write_bytes(b"EPUB")
+    (src / "notes.txt").write_bytes(b"nope")  # not a configured type
+    (src / ".git" / "hidden.pdf").write_bytes(b"%PDF")  # ignored dir
+    (src / "link.pdf").symlink_to(src / "a.pdf")  # symlinks are not counted
+
+    stats = si.catalog_stats(state_db, base_config)
+    assert stats["disk_books"] == 3
+    assert stats["disk_by_ext"] == {".pdf": 2, ".epub": 1}
+    assert stats["disk_unprocessed"] == 3  # nothing in the catalog yet
+
+    # Narrowing the global file_types narrows the count the same way a
+    # scan would.
+    cfg = base_config.model_copy(deep=True)
+    cfg.file_types = [".pdf"]
+    stats = si.catalog_stats(state_db, cfg)
+    assert stats["disk_books"] == 2
+    assert stats["disk_by_ext"] == {".pdf": 2}
 
 
 # --- serve log -------------------------------------------------------------------
@@ -351,6 +384,7 @@ def test_route_catalog(system_client: TestClient) -> None:
     assert body["processed_books"] == 1  # the hand-built rev has chunks
     assert body["published_books"] == 1  # publish_handbuilt activates it
     assert body["chunks"] == len(_TEXTS)
+    assert body["disk_books"] == 0  # the fixture source root is not on disk
     assert body["db_size_bytes"] > 0
 
 

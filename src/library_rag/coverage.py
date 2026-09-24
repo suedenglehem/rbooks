@@ -194,7 +194,9 @@ def _root_coverage(
     prefix = normalize_path(root) + "/"
     rc.registered = sum(1 for a in aliases if a.startswith(prefix))
 
-    for p in iter_candidate_paths(root, cfg.scan.ignore_dirs, cfg.scan.ignore_files):
+    for p in iter_candidate_paths(
+        root, cfg.scan.ignore_dirs, cfg.scan.ignore_files, frozenset(cfg.file_types)
+    ):
         norm = normalize_path(p)
         rc.discovered += 1
         if detect_format(p) is None:

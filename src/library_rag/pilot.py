@@ -464,7 +464,11 @@ def survey_sources(
 
     candidates: list[Path] = []
     for root in cfg.paths.source_roots:
-        candidates.extend(iter_candidate_paths(root, cfg.scan.ignore_dirs, cfg.scan.ignore_files))
+        candidates.extend(
+            iter_candidate_paths(
+                root, cfg.scan.ignore_dirs, cfg.scan.ignore_files, frozenset(cfg.file_types)
+            )
+        )
     candidates = [p for p in candidates if normalize_path(p) not in have]
     if limit is not None:
         candidates = candidates[:limit]

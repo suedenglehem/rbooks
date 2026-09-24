@@ -116,6 +116,9 @@ export class App {
   // The view on screen, so a /ready poll can react when Browse becomes
   // unavailable (mount pulled) while its tab is open.
   private currentView: "research" | "ingest" | "resumes" | "browse" = "research";
+  // Which Diagnostics log panel is open (shared #diag-log-view box); a second
+  // click of the same button closes it. null = closed.
+  private logMode: "serve" | "jobs" | null = null;
 
   constructor(private root: HTMLElement) {
     root.innerHTML = "";
@@ -337,8 +340,10 @@ export class App {
    *  LLM + embedder + GPU + CPU status, and the graceful-shutdown button. */
   private buildDiagnostics(): HTMLElement {
     const catalog = el("div", { class: "cards diag-cards" },
-      this.card("d-books", "Books"),
+      this.card("d-disk", "Books on disk"),
+      this.card("d-books", "Books in catalog"),
       this.card("d-processed", "Processed"),
+      this.card("d-unprocessed", "Not processed"),
       this.card("d-published", "Published"),
       this.card("d-occupied", "Space occupied"),
       this.card("d-db", "Database size"),
@@ -1067,13 +1072,19 @@ export class App {
   private async refreshCatalog(): Promise<void> {
     try {
       const c = await api.systemCatalog();
+      const exts = Object.entries(c.disk_by_ext)
+        .map(([ext, n]) => `${n} ${ext}`)
+        .join(" · ");
+      this.set("d-disk", exts ? `${c.disk_books} (${exts})` : String(c.disk_books));
       this.set("d-books", String(c.books));
       this.set("d-processed", `${c.processed_books} / ${c.books}`);
+      this.set("d-unprocessed", String(c.disk_unprocessed));
       this.set("d-published", `${c.published_books} / ${c.books}`);
       this.set("d-occupied", formatBytes(c.space_occupied_bytes));
       this.set("d-db", formatBytes(c.db_size_bytes));
       this.set("d-freespace", `${formatBytes(c.db_drive_free_bytes)} / ${formatBytes(c.db_drive_total_bytes)}`);
     } catch (e) {
+      this.set("d-disk", errText(e));
       this.set("d-books", errText(e));
     }
   }
@@ -1145,8 +1156,20 @@ export class App {
     return this.root.querySelector<HTMLElement>("#diag-log-view")!;
   }
 
+  private closeLogView(): void {
+    const view = this.logView();
+    view.hidden = true;
+    view.textContent = "";
+    this.logMode = null;
+  }
+
   private async showServeLog(): Promise<void> {
     const view = this.logView();
+    if (this.logMode === "serve") {
+      this.closeLogView();
+      return;
+    }
+    this.logMode = "serve";
     view.hidden = false;
     view.textContent = "Loading…";
     try {
@@ -1163,6 +1186,11 @@ export class App {
 
   private async showJobLogs(): Promise<void> {
     const view = this.logView();
+    if (this.logMode === "jobs") {
+      this.closeLogView();
+      return;
+    }
+    this.logMode = "jobs";
     view.hidden = false;
     view.textContent = "Loading…";
     view.innerHTML = "";

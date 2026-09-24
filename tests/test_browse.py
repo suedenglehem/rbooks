@@ -222,9 +222,7 @@ def browse_client(
     (root / "sub").mkdir(parents=True)
     (root / "a.pdf").write_bytes(b"%PDF")
     (root / "sub" / "b.epub").write_bytes(b"EPUB")
-    base_config.browse = BrowseSettings(
-        enabled=True, root=root, file_types=[".pdf", ".epub"]
-    )
+    base_config.browse = BrowseSettings(enabled=True, root=root)
     return _client(base_config, state_db), root
 
 
@@ -278,9 +276,7 @@ def test_route_disabled_by_default(
 def test_route_missing_root_degrades(
     state_db: Database, base_config: Config, tmp_path: Path
 ) -> None:
-    base_config.browse = BrowseSettings(
-        enabled=True, root=tmp_path / "gone-mount", file_types=FT
-    )
+    base_config.browse = BrowseSettings(enabled=True, root=tmp_path / "gone-mount")
     client = _client(base_config, state_db)
     assert client.get("/ready").json()["browse"] is False
     assert client.get("/browse/dir").status_code == 404
