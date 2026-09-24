@@ -145,14 +145,25 @@ export class App {
     // entry, the first back press would leave this document entirely
     // (returning to whatever page preceded it) and no web API can cancel
     // that navigation. So on load we seed one guard entry; every
-    // popstate — back OR forward — lands on Research when we are anywhere
-    // else, does nothing when we are already there, and re-arms a fresh
-    // guard entry behind the new position. Back therefore can never
-    // cross out of the site: only closing the tab or typing a new URL
-    // does. (Forward is absorbed the same way.)
+    // popstate — back OR forward — walks the user out: from Browse it
+    // first moves to the books root (and only from the root falls
+    // through to Research), from any other non-Research view it lands
+    // on Research directly, and on Research it does nothing. Each
+    // handling re-arms a fresh guard entry behind the new position, so
+    // back can never cross out of the site: only closing the tab or
+    // typing a new URL does. (Forward is absorbed the same way.)
     history.pushState({ nav: "home" }, "");
     window.addEventListener("popstate", () => {
-      if (this.currentView !== "research") this.showView("research");
+      if (this.currentView === "browse") {
+        if (this.browsePath !== "") {
+          this.browsePath = "";
+          void this.loadBrowse();
+        } else {
+          this.showView("research");
+        }
+      } else if (this.currentView !== "research") {
+        this.showView("research");
+      }
       history.pushState({ nav: "home" }, "");
     });
 
@@ -170,12 +181,15 @@ export class App {
     // The Browse button starts hidden: loadReady shows it only when the
     // server reports browse available (/ready.browse), and the 30 s poll
     // hides it again if the mount goes away.
-    const browseBtn = this.navBtn("browse", "Browse");
+    const browseBtn = this.navBtn("browse", "Browse", true);
     browseBtn.hidden = true;
+    // The Rag (ingestion dashboard) button is a utility action, not a
+    // view tab: it sits at the far right of the header, right of the
+    // token widget's "Set" button.
+    const ingestBtn = this.navBtn("ingest", "Rag");
     const views = el("nav", { class: "views" },
-      this.navBtn("research", "Research"),
-      this.navBtn("ingest", "Ingestion"),
-      this.navBtn("resumes", "Resumes"),
+      this.navBtn("research", "Research", true),
+      this.navBtn("resumes", "Summaries", true),
       browseBtn,
     );
     const tokenWrap = el("div", { class: "token", hidden: "true" },
@@ -188,6 +202,7 @@ export class App {
       readiness,
       views,
       tokenWrap,
+      ingestBtn,
     );
   }
 
@@ -196,8 +211,12 @@ export class App {
       el("span", { class: "dot-marker" }), label);
   }
 
-  private navBtn(view: "research" | "ingest" | "resumes" | "browse", label: string): HTMLButtonElement {
-    const b = el("button", { class: "view-btn", "data-view": view }, label);
+  private navBtn(
+    view: "research" | "ingest" | "resumes" | "browse",
+    label: string,
+    bold = false,
+  ): HTMLButtonElement {
+    const b = el("button", { class: bold ? "view-btn bold" : "view-btn", "data-view": view }, label);
     b.addEventListener("click", () => this.showView(view));
     return b;
   }

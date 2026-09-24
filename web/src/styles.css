@@ -137,6 +137,10 @@ main > section[hidden] { display: none; }
   color: var(--accent-ink);
 }
 
+.view-btn.bold {
+  font-weight: 700;
+}
+
 .token {
   display: flex;
   gap: 6px;
