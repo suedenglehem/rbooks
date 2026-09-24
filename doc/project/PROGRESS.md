@@ -3102,3 +3102,28 @@ end and breaks once N complete lines are present.
 - Note for future sessions: the progress log now lives at
   `doc/project/PROGRESS.md`.
 - Full-library launch still HELD on explicit operator approval.
+
+### Addendum (2026-09-25 ~01:40) — embed_port → embed_ports consolidation
+- `services.embed_port` (the M4 single-port key) is removed;
+  `services.embed_ports` is the sole key, defaulting to `[8081]` — a
+  config without the key behaves exactly like the old
+  `embed_port: 8081` (e905c19).
+- Pool validated at load: non-empty, ports 1-65535. `load_config`
+  rejects a legacy `embed_port` key with an explicit ConfigError —
+  pydantic v2 `extra="ignore"` would otherwise drop the stale key and
+  silently fall back to the default pool (a legacy config on a
+  non-default port would have been misrouted to 8081).
+- `embeddings.make_embedder` and `system_info.service_status` read the
+  pool; round-robin + transient-failover semantics unchanged. The
+  single-host replica design and multi-replica example are documented
+  in config.example.yaml.
+- Live pilot-sandbox config (outside the repo) migrated
+  `embed_port: 8081` → `embed_ports: [8081]`; the operator-local
+  gitignored repo config.yaml already carried the 8-port pool
+  `[8081..8088]` and loads cleanly.
+- Tests: default/empty/out-of-range pool validation, legacy-key
+  rejection regression test, updated default-pool assertions in
+  test_embeddings / test_system_info.
+- Gate: ruff clean, mypy 12 pre-existing test_browse errors only,
+  pytest full suite green (exit 0).
+- Full-library launch still HELD on explicit operator approval.
