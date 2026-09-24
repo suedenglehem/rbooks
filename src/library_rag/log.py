@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -88,6 +89,39 @@ def setup_logging(level: int | str = "INFO", fmt: str = "json") -> None:
     # Third-party noise we would rather not drown ingestion output in.
     logging.getLogger("multipart").setLevel(logging.WARNING)
     _CONFIGURED = True
+
+
+def add_file_log(path: Path, level: int | str = "INFO", fmt: str = "json") -> bool:
+    """Attach a FileHandler to the root logger, alongside the stderr handler.
+
+    Idempotent per path: a handler already attached to *path* (same resolved
+    file) is kept as-is. The level rides on the handler itself (the same
+    contract as the stderr handler in :func:`setup_logging`), so later root
+    level changes — e.g. :class:`JobLogCapture`'s DEBUG window — do not change
+    what lands in the file.
+
+    Returns True when a new handler was attached, False when one was already
+    present, and False (with a warning left to the caller) when the path could
+    not be created or opened — a read-only state root must not kill ``serve``.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return False
+    target = os.path.abspath(os.fspath(path))
+    root = logging.getLogger()
+    for handler in root.handlers:
+        if isinstance(handler, logging.FileHandler) and handler.baseFilename == target:
+            return False
+    resolved = level if isinstance(level, int) else getattr(logging, str(level), logging.INFO)
+    try:
+        handler = logging.FileHandler(path, mode="a", encoding="utf-8")
+    except OSError:
+        return False
+    handler.setLevel(resolved)
+    handler.setFormatter(_JsonFormatter() if fmt == "json" else _HumanFormatter())
+    root.addHandler(handler)
+    return True
 
 
 def get_logger(name: str) -> logging.Logger:

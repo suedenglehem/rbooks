@@ -12,7 +12,10 @@ reader routes (``/books/...``) plus the research surface:
 * ``/resumes/search`` and ``/resumes/{rev_id}`` — bm25 keyword search over the
   stored per-book summaries (M8) and a single resume's full record;
 * ``/scan`` and ``/ingest/...`` — the ingestion dashboard controls
-  (status, pause, resume, retry, rescan).
+  (status, pause, resume, retry, rescan);
+* ``/system/...`` — the Rag-page Diagnostics block: catalog stats, the
+  serve-log tail, per-job failure logs, LLM/embedder/GPU/CPU status, and
+  ``POST /system/shutdown`` (SIGTERM graceful stop of the serve process).
 
 Auth (PRD §12): the app binds loopback by default. The bearer-token
 requirement is a configurable master switch, ``services.require_api_token``,
@@ -29,18 +32,20 @@ substitute the fakes; ``serve`` wires the real implementations.
 
 from __future__ import annotations
 
+import os
+import signal
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.requests import ClientDisconnect
 
-from . import __version__
+from . import __version__, system_info
 from .answers import answer_query, get_answer, list_answers, resolve_citation
 from .browse import BrowseError, BrowseNotFound, list_browse_dir
 from .config import Config
@@ -72,6 +77,17 @@ _OPEN_PATHS = {"/health", "/", "/index.html"}
 def _is_static_path(path: str) -> bool:
     segment = path.rsplit("/", 1)[-1]
     return "." in segment  # /assets/app-*.js, /pdf.worker-*.mjs, favicon, ...
+
+
+def _self_terminate() -> None:
+    """Graceful shutdown: SIGTERM to the serve process itself.
+
+    uvicorn's handler drains in-flight requests, the server exits, and
+    ``_serve`` closes the state DB and releases the embedded Qdrant lock (so
+    the ingestion worker can start). Sent from a BackgroundTask *after* the
+    HTTP response is flushed, so the client always sees the ack first.
+    """
+    os.kill(os.getpid(), signal.SIGTERM)
 
 
 class SearchRequest(BaseModel):
@@ -379,6 +395,50 @@ def create_app(
     def ingest_retry(body: RetryRequest) -> dict[str, Any]:
         requeued = Jobs(db).retry(include_permanent=body.include_permanent)
         return {"requeued": requeued}
+
+    # --- system diagnostics (Rag-page Diagnostics block) ------------------------
+    #
+    # Read-only probes (catalog, logs, endpoints, GPU/CPU) plus one
+    # self-directed action: graceful shutdown. All of them are outside
+    # _OPEN_PATHS, so the bearer middleware protects them automatically.
+
+    state_root = cfg.paths.state_root
+
+    @app.get("/system/catalog")
+    def system_catalog() -> dict[str, Any]:
+        return system_info.catalog_stats(db, cfg)
+
+    @app.get("/system/log")
+    def system_log(lines: int = Query(default=1000, ge=1, le=5000)) -> dict[str, Any]:
+        return system_info.serve_log_tail(state_root / "logs" / "serve.log", lines=lines)
+
+    @app.get("/system/job-logs")
+    def system_job_logs(limit: int = Query(default=200, ge=1, le=1000)) -> dict[str, Any]:
+        return system_info.job_logs_list(db, state_root / "job_logs", limit=limit)
+
+    @app.get("/system/job-logs/{name}")
+    def system_job_log(
+        name: str, lines: int = Query(default=4000, ge=1, le=20000)
+    ) -> dict[str, Any]:
+        data = system_info.job_log_read(state_root / "job_logs", name, lines=lines)
+        if data is None:
+            raise HTTPException(404, "unknown or invalid job log name")
+        return data
+
+    @app.get("/system/status")
+    def system_status(
+        timeout: float = Query(default=2.0, ge=0.5, le=15.0)
+    ) -> dict[str, Any]:
+        return {
+            "services": system_info.service_status(cfg, timeout=timeout),
+            "gpu": system_info.gpu_status(),
+            "cpu": system_info.cpu_status(),
+        }
+
+    @app.post("/system/shutdown")
+    def system_shutdown(background: BackgroundTasks) -> dict[str, Any]:
+        background.add_task(_self_terminate)
+        return {"shutting_down": True}
 
     # --- static UI (last: the catch-all mount must not shadow the API routes) -----
     dist = find_web_dist()

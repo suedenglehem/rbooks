@@ -69,7 +69,7 @@ from .locks import (
     remove_stale_pidfile,
     write_pidfile,
 )
-from .log import setup_logging
+from .log import add_file_log, setup_logging
 from .migrate import MigrationError, MigrationReport, run_migration
 from .migrations import current_version, migrate
 from .pilot import (
@@ -654,6 +654,15 @@ def _is_loopback(host: str) -> bool:
 def _serve(args: argparse.Namespace) -> int:
     setup_logging(args.log_level, args.log_format)
     cfg = _require_config(args)
+    # Persistent serve log next to the state DB: the Rag-page Diagnostics
+    # block tails it, and it survives terminal scrollback. Best-effort — a
+    # read-only state root degrades to stderr-only logging, never a crash.
+    if not add_file_log(cfg.paths.state_root / "logs" / "serve.log", args.log_level, args.log_format):
+        print(
+            f"warning: could not open the serve log at "
+            f"{cfg.paths.state_root / 'logs' / 'serve.log'} — logging to stderr only.",
+            file=sys.stderr,
+        )
     host, port = cfg.services.app_host, cfg.services.app_port
     if not _is_loopback(host) and not cfg.services.require_api_token:
         # The token requirement is opt-in (services.require_api_token), so a

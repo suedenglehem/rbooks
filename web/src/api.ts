@@ -210,6 +210,93 @@ export interface BrowseEntry {
   title: string | null;
 }
 
+// --- system diagnostics (Rag page Diagnostics block) -------------------------
+
+export interface SystemCatalog {
+  books: number;
+  processed_books: number;
+  published_books: number;
+  chunks: number;
+  books_bytes: number;
+  derived_bytes: Record<string, number>; // state / qdrant / artifacts
+  space_occupied_bytes: number;
+  db_path: string;
+  db_size_bytes: number;
+  db_drive_total_bytes: number;
+  db_drive_free_bytes: number;
+}
+
+export interface ServeLogTail {
+  path: string;
+  exists: boolean;
+  line_count: number;
+  lines: string[];
+}
+
+export interface JobLogEntry {
+  name: string;
+  job_id: number;
+  attempt: number;
+  size_bytes: number;
+  mtime: number;
+  state: string | null; // null when the queue no longer knows the job
+  error_category?: string | null;
+  error_detail?: string | null;
+  stage?: string | null;
+  input_id?: string | null;
+}
+
+export interface JobLogList {
+  dir: string;
+  count: number;
+  logs: JobLogEntry[];
+}
+
+export interface JobLogRead {
+  name: string;
+  line_count: number;
+  lines: string[];
+}
+
+export interface EndpointStatus {
+  label: string;
+  host: string;
+  port: number;
+  up: boolean;
+  detail: string;
+}
+
+export interface GpuInfo {
+  index: number;
+  name: string;
+  mem_total_mib: number;
+  mem_used_mib: number;
+  mem_free_mib: number;
+  util_pct: number;
+  temp_c: number;
+}
+
+export interface GpuStatus {
+  available: boolean;
+  note: string;
+  gpus: GpuInfo[];
+}
+
+export interface CpuStatus {
+  logical_cores: number;
+  load1: number;
+  load5: number;
+  load15: number;
+  load_pct: number;
+  ram: { total_bytes: number; available_bytes: number; used_pct: number };
+}
+
+export interface SystemStatus {
+  services: { llm: EndpointStatus[]; embedders: EndpointStatus[] };
+  gpu: GpuStatus;
+  cpu: CpuStatus;
+}
+
 // --- token ------------------------------------------------------------------
 
 let token = readStoredToken();
@@ -352,6 +439,16 @@ export const api = {
     request<{ paused: boolean }>("/ingest/resume", post("/ingest/resume", {})),
   ingestRetry: (includePermanent: boolean) =>
     request<{ requeued: number }>("/ingest/retry", post("/ingest/retry", { include_permanent: includePermanent })),
+
+  systemCatalog: () => request<SystemCatalog>("/system/catalog"),
+  systemLog: (lines = 1000) =>
+    request<ServeLogTail>(`/system/log?lines=${lines}`),
+  systemJobLogs: () => request<JobLogList>("/system/job-logs"),
+  systemJobLog: (name: string, lines = 4000) =>
+    request<JobLogRead>(`/system/job-logs/${encodeURIComponent(name)}?lines=${lines}`),
+  systemStatus: () => request<SystemStatus>("/system/status"),
+  systemShutdown: () =>
+    request<{ shutting_down: boolean }>("/system/shutdown", post("/system/shutdown", {})),
 };
 
 /** Authed download of the archived original (blob URL + temporary anchor). */

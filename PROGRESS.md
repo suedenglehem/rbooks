@@ -2841,5 +2841,143 @@ rebuilds `web/dist`, committed; serve reads dist from disk, no restart).
   while `require_api_token: false`** — that is already the current
   behavior (`loadReady` hides it and clears the stale stored token,
   re-polls every 30 s; the widget only surfaces on a real 401), so no
-  code change. Open: local master is 5 commits ahead of origin
-  (unpushed).
+  code change. All 6 commits pushed to origin at ~15:10 on operator
+  request — `origin/master` = `0b4aced`, nothing unpushed, tree clean.
+- **Rag button weight (~15:05)**: operator reported "the Rag button
+  should not be bold" — code check (`navBtn("ingest", "Rag")` has no
+  bold class; CSS base 400 vs `.view-btn.bold` 700) plus a 4× zoomed
+  crop of `screens/Capture1.JPG` showed Rag already renders visibly
+  thinner than the bold tabs. Operator chose "no change needed" — no
+  code change.
+- **Live state at save**: serve pid 7659 up ~1 h 10 min,
+  `0.0.0.0:8100`, bundle `index-DFfDzjRO.js`, `/health` 200.
+- **Next**: awaiting operator direction. Optional: investigate the
+  failed answer "find me some facts about photography" (0 citations,
+  in answer history) if asked. Full-library launch remains HELD on
+  explicit operator approval.
+
+### Addendum (2026-09-24 ~18:45) — post-reboot recovery
+
+- Host rebooted ~18:39 (serve 7659 SIGTERM'd cleanly during shutdown,
+  serve.log tail). Embedding fleet 8081-8088 auto-relaunched at boot
+  (8192/8192 verified); vLLM auto-relaunched in its container, host
+  port 8091 serving `qwen3.8-27b` (the container process internally
+  listens on 8000 — not a mismatch). **ak:8080 is DOWN**
+  (operator-managed; the answer pool fails over to vLLM-only, `/ready`
+  `answer_model` still true).
+- serve relaunched detached: python pid 7334 (uv wrapper 7331), same
+  live config `pilot-sandbox/scratch/config.sandbox.yaml`, log
+  appended to repo-root `serve.log`; `serve.pid` updated
+  7659 → 7334. `/ready` → qdrant / embedding / answer / browse all
+  true, `token_required` false, `/health` 200.
+- No ingest worker running (unchanged since M10 close); full-library
+  launch still HELD on explicit operator approval.
+
+## M11 — Rag-page Diagnostics block (2026-09-24)
+
+**Status: gate passed (589 passed, ruff clean; mypy shows only the 12
+pre-existing tests/test_browse.py errors, verified at HEAD).** Operator
+request: a Diagnostics block on the Rag page with (1) catalog — book
+count, processed count, space occupied, database size, free space on the
+database's drive; (2) logging — button for the last 1000 log lines and
+readable per-job failure logs; (3) system — LLM endpoint statuses,
+embedder statuses, GPU make/memory/util, CPU load; plus a graceful
+shutdown button.
+
+### Design
+- New pure module `src/library_rag/system_info.py` (no FastAPI
+  dependency, like `browse`/`resumes`): every probe is defensive — a
+  missing file, a dead endpoint, or no `nvidia-smi` degrades to an
+  empty/"unavailable" field rather than raising, so one broken probe
+  never blanks the panel. The only side effects are reading files this
+  process (or the worker) owns.
+- `catalog_stats` — books / processed / published / chunk counts and
+  active-revision byte total from the state DB; "processed" = the doc's
+  *active revision has chunks*; drive headroom via `shutil.disk_usage`;
+  derived roots (state / qdrant / artifacts) measured with `du -sb` in
+  parallel (C-speed; a Python walk is far too slow on a 35k-file tree),
+  each falling back to 0.
+- Serve log: `_serve` now calls `log.add_file_log(state_root/logs/serve.log)`
+  (idempotent, fail-soft) so serve writes to a real file even when the
+  shell only redirects stderr. `serve_log_tail` reads the last N lines
+  from the end in 64 KiB blocks (multi-MB logs cost a handful of reads;
+  bytes are decoded only at the end so a multi-byte character split at a
+  block boundary lands on a line that is always dropped by the tail
+  slice).
+- Job logs: the worker's failure logs (`state_root/job_logs/<job_id>.
+  attempt<N>.log`) are listed newest-first and annotated from the `jobs`
+  table (state / error_category / stage / input_id — one `IN (...)`
+  query), so the list is actionable; a log whose job outlived a queue
+  reset shows `state: null`. Reads use the same strict-name regex plus
+  a realpath containment check as browse — a crafted name 404s.
+- `service_status` pings exactly what the app is configured to call —
+  the primary answer endpoint + `answer.extra_endpoints`, and the embed
+  pool (`embed_ports` or the single `embed_port`) — all in parallel
+  (GET `/health`, then `/v1/models`; `up = status < 500`), so a fully
+  dead fleet costs ~timeout, not timeout × endpoints.
+- GPU via `nvidia-smi --query-gpu` (make, memory, util, temp); CPU via
+  1/5/15-min load averages + `psutil.virtual_memory()` (no sampling —
+  the probe must never stall the request).
+- Graceful shutdown: `POST /system/shutdown` returns
+  `{"shutting_down": true}` immediately, then a BackgroundTask sends
+  SIGTERM to the serve process itself (uvicorn drains and exits
+  cleanly). The UI button asks for `confirm()` first.
+- Auth: nothing new — `/system/*` is not in `_OPEN_PATHS`, so the
+  bearer middleware covers it automatically (unit-tested).
+
+### Delivered
+- `src/library_rag/system_info.py` (NEW) — `catalog_stats`,
+  `serve_log_tail`, `job_logs_list`, `job_log_read`, `service_status`,
+  `gpu_status`, `cpu_status`.
+- `src/library_rag/api.py` — `GET /system/catalog`, `GET
+  /system/log?lines=1000`, `GET /system/job-logs?limit=200`, `GET
+  /system/job-logs/{name}?lines=4000` (404 on bad/missing name), `GET
+  /system/status?timeout=2.0`, `POST /system/shutdown`; module-level
+  `_self_terminate()`.
+- `src/library_rag/log.py` — `add_file_log()` (per-handler idempotent,
+  fail-soft); `src/library_rag/cli.py` — `_serve` wires it to
+  `state_root/logs/serve.log`.
+- `web/src/api.ts` — system interfaces + six `api.system*` methods.
+- `web/src/app.ts` — Diagnostics block in the ingest view (catalog
+  cards; "Last 1000 log lines" and "Failed job logs" buttons into a
+  shared log pane; endpoint/GPU/CPU tables; danger shutdown button)
+  with `loadDiagnostics`/`refreshCatalog`/`refreshSystem` and the
+  job-log list→read flow.
+- `web/src/styles.css` — `.diag-cards`, `.log-view`, `.job-log-row`,
+  `.diag-group/.diag-h`, `table.diag-table`, `.ok/.bad`.
+
+### Tests (22 new, all in `tests/test_system_info.py`)
+| Command                   | Result |
+| ------------------------- | ------ |
+| `uv run ruff check .`     | All checks passed! |
+| `uv run mypy`             | 12 errors — all pre-existing in tests/test_browse.py (verified at HEAD) |
+| `uv run pytest`           | 589 passed (567 baseline + 22 new) |
+
+The tail test with a no-trailing-newline file caught a real bug in the
+first `_tail_lines` implementation (the oldest edge line was
+mis-appended at the wrong end); the rewrite reads fixed blocks from the
+end and breaks once N complete lines are present.
+
+### Live E2E (2026-09-24 ~19:47)
+- serve restarted onto the new code (old pid 7334 SIGTERM'd clean;
+  new python pid **28310**, `serve.pid` updated; no ingest worker
+  running — Qdrant lock free). `/ready` all true, `token_required`
+  false.
+- `/system/catalog`: 344 books / 335 processed / 335 published /
+  54,270 chunks; 2.52 GB books, 2.25 GB derived (state 554 MB, qdrant
+  1.05 GB, artifacts 649 MB), 4.77 GB occupied; DB 554 MB with
+  7.51 TB free on its drive. First call ~9.5 s (the parallel `du`s) —
+  acceptable for a click-driven diagnostics panel.
+- `/system/job-logs`: 16 real failure logs listed, annotated (e.g.
+  `permanent_failed · resume_too_short` rows), newest first; bad names
+  404.
+- `/system/status`: primary LLM 8091 up, `extra-1` ak:8080 DOWN
+  (timed out — matches the known fleet state), `embed-8081` up
+  (config pins a single embed port; the 8-server pool 8081–8088 is
+  only probed where configured), 3 GPUs (RTX 3090 ×2, RTX 3080 Ti)
+  with memory/util/temp, 32-core CPU at ~8% load.
+- Serve-log file handler verified filling after a search request;
+  rebuilt web bundle (`index-CJXvXWtP.js`) confirmed served.
+- `/system/shutdown` NOT hit live (it would kill the server); covered
+  by the monkeypatched route test.
+- Full-library launch still HELD on explicit operator approval.

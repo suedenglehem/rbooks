@@ -508,6 +508,55 @@ table.jobs td.num { text-align: right; font-variant-numeric: tabular-nums; }
   word-break: break-word;
 }
 
+/* --- diagnostics (Rag page) ------------------------------------------------------------ */
+
+.diag-cards .card-v { font-size: 14px; }
+
+.log-view {
+  background: var(--pane);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px;
+  font-size: 11px;
+  line-height: 1.5;
+  overflow: auto;
+  max-height: 320px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.job-log-row {
+  padding: 4px 8px;
+  font-size: 12px;
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+  border-radius: 6px;
+}
+
+.job-log-row:hover { background: var(--flash); }
+
+.diag-group { margin-bottom: 8px; }
+
+.diag-h {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  margin: 8px 0 3px;
+}
+
+table.diag-table { border-collapse: collapse; font-size: 12px; }
+
+table.diag-table td {
+  padding: 2px 14px 2px 0;
+  vertical-align: baseline;
+}
+
+table.diag-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
+
+.ok { color: var(--ok); }
+.bad { color: var(--err); font-weight: 600; }
+
 /* --- resumes view (M8) --------------------------------------------------------------- */
 
 #resume-query {

@@ -19,8 +19,12 @@ import type {
   Book,
   BookManifest,
   BrowseEntry,
+  CpuStatus,
+  EndpointStatus,
   Evidence,
   EvidenceLocation,
+  GpuStatus,
+  JobLogEntry,
   Passage,
   PassageSpan,
   ResumeSummary,
@@ -323,8 +327,37 @@ export class App {
         el("table", { class: "jobs", id: "i-jobs" }),
         el("h3", { class: "section-h" }, "Last scan"),
         el("pre", { class: "scan-report", id: "i-scan-report" }, "No scan yet in this session."),
+        el("h3", { class: "section-h" }, "Diagnostics"),
+        this.buildDiagnostics(),
         this.buildTokenWidget(),
       ));
+  }
+
+  /** Diagnostics block: catalog cards, serve-log / failed-job-log readers,
+   *  LLM + embedder + GPU + CPU status, and the graceful-shutdown button. */
+  private buildDiagnostics(): HTMLElement {
+    const catalog = el("div", { class: "cards diag-cards" },
+      this.card("d-books", "Books"),
+      this.card("d-processed", "Processed"),
+      this.card("d-published", "Published"),
+      this.card("d-occupied", "Space occupied"),
+      this.card("d-db", "Database size"),
+      this.card("d-freespace", "Drive free"),
+    );
+    const logButtons = el("div", { class: "ingest-actions" },
+      button("Last 1000 log lines", "btn", () => this.showServeLog()),
+      button("Failed job logs", "btn", () => this.showJobLogs()),
+    );
+    return el("div", { id: "diag" },
+      catalog,
+      logButtons,
+      el("pre", { class: "log-view", id: "diag-log-view", hidden: "true" }),
+      el("div", { class: "diag-h" }, "System"),
+      el("div", { id: "diag-system" }, el("div", { class: "muted small" }, "…")),
+      el("div", { class: "ingest-actions" },
+        button("Graceful shutdown", "btn danger", () => this.shutdownServe()),
+      ),
+    );
   }
 
   /** API token widget (label + field + "Set"), at the bottom of the Rag
@@ -970,6 +1003,9 @@ export class App {
           jobs.append(el("tr", {}, el("td", {}, name), el("td", { class: "num" }, String(count))));
         }
       }
+      // Diagnostics refresh on the same view-switch; each section degrades
+      // independently, so this is fire-and-forget.
+      void this.loadDiagnostics();
     } catch (e) {
       this.handleApiError(e);
       this.set("i-msg", errText(e));
@@ -1016,6 +1052,169 @@ export class App {
       const r = await api.ingestRetry(includePermanent);
       this.set("i-msg", `Requeued ${r.requeued} job(s).`);
       await this.loadIngest();
+    } catch (e) {
+      this.handleApiError(e);
+      this.set("i-msg", errText(e));
+    }
+  }
+
+  // --- diagnostics --------------------------------------------------------------------------
+
+  private async loadDiagnostics(): Promise<void> {
+    await Promise.allSettled([this.refreshCatalog(), this.refreshSystem()]);
+  }
+
+  private async refreshCatalog(): Promise<void> {
+    try {
+      const c = await api.systemCatalog();
+      this.set("d-books", String(c.books));
+      this.set("d-processed", `${c.processed_books} / ${c.books}`);
+      this.set("d-published", `${c.published_books} / ${c.books}`);
+      this.set("d-occupied", formatBytes(c.space_occupied_bytes));
+      this.set("d-db", formatBytes(c.db_size_bytes));
+      this.set("d-freespace", `${formatBytes(c.db_drive_free_bytes)} / ${formatBytes(c.db_drive_total_bytes)}`);
+    } catch (e) {
+      this.set("d-books", errText(e));
+    }
+  }
+
+  private async refreshSystem(): Promise<void> {
+    try {
+      const s = await api.systemStatus();
+      const box = this.root.querySelector<HTMLElement>("#diag-system")!;
+      box.innerHTML = "";
+      box.append(this.endpointRows("Answer (LLM) endpoints", s.services.llm));
+      box.append(this.endpointRows("Embedder endpoints", s.services.embedders));
+      box.append(this.gpuRows(s.gpu));
+      box.append(this.cpuRow(s.cpu));
+    } catch (e) {
+      this.root.querySelector<HTMLElement>("#diag-system")!.innerHTML = "";
+      this.set("diag-system", errText(e));
+    }
+  }
+
+  private endpointRows(label: string, endpoints: EndpointStatus[]): HTMLElement {
+    const rows = endpoints.map(
+      (e) =>
+        el("tr", {},
+          el("td", {}, e.label),
+          el("td", {}, `${e.host}:${e.port}`),
+          el("td", { class: e.up ? "ok" : "bad" }, e.up ? "up" : "DOWN"),
+          el("td", { class: "muted small" }, e.detail),
+        ),
+    );
+    return el("div", { class: "diag-group" },
+      el("div", { class: "diag-h" }, label),
+      el("table", { class: "diag-table" }, el("tbody", {}, ...rows)),
+    );
+  }
+
+  private gpuRows(g: GpuStatus): HTMLElement {
+    if (!g.available) {
+      return el("div", { class: "diag-group" },
+        el("div", { class: "diag-h" }, "GPU"),
+        el("div", { class: "muted small" }, g.note),
+      );
+    }
+    const rows = g.gpus.map(
+      (x) =>
+        el("tr", {},
+          el("td", {}, x.name),
+          el("td", {}, `${x.mem_used_mib} / ${x.mem_total_mib} MiB`),
+          el("td", { class: "num" }, `${x.util_pct}% util`),
+          el("td", { class: "num" }, `${x.temp_c} °C`),
+        ),
+    );
+    return el("div", { class: "diag-group" },
+      el("div", { class: "diag-h" }, `GPU — ${g.note}`),
+      el("table", { class: "diag-table" }, el("tbody", {}, ...rows)),
+    );
+  }
+
+  private cpuRow(c: CpuStatus): HTMLElement {
+    return el("div", { class: "diag-group" },
+      el("div", { class: "diag-h" }, "CPU"),
+      el("div", { class: "small" },
+        `load ${c.load1} / ${c.load5} / ${c.load15} (1/5/15 min) · ${c.load_pct}% of 1-min · ${c.logical_cores} logical cores`),
+      el("div", { class: "muted small" },
+        `RAM ${formatBytes(c.ram.available_bytes)} available of ${formatBytes(c.ram.total_bytes)}`),
+    );
+  }
+
+  private logView(): HTMLElement {
+    return this.root.querySelector<HTMLElement>("#diag-log-view")!;
+  }
+
+  private async showServeLog(): Promise<void> {
+    const view = this.logView();
+    view.hidden = false;
+    view.textContent = "Loading…";
+    try {
+      const t = await api.systemLog(1000);
+      if (!t.exists) {
+        view.textContent = `No serve log at ${t.path} yet (the server logs to stderr only, or just restarted before logging anything).`;
+      } else {
+        view.textContent = `# ${t.path} — last ${t.line_count} line(s)\n` + t.lines.join("\n");
+      }
+    } catch (e) {
+      view.textContent = errText(e);
+    }
+  }
+
+  private async showJobLogs(): Promise<void> {
+    const view = this.logView();
+    view.hidden = false;
+    view.textContent = "Loading…";
+    view.innerHTML = "";
+    try {
+      const list = await api.systemJobLogs();
+      if (list.count === 0) {
+        view.append(el("div", { class: "muted small" }, `No failed-job logs in ${list.dir}.`));
+        return;
+      }
+      view.append(el("div", { class: "muted small" }, `#${list.count} job log(s) in ${list.dir} — click a row to read it (last 4000 lines).`));
+      for (const l of list.logs) {
+        const when = new Date(l.mtime * 1000).toLocaleString();
+        const row = el("div", { class: "job-log-row", role: "button", tabindex: "0" },
+          el("span", {}, l.name),
+          el("span", { class: "muted" },
+            ` · job ${l.job_id} · ${l.state ?? "state unknown"}${l.error_category ? ` · ${l.error_category}` : ""}`),
+          el("span", { class: "muted" }, ` · ${formatBytes(l.size_bytes)} · ${when}`),
+        );
+        const open = () => void this.showJobLog(l.name);
+        row.addEventListener("click", open);
+        row.addEventListener("keydown", (e) => {
+          if (e.key === "Enter") open();
+        });
+        view.append(row);
+      }
+    } catch (e) {
+      view.textContent = errText(e);
+    }
+  }
+
+  private async showJobLog(name: string): Promise<void> {
+    const view = this.logView();
+    view.textContent = "Loading…";
+    try {
+      const t = await api.systemJobLog(name, 4000);
+      view.textContent = `# ${t.name} — last ${t.line_count} line(s)\n` + t.lines.join("\n");
+      view.scrollTop = 0;
+    } catch (e) {
+      view.textContent = errText(e);
+    }
+  }
+
+  private async shutdownServe(): Promise<void> {
+    const ok = window.confirm(
+      "Gracefully stop the research app (serve)?\n\n" +
+      "In-flight requests are drained, then the process exits and the " +
+      "ingestion worker can start. You will need to relaunch serve to use the UI again.",
+    );
+    if (!ok) return;
+    try {
+      await api.systemShutdown();
+      this.set("i-msg", "Shutdown accepted — the server is draining and about to exit.");
     } catch (e) {
       this.handleApiError(e);
       this.set("i-msg", errText(e));
