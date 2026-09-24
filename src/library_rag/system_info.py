@@ -341,8 +341,8 @@ def service_status(cfg: Config, timeout: float = 2.0) -> dict[str, Any]:
     """Health of the LLM answer endpoints and the embedding endpoints.
 
     Reports exactly what the app is configured to call: the primary answer
-    endpoint plus ``answer.extra_endpoints``, and the embed pool (``embed_ports``
-    or the single ``embed_port``). All pings run in parallel with a short
+    endpoint plus ``answer.extra_endpoints``, and the embed pool
+    (``embed_ports``). All pings run in parallel with a short
     connect/read timeout, so a fully-dead fleet costs ~*timeout* seconds, not
     *timeout* times the endpoint count.
     """
@@ -350,7 +350,7 @@ def service_status(cfg: Config, timeout: float = 2.0) -> dict[str, Any]:
     llm = [
         ("primary", svc.answer_host, svc.answer_port)
     ] + [(f"extra-{i + 1}", e.host, e.port) for i, e in enumerate(cfg.answer.extra_endpoints)]
-    ports = svc.embed_ports if svc.embed_ports else [svc.embed_port]
+    ports = svc.embed_ports
     embed = [(f"embed-{p}", svc.embed_host, p) for p in ports]
 
     def ping(label: str, host: str, port: int) -> dict[str, Any]:

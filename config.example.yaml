@@ -46,8 +46,7 @@ services:
   # machines. There is no multi-host support; to use a second machine, point
   # embed_host at it and (re)bind its replicas' ports there.
   #
-  # `embed_port` (default 8081) is the single-replica shorthand. `embed_ports`
-  # replaces it with an explicit list, e.g. [8081, 8082, 8083, 8084].
+  # `embed_ports` is the pool of replicas, default [8081] (single replica).
   # Requests round-robin across the ports; a request that fails on one
   # endpoint (5xx, timeout) is retried on the next replica in rotation.
   #
@@ -56,12 +55,9 @@ services:
   # connect_timeout_seconds). A dead or packet-dropping replica therefore
   # costs up to 120 s per bounced request before failover moves on.
   embed_host: 127.0.0.1
-  embed_port: 8081
-  # embed_ports:
-  #   - 8081
-  #   - 8082
-  #   - 8083
-  #   - 8084
+  embed_ports: [8081]
+  # Run more replicas by listing every port (one llama-server per port):
+  # embed_ports: [8081, 8082, 8083, 8084]
   # FastAPI app bind. Keep loopback unless the operator opts into LAN exposure
   # (which then requires api_token). Avoid :8000/:8081/:8091 (occupied).
   app_host: 127.0.0.1

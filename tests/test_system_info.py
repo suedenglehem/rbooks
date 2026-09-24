@@ -323,9 +323,9 @@ def test_service_status_up_and_down(base_config: Config, live_port: int) -> None
 
 
 def test_service_status_reports_configured_single_embedder(base_config: Config) -> None:
-    # With embed_ports empty the single embed_port is the pool.
+    # Default pool is the single historical port 8081.
     out = si.service_status(base_config.model_copy(deep=True), timeout=1.0)
-    assert [e["label"] for e in out["embedders"]] == [f"embed-{base_config.services.embed_port}"]
+    assert [e["label"] for e in out["embedders"]] == [f"embed-{base_config.services.embed_ports[0]}"]
     assert len(out["llm"]) == 1
     assert out["llm"][0]["label"] == "primary"
 

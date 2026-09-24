@@ -233,13 +233,39 @@ def test_services_qdrant_path_defaults_none() -> None:
 
 
 def test_services_embed_ports_default_and_validation() -> None:
-    # Empty pool by default: single-endpoint behavior via embed_port.
-    assert Services().embed_ports == []
+    # Default pool is the single historical port: a config without the key
+    # behaves exactly like the old single-endpoint embed_port: 8081.
+    assert Services().embed_ports == [8081]
     assert Services(embed_ports=[8081, 8082]).embed_ports == [8081, 8082]
-    with pytest.raises(ConfigError, match=r"port must be 1-65535"):
-        Services(embed_port=0)
+    with pytest.raises(ConfigError, match=r"must not be empty"):
+        Services(embed_ports=[])
     with pytest.raises(ConfigError, match=r"port must be 1-65535"):
         Services(embed_ports=[8081, 70000])
+
+
+def test_load_config_rejects_legacy_embed_port_key(roots: dict[str, Path], tmp_path: Path) -> None:
+    # The legacy single-port key must not be silently ignored (pydantic's
+    # extra="ignore" would drop it and fall back to the default pool).
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(
+        "\n".join(
+            [
+                "paths:",
+                "  source_roots: []",
+                f"  archive_root: {roots['archive_root']}",
+                f"  artifact_root: {roots['artifact_root']}",
+                f"  state_root: {roots['state_root']}",
+                f"  qdrant_root: {roots['qdrant_root']}",
+                f"  model_root: {roots['model_root']}",
+                f"  scratch_root: {roots['scratch_root']}",
+                "services:",
+                "  embed_port: 8082",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match=r"embed_port was removed"):
+        load_config(cfg_file)
 
 
 def test_services_connect_timeout_default_and_validation() -> None:

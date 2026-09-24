@@ -168,12 +168,11 @@ class Services(BaseModel):
     answer_port: int = 8080
     # llama.cpp embedding-model server (OpenAI-compatible /v1/embeddings).
     embed_host: str = "127.0.0.1"
-    embed_port: int = 8081
-    # Optional pool of identical embedding-model replicas (one llama-server
-    # per port). When non-empty, embedding requests round-robin across these
-    # ports and fail over to the next on transient unavailability; embed_port
-    # is then ignored. Empty keeps the single-embed_port behavior.
-    embed_ports: list[int] = Field(default_factory=list)
+    # Pool of identical embedding-model replicas (one llama-server per port),
+    # all on embed_host. Default is the single-replica [8081]. With more than
+    # one port, embedding requests round-robin across the pool and fail over
+    # to the next replica on transient unavailability.
+    embed_ports: list[int] = Field(default_factory=lambda: [8081])
     # FastAPI app bind address. Must stay loopback unless the operator opts in.
     app_host: str = "127.0.0.1"
     app_port: int = 8000
@@ -207,11 +206,12 @@ class Services(BaseModel):
         # only place a non-loopback host is surfaced, so record it explicitly.
         return v
 
-    @field_validator("embed_port", "embed_ports")
+    @field_validator("embed_ports")
     @classmethod
-    def _valid_ports(cls, v: int | list[int]) -> int | list[int]:
-        ports = v if isinstance(v, list) else [v]
-        for port in ports:
+    def _valid_ports(cls, v: list[int]) -> list[int]:
+        if not v:
+            raise ConfigError("services.embed_ports must not be empty")
+        for port in v:
             if not 1 <= port <= 65535:
                 raise ConfigError(f"port must be 1-65535 (got {port})")
         return v
@@ -849,6 +849,15 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
     services = raw.setdefault("services", {})
     if os.environ.get("LIBRARY_RAG_API_TOKEN") and not services.get("api_token"):
         services["api_token"] = os.environ["LIBRARY_RAG_API_TOKEN"]
+
+    # The legacy single-port key embed_port was replaced by the embed_ports
+    # pool; pydantic would ignore the stale key and silently fall back to the
+    # default pool, so reject it explicitly instead.
+    if isinstance(services, dict) and "embed_port" in services:
+        raise ConfigError(
+            "services.embed_port was removed; use services.embed_ports "
+            "(a list of ports, e.g. embed_ports: [8081])"
+        )
 
     # require_api_token without a value would enforce auth with no usable
     # token; fail at load instead of at the first request.

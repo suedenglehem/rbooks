@@ -591,7 +591,8 @@ def test_make_embedder_uses_embed_ports_when_set(base_config: Config) -> None:
     ]
 
 
-def test_make_embedder_defaults_to_embed_port(base_config: Config) -> None:
+def test_make_embedder_defaults_to_single_port(base_config: Config) -> None:
+    # No pool configured: the default pool is the single historical port.
     base_config.embedding.model_revision = "rev-1"
     emb = make_embedder(base_config)
     assert isinstance(emb, LlamaCppEmbedder)
