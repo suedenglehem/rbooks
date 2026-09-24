@@ -3022,3 +3022,61 @@ end and breaks once N complete lines are present.
   `/browse/dir` lists the category tree correctly. New bundle
   `index-BvF91VSZ.js` — operator should hard-refresh.
 - Full-library launch still HELD on explicit operator approval.
+
+### Addendum (2026-09-24 ~21:20) — models/ launch scripts tracked
+- 7a33d2c: models/ un-ignored and committed (qwen_on_lx.sh — local
+  llama-server :8091, 2-GPU tensor split + draft-MTP; qwen_on_win.sh —
+  Windows :8080 variant; embedder.sh — bge-m3 :8081). Launch scripts
+  only; weights stay in paths.model_root. `.gitignore` updated: models/
+  removed from the scratch block, `*.swp` and `serve.pid` added.
+  serve.pid also un-tracked (cde2fa2 "models' scripts" had picked it up
+  by mistake while its actual models/ payload was gitignored and
+  skipped — see 7a33d2c's commit message for the full note).
+- Operator 7b37d14 "typo" (after 7a33d2c): removed embedder.sh's dead
+  `m=` variable (the command already used `-m ./bge-m3-q8_0.gguf`).
+- No behavior change; serve pid 45694 still up; full-library launch
+  still HELD on explicit operator approval.
+
+### Addendum (2026-09-25 ~00:47) — post-reboot recovery #2
+
+- Host rebooted ~00:39 (serve 45694 died with it; no crash in
+  serve.log — last line 20:51:10, a clean reboot kill). Embedding fleet
+  8081-8088 auto-relaunched at boot; vLLM auto-relaunched in its
+  container (host :8091 serving `qwen3.8-27b`, `/health` 200, model
+  list OK). ak:8080 status unknown post-reboot — remote machine,
+  operator-managed (the answer pool fails over to vLLM-only either way).
+- serve relaunched detached: python pid 7445 (uv wrapper 7442), same
+  live config `pilot-sandbox/scratch/config.sandbox.yaml`, log appended
+  to repo-root `serve.log`; `serve.pid` updated 45694 → 7445.
+  `/ready` → qdrant / embedding / answer / browse all true,
+  `token_required` false.
+- No ingest worker running; full-library launch still HELD on explicit
+  operator approval.
+
+### Addendum (2026-09-25 ~00:55) — serve.sh control script
+- New `serve.sh` (repo root, operator tool, +x):
+  - `start` — detached `nohup uv run library-rag serve` on the live
+    config (log appended to repo-root `serve.log`), waits for `/health`,
+    writes the python pid to `serve.pid`. Refuses if serve is already
+    up (or something else owns :8100 — recovers the pid into the
+    pidfile in that case) or if an ingest worker is running (embedded
+    Qdrant is single-process).
+  - `stop` — graceful: `POST /system/shutdown` (token header only when
+    `LIBRARY_RAG_API_TOKEN` is set after sourcing serve.env), SIGTERM
+    after 30 s if the API is unavailable, SIGKILL as a last resort.
+    Removes `serve.pid`; reports "serve not running" on a clean no-op.
+  - `status` — serve pid/uptime//health//ready; while serving,
+    endpoints + GPU + CPU rendered from `/system/status`; when down,
+    direct 2-3 s probes of 127.0.0.1:8091, :8081 and ak:8080; worker
+    presence via pgrep; config path. The model fleet is reported, not
+    managed (it auto-restarts at boot and is operator-managed).
+  - Config from `$LIBRARY_RAG_CONFIG` (default: the live
+    pilot-sandbox config); `<config dir>/serve.env` sourced if present
+    (token env, never echoed).
+- Fully live-tested ~00:52: status (up) → graceful stop (7445, clean
+  exit via the API) → status (down, fleet probes) → start (9254,
+  `/ready` all true) → duplicate start refused (exit 1) → status (up,
+  new pid). `serve.pid` is script-managed going forward.
+- Post-reboot note: ak:8080 is back UP (operator restored it after the
+  ~00:39 reboot) — the dual-endpoint answer split is active again.
+- Full-library launch still HELD on explicit operator approval.
