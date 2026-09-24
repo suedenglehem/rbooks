@@ -3080,3 +3080,25 @@ end and breaks once N complete lines are present.
 - Post-reboot note: ak:8080 is back UP (operator restored it after the
   ~00:39 reboot) — the dual-endpoint answer split is active again.
 - Full-library launch still HELD on explicit operator approval.
+
+### Addendum (2026-09-25 ~01:05) — documentation reorganization
+- All five root-level development-stage .md files moved to `doc/project/`
+  via `git mv` (contents untouched, now frozen historical records):
+  CLAUDE_PRD.md, M6_PILOT_REPORT.md, PROGRESS.md (this file), RUNBOOK.md,
+  README.md (M0-era original).
+- New `doc/README.md` — the current-state project documentation:
+  architecture diagram, components (full CLI command table, serve app +
+  web views + API surface, worker durability contract, model fleet),
+  ingestion/answer data flow, live storage layout, configuration
+  reference, operations (serve.sh, full-library launch HELD,
+  post-reboot recovery), quality gates, M0–M11 milestone table, current
+  pilot state (344/335/54,270 chunks; 34,768 books on disk).
+- Only two functional references to the moved files, both updated:
+  `pyproject.toml` readme → `doc/README.md`;
+  `src/library_rag/__init__.py` docstring → `doc/project/CLAUDE_PRD.md`.
+  Cross-references inside the frozen historical docs are left as written.
+- No behavior change: `library-rag --help` + package import smoke-tested
+  after the move.
+- Note for future sessions: the progress log now lives at
+  `doc/project/PROGRESS.md`.
+- Full-library launch still HELD on explicit operator approval.
