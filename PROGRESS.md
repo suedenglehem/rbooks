@@ -2831,3 +2831,15 @@ rebuilds `web/dist`, committed; serve reads dist from disk, no restart).
   cancelled 604 / permanent_failed 11 with INGESTION running; the
   status card inside the Rag view still reads "INGESTION" (rename to
   "Rag" offered, not requested).
+- **Follow-up (~15:00)**: `2794ec8` — the operator asked to "rename
+  Ingestion into Tngest"; confirmed by question that "Tngest" was a
+  typo and the card label is now **Ingest** (renders INGEST; the two
+  status *sentences* "Ingestion paused." / "Ingestion resumed." are
+  untouched English, not the label). Bundle is now
+  `index-DFfDzjRO.js` (served, verified 200 on 0.0.0.0:8100).
+  Operator also confirmed the API-token widget **should stay hidden
+  while `require_api_token: false`** — that is already the current
+  behavior (`loadReady` hides it and clears the stale stored token,
+  re-polls every 30 s; the widget only surfaces on a real 401), so no
+  code change. Open: local master is 5 commits ahead of origin
+  (unpushed).
