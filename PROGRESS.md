@@ -2793,3 +2793,41 @@ green — 567 passed, ruff + mypy clean)
   watch — its API side (`/ready.browse` false, `/browse/*` 404s, app
   otherwise healthy) is the verified missing-root behavior, and the
   30 s poll self-healing is the SPA's existing mechanism.
+
+### Addendum (2026-09-24 ~14:30) — post-M10 navigation & header fixes (operator pass)
+
+Operator-driven UI iteration on the SPA (vanilla TS + Vite; each change
+rebuilds `web/dist`, committed; serve reads dist from disk, no restart).
+
+- `f0c6073` — **browser back trap**: a guard history entry is seeded on
+  load; every popstate (back / forward / hardware back) re-arms a fresh
+  guard, so back can never cross out of the site — only closing the tab
+  or typing a URL does. Back = home semantics; forward is absorbed.
+- `cf08e65` — **header/nav**: Ingestion tab removed; a "Rag" button sits
+  at the far right of the header (utility position). Research /
+  Summaries / Browse labels are bold; the Resumes tab is renamed
+  **Summaries**. Back inside Browse first moves to the books **root**;
+  from the root (or any other non-Research view) it lands on Research;
+  on Research it is a no-op.
+- `17f0d6a` — **API token widget** (field + Set) moved from the header
+  to the bottom of the Rag page, visibility rules unchanged (hidden
+  unless the server reports a token may be needed); a 401 now also
+  switches to the Rag view so the prompt is visible where the field
+  lives (guarded against a 401 → showView → refetch loop).
+- **Operator screenshots** `screens/Capture1-5.JPG` (~14:23, at
+  `http://tr4:8100`): new nav confirmed (bold Research / Summaries /
+  Browse + Rag far right); a live answer "What do you know about
+  optics?" with 12 citations and the reader on
+  `photo/Digital Optics For Digital Photography.pdf` p.9/10; the Rag
+  page with the API-token widget at the bottom (visible in the
+  operator's session; my `/ready` smoke at ~13:00 said
+  `token_required: false`, so its visibility there came from a 401
+  prompt or a config flip on their side — unverified).
+- **Live state**: serve pid 7659 (`pilot-sandbox/scratch/serve.pid`
+  updated), bundle `index-sx6oNGYF.js` served on 0.0.0.0:8100.
+- **Unverified observations** (operator session, worth a look if
+  asked): answer history shows a `failed` query "find me some facts
+  about photography" (0 citations); Rag jobs succeeded 16589 /
+  cancelled 604 / permanent_failed 11 with INGESTION running; the
+  status card inside the Rag view still reads "INGESTION" (rename to
+  "Rag" offered, not requested).
