@@ -2981,3 +2981,13 @@ end and breaks once N complete lines are present.
 - `/system/shutdown` NOT hit live (it would kill the server); covered
   by the monkeypatched route test.
 - Full-library launch still HELD on explicit operator approval.
+
+### Addendum (2026-09-24 ~20:10) — operator UI tweaks
+- API token widget (field + "Set") moved from the bottom of the Rag
+  page to just above the Jobs table (still hidden while
+  `require_api_token` is false).
+- Diagnostics "System" title now uses the same bold section-heading
+  style as Jobs / Last scan (`h3.section-h`) with extra top spacing
+  (20px) after the log controls.
+- Web-only changes: rebuilt bundle served from disk, no serve restart
+  (bundle index-CfPfSb3O.js).

@@ -323,13 +323,13 @@ export class App {
         cards,
         actions,
         el("div", { class: "ingest-msg", id: "i-msg" }),
+        this.buildTokenWidget(),
         el("h3", { class: "section-h" }, "Jobs"),
         el("table", { class: "jobs", id: "i-jobs" }),
         el("h3", { class: "section-h" }, "Last scan"),
         el("pre", { class: "scan-report", id: "i-scan-report" }, "No scan yet in this session."),
         el("h3", { class: "section-h" }, "Diagnostics"),
         this.buildDiagnostics(),
-        this.buildTokenWidget(),
       ));
   }
 
@@ -352,7 +352,7 @@ export class App {
       catalog,
       logButtons,
       el("pre", { class: "log-view", id: "diag-log-view", hidden: "true" }),
-      el("div", { class: "diag-h" }, "System"),
+      el("h3", { class: "section-h diag-section-h" }, "System"),
       el("div", { id: "diag-system" }, el("div", { class: "muted small" }, "…")),
       el("div", { class: "ingest-actions" },
         button("Graceful shutdown", "btn danger", () => this.shutdownServe()),
@@ -360,8 +360,8 @@ export class App {
     );
   }
 
-  /** API token widget (label + field + "Set"), at the bottom of the Rag
-   *  page. Hidden until the server reports a token may be needed. */
+  /** API token widget (label + field + "Set"), above the Jobs table on the
+   *  Rag page. Hidden until the server reports a token may be needed. */
   private buildTokenWidget(): HTMLElement {
     return el("div", { class: "token", hidden: "true" },
       el("label", { class: "token-label" }, "API token",

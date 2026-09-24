@@ -545,6 +545,10 @@ table.jobs td.num { text-align: right; font-variant-numeric: tabular-nums; }
   margin: 8px 0 3px;
 }
 
+/* Top-level "System" heading: same style as the other section headings
+   (Jobs / Last scan) with extra breathing room after the log controls. */
+.diag-section-h { margin-top: 20px; }
+
 table.diag-table { border-collapse: collapse; font-size: 12px; }
 
 table.diag-table td {
