@@ -1,7 +1,5 @@
 #!/bin/sh
 
-m="/dd2/lmstudio/Models/xtra/bce-embedding-base_v1-Q8_0.gguf"
-
 port=8081
 
 case $1 in
