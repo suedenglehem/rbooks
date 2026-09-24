@@ -184,24 +184,17 @@ export class App {
     const browseBtn = this.navBtn("browse", "Browse", true);
     browseBtn.hidden = true;
     // The Rag (ingestion dashboard) button is a utility action, not a
-    // view tab: it sits at the far right of the header, right of the
-    // token widget's "Set" button.
+    // view tab: it sits at the far right of the header.
     const ingestBtn = this.navBtn("ingest", "Rag");
     const views = el("nav", { class: "views" },
       this.navBtn("research", "Research", true),
       this.navBtn("resumes", "Summaries", true),
       browseBtn,
     );
-    const tokenWrap = el("div", { class: "token", hidden: "true" },
-      el("label", { class: "token-label" }, "API token",
-        el("input", { type: "password", id: "token-input", autocomplete: "off" })),
-      button("Set", "btn small", () => this.saveToken()),
-    );
     return el("header", { class: "app-header" },
       el("h1", { class: "title" }, "Library Research"),
       readiness,
       views,
-      tokenWrap,
       ingestBtn,
     );
   }
@@ -330,7 +323,18 @@ export class App {
         el("table", { class: "jobs", id: "i-jobs" }),
         el("h3", { class: "section-h" }, "Last scan"),
         el("pre", { class: "scan-report", id: "i-scan-report" }, "No scan yet in this session."),
+        this.buildTokenWidget(),
       ));
+  }
+
+  /** API token widget (label + field + "Set"), at the bottom of the Rag
+   *  page. Hidden until the server reports a token may be needed. */
+  private buildTokenWidget(): HTMLElement {
+    return el("div", { class: "token", hidden: "true" },
+      el("label", { class: "token-label" }, "API token",
+        el("input", { type: "password", id: "token-input", autocomplete: "off" })),
+      button("Set", "btn small", () => this.saveToken()),
+    );
   }
 
   private buildResumeView(): HTMLElement {
@@ -461,6 +465,11 @@ export class App {
     // The server has told us it does not enforce a token: never surface the
     // field + "Set" button, even if a stray 401 arrives.
     if (this.tokenRequired === false) return;
+    // The widget lives on the Rag page — switch to it so the prompt is
+    // visible no matter which request triggered the 401. (Guarded: an
+    // unconditional showView would re-fetch ingest status and re-enter
+    // this prompt in a loop while every call is 401-ing.)
+    if (this.currentView !== "ingest") this.showView("ingest");
     this.root.querySelector<HTMLElement>(".token")!.hidden = false;
     if (!getToken()) this.root.querySelector<HTMLInputElement>("#token-input")!.focus();
   }
