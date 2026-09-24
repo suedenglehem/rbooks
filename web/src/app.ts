@@ -305,7 +305,7 @@ export class App {
       this.card("i-chunks", "Chunks"),
       this.card("i-answers", "Answers"),
       this.card("i-schema", "Schema"),
-      this.card("i-paused", "Ingestion"),
+      this.card("i-paused", "Ingest"),
     );
     const actions = el("div", { class: "ingest-actions" },
       button("Scan folders", "btn primary", () => this.ingestScan()),
