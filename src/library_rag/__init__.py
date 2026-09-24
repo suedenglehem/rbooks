@@ -1,6 +1,6 @@
 """library_rag — local-first RAG research application for a personal book library.
 
-Package layout (grows across milestones; see CLAUDE_PRD.md §4):
+Package layout (grows across milestones; see doc/project/CLAUDE_PRD.md §4):
 
     config    -- config loading/validation (M0)
     log       -- structured logging (M0)
