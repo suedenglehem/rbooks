@@ -2991,3 +2991,34 @@ end and breaks once N complete lines are present.
   (20px) after the log controls.
 - Web-only changes: rebuilt bundle served from disk, no serve restart
   (bundle index-CfPfSb3O.js).
+
+### Addendum (2026-09-24 ~20:55) — log toggles, on-disk totals, global file_types
+- Diagnostics log buttons now toggle: a second click on "Last 1000 log"
+  or "Failed job logs" closes the shared log view (`logMode` state; the
+  job-log detail inherits "jobs" mode, so the close works from there
+  too).
+- Diagnostics catalog cards gained on-disk repository totals: `disk_books`
+  (total book files under the source roots, counted with the same
+  `iter_candidate_paths` a scan uses — same ignore dirs, no symlinks),
+  `disk_by_ext` (per-extension breakdown), `disk_unprocessed`
+  (= disk total − processed). New "Books on disk" card shows
+  `N (x .pdf · y .epub)`; "Unprocessed" card shows the backlog.
+- `browse.file_types` moved to a top-level global `file_types` setting
+  (default `[".pdf", ".epub"]`, normalized + deduped at load, validated
+  against `SUPPORTED_FILE_TYPES` — unsupported/empty/undotted entries are
+  a `ConfigError`). The scanner, browse, coverage, latency and pilot all
+  filter to it; a leftover `browse.file_types` key is silently ignored
+  (legacy configs load fine).
+- Live config updated: `file_types: [.pdf, .epub]` now global; `browse:`
+  keeps only `enabled`/`root`. Backup: `config.sandbox.yaml.pre-filetypes`.
+- Gate: ruff clean, mypy 12 pre-existing test_browse errors only, pytest
+  591 passed (567 baseline + 22 + 2 new: disk-walk stats test,
+  global-file-types scan test).
+- Live E2E (~20:57): serve restarted (old 28310 SIGTERM'd in 2 s; new
+  python pid **45694**, `serve.pid` updated; no ingest worker — the
+  `ingest_worker.pid` file is stale). `/ready` all true.
+  `/system/catalog`: on-disk **34,768 books** (25,542 .pdf + 9,226 .epub),
+  34,433 unprocessed; catalog unchanged 344 / 335 / 335 / 54,270 chunks.
+  `/browse/dir` lists the category tree correctly. New bundle
+  `index-BvF91VSZ.js` — operator should hard-refresh.
+- Full-library launch still HELD on explicit operator approval.
