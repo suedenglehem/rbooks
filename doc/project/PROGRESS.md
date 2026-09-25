@@ -3127,3 +3127,37 @@ end and breaks once N complete lines are present.
 - Gate: ruff clean, mypy 12 pre-existing test_browse errors only,
   pytest full suite green (exit 0).
 - Full-library launch still HELD on explicit operator approval.
+
+### Addendum (2026-09-25 ~02:00) — failed "photography" answer: investigation, no code change
+- Operator asked to investigate the failed answer "find me some facts about
+  photography" (answer `821c236c`, 2026-09-22 21:48:26 CEST, 0 citations,
+  `answer model unavailable: ... http://127.0.0.1:8091/...: timed out`).
+- **Root cause: queue-wait timeout on the serialized vLLM, not a code bug.**
+  The answer request (sent ~19:47:26 UTC, 6.35s after the query at 19:47:20
+  — search itself worked, 12 evidence chunks persisted) sat queued behind a
+  long resume-backfill generation on the vLLM Docker container
+  (`vllm-qwen38-27b-dual-max`, `--max-num-seqs 1` = fully serialized). The
+  M8 backfill (293 resumes) was still draining that evening (finished late
+  night 09-23). Container logs (UTC): `Running: 1 reqs, Waiting: 1 reqs`
+  19:47:30–19:48:20, then `Waiting: 0` at 19:48:30 — our request discarded
+  when the pre-M9 flat 60s httpx read timeout fired at 19:48:26 UTC
+  (httpx closes the connection; vLLM never returned 200). Arithmetic closes
+  to ~20ms: `created_at 19:48:26.336 = search_start + 6.3505s + 60.0s`.
+  `model_ms: 0.0` is structural (incremented only after success), not
+  evidence of a zero-length call. No failover existed yet (M9 pool merged
+  09-23 02:12, hours later); the failure likely motivated M9.
+- The 0 citations are by design: citations are parsed from the model
+  response only; the 12 evidence chunks remain in the failed record.
+- Other answer records checked: "white collar crimes" (09-21 16:53) was a
+  different transient — 200 with malformed body (`content is not a string`),
+  same class as the sieglove.pdf incident, retry-OK. The two "life
+  expectancy" answers are legitimate abstentions, not failures.
+- **Verification:** re-ran the same query via `POST /answer` against the
+  current (M9) pipeline — `answered`, 7 citations (E1/E2/E6/E8/E10/E11/E12
+  from *Digital Photography and Imaging*), retrieval 9.5s, model 16.9s.
+  `/system/status` all green (:8091, ak:8080, embed-8081 HTTP 200).
+- No code change indicated — the system degraded exactly as designed.
+  Remaining structural factor is operator-managed: vLLM `--max-num-seqs 1`
+  queues interactive answers behind long generations (raise it or pause the
+  backfill during interactive use if that matters).
+- Full-library launch still HELD on explicit operator approval.
