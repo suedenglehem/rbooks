@@ -3194,8 +3194,8 @@ end and breaks once N complete lines are present.
   archive/artifact/state/qdrant/model/scratch[/backup]) against the filesystem:
   OK with device, EMPTY, or MISSING. An unmounted drive is surfaced via an
   empty-directory-on-the-root-filesystem heuristic ("(on <dir> — drive
-  unmounted?)") — relevant because the SATA SSD is mounted by
-  `/etc/init.d/pcirestart.sh`, not fstab, so a plain mount check misses it.
+  unmounted?)"). Only configured roots are checked — drives the project does
+  not use (e.g. /mnt/models_sata_ssd) are deliberately out of scope.
   `start` pre-checks the same paths and dies on missing source roots (writable
   roots are auto-created, so only warned).
 - Tests: `test_release_parks_without_consuming_attempt` (jobs) + three worker
