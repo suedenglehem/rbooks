@@ -28,6 +28,7 @@ from .locks import pid_alive
 from .versioning import software_version
 
 __all__ = [
+    "BOOK_BUDGET_PARKED",
     "LEGACY_VERSION",
     "VERSION_ACK_KEY",
     "Claimed",
@@ -37,6 +38,11 @@ __all__ = [
     "backoff_delay",
     "normalize_version",
 ]
+
+# error_detail marker for jobs parked by a bounded run's book budget (see
+# ``Jobs.release``): the drain-exit must not wait on them, because each release
+# re-arms one and waiting would hold a bounded run open forever.
+BOOK_BUDGET_PARKED = "book_budget_parked"
 
 
 class StaleLeaseError(RuntimeError):
@@ -300,6 +306,31 @@ class Jobs:
         )
         if cur.rowcount == 0:
             raise StaleLeaseError(f"job {job.job_id}: stale token on defer")
+
+    def release(self, job: Claimed, delay: float = 30.0, now: float | None = None) -> None:
+        """Fenced put-back for a claimed job that was never actually processed.
+
+        Like :meth:`defer` (returns to ``retryable_failed`` with a retry time),
+        but also restores the attempt consumed by :meth:`claim`, so a bounded
+        run can park out-of-budget jobs without burning their retry budget:
+        after *max_attempts* releases a job is still as fresh as before. The
+        ``error_detail`` marker lets callers tell parked jobs apart from real
+        deferrals (the bounded drain-exit must not wait on them).
+        """
+        ts = time.time() if now is None else now
+        cur = self._db.execute(
+            """
+            UPDATE jobs SET state = 'retryable_failed', next_attempt_at = ?,
+                   error_category = NULL, error_detail = ?,
+                   lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
+                   attempts = MAX(attempts - 1, 0),
+                   updated_at = ?
+            WHERE job_id = ? AND lease_token = ?
+            """,
+            (ts + delay, BOOK_BUDGET_PARKED, ts, job.job_id, job.token),
+        )
+        if cur.rowcount == 0:
+            raise StaleLeaseError(f"job {job.job_id}: stale token on release")
 
     def reclaim_dead_lease_owners(self, now: float | None = None) -> int:
         """Flip ``running`` jobs whose owner process is provably dead back to

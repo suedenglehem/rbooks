@@ -97,7 +97,14 @@ from .indexing import (
     reconcile_publications,
     release_publish_lock,
 )
-from .jobs import VERSION_ACK_KEY, Claimed, Jobs, StaleLeaseError, VersionGateError
+from .jobs import (
+    BOOK_BUDGET_PARKED,
+    VERSION_ACK_KEY,
+    Claimed,
+    Jobs,
+    StaleLeaseError,
+    VersionGateError,
+)
 from .llm import AnswerModel, AnswerModelError, AnswerModelUnavailableError
 from .log import JobLogCapture, get_logger, log_event, prune_job_logs
 from .normalization import normalize_unit, unit_removed_ranges
@@ -127,6 +134,12 @@ __all__ = [
 DEFAULT_LEASE_TTL = 300.0
 # How long a not-ready job (chunk waiting on OCR) waits before being re-claimed.
 _DEFER_DELAY = 15.0
+# Bounded runs (--max-books): out-of-budget extracts are parked this long, and
+# the drain-exit waits out deferral gaps up to this horizon so "N books" really
+# finishes those N books before exiting on its own (a chunk job parked behind an
+# OCR that is still settling must not be left behind).
+BOOK_BUDGET_RELEASE_DELAY = 30.0
+BOUNDED_DRAIN_GRACE = 30.0
 # Job states that still count as "in flight" for prerequisite checks.
 _OPEN_STATES = "('pending', 'running', 'retryable_failed')"
 # Job states that are terminal: the pipeline may move on past them.
@@ -1349,6 +1362,7 @@ def run_worker(
     cfg: Config,
     *,
     once: bool = False,
+    max_books: int | None = None,
     lease_ttl: float = DEFAULT_LEASE_TTL,
     poll_delay: float = 1.0,
     stop_event: Callable[[], bool] | None = None,
@@ -1361,6 +1375,18 @@ def run_worker(
     becomes true. Returns the number of jobs brought to a handled state
     (terminal, or deferred — deferrals keep the *once* drain loop from
     busy-spinning on a not-ready job).
+
+    *max_books* bounds a run to N books (source revisions): at most N distinct
+    extract jobs are STARTED; their full downstream pipeline is drained
+    end-to-end and the worker then exits on its own when nothing in-budget
+    remains claimable — no *once*, no *stop_event* needed. Out-of-budget
+    extracts are parked with :meth:`Jobs.release` (no attempt consumed, marked
+    ``BOOK_BUDGET_PARKED``) so a later run picks them up as fresh; the returned
+    count covers processed jobs only, not parked ones. The drain-exit waits out
+    short deferral gaps up to ``BOUNDED_DRAIN_GRACE`` (a chunk job parked 15 s
+    behind an OCR that is still settling) so "N books" really finishes those N
+    books; budget-parked jobs are excluded from the wait, as are deferrals
+    older than the grace window.
 
     Stopping mid-loop is graceful by construction: at most the in-flight
     jobs' current units are in flight (one in the sequential default, up to
@@ -1420,6 +1446,39 @@ def run_worker(
             STAGE_RESUME: partial(_run_resume, model=model),
         }
         completed = 0
+        # Book budget (--max-books): rev_ids whose extract this run started.
+        # Mutated only on the claiming thread (both branches claim here), so no
+        # lock is needed even though handlers run on a pool below.
+        started_books: set[str] = set()
+
+        def _over_book_budget(job: Claimed) -> bool:
+            return (
+                max_books is not None
+                and job.stage == STAGE_EXTRACT
+                and job.input_id is not None
+                and job.input_id not in started_books
+                and len(started_books) >= max_books
+            )
+
+        def _queue_drained() -> bool:
+            """True when nothing this run should wait for remains claimable.
+
+            A plain *once* pass exits on the first empty claim. A bounded run
+            additionally waits out short deferral gaps (a chunk job parked 15 s
+            behind an OCR that is still settling) up to ``BOUNDED_DRAIN_GRACE``;
+            budget-parked extracts are excluded — each release re-arms one, so
+            waiting on them would hold the run open forever.
+            """
+            row = db.query_one(
+                "SELECT MIN(next_attempt_at) AS t FROM jobs"
+                " WHERE state = 'retryable_failed' AND next_attempt_at IS NOT NULL"
+                " AND COALESCE(error_detail, '') != ?",
+                (BOOK_BUDGET_PARKED,),
+            )
+            if row is None or row["t"] is None:
+                return True
+            return float(row["t"]) > time.time() + BOUNDED_DRAIN_GRACE
+
         concurrency = max(1, int(cfg.worker.max_concurrent_jobs))
         if concurrency == 1:
             while True:
@@ -1427,11 +1486,21 @@ def run_worker(
                     break
                 job = jobs.claim(name, lease_ttl)
                 if job is None:
-                    if once:
+                    # A bounded run decides its own exit (waits out deferral
+                    # gaps); otherwise plain *once* semantics apply.
+                    if (max_books is not None and _queue_drained()) or once:
                         break
                     if poll_delay > 0:
                         _sleep_interruptible(poll_delay, stop_event)
                     continue
+                if _over_book_budget(job):
+                    # Book budget exhausted: park this extract without consuming
+                    # its attempt; keep draining in-budget work behind it. When
+                    # nothing else is claimable the loop exits (see above).
+                    jobs.release(job, delay=BOOK_BUDGET_RELEASE_DELAY)
+                    continue
+                if job.stage == STAGE_EXTRACT and job.input_id is not None:
+                    started_books.add(job.input_id)
                 if _handle_claimed(db, cfg, jobs, handlers, lease_ttl, job):
                     completed += 1
             return completed
@@ -1455,11 +1524,18 @@ def run_worker(
                     continue
                 job = jobs.claim(name, lease_ttl)
                 if job is None:
-                    if once:
+                    # Same exit rule as the sequential path (bounded runs wait
+                    # out deferral gaps; otherwise plain *once* semantics).
+                    if (max_books is not None and _queue_drained()) or once:
                         break
                     if poll_delay > 0:
                         _sleep_interruptible(poll_delay, stop_event)
                     continue
+                if _over_book_budget(job):
+                    jobs.release(job, delay=BOOK_BUDGET_RELEASE_DELAY)
+                    continue
+                if job.stage == STAGE_EXTRACT and job.input_id is not None:
+                    started_books.add(job.input_id)
                 inflight.add(ex.submit(_handle_claimed, db, cfg, jobs, handlers, lease_ttl, job))
             for f in inflight:
                 if f.result():

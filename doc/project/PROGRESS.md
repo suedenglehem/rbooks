@@ -3161,3 +3161,47 @@ end and breaks once N complete lines are present.
   queues interactive answers behind long generations (raise it or pause the
   backfill during interactive use if that matters).
 - Full-library launch still HELD on explicit operator approval.
+
+### Addendum (2026-09-26 ~19:30) — serve.sh `ingest [N]` bounded runs + drive reporting
+- **Diagnosis ("worker stays not working"):** by design, nothing starts the
+  ingest worker after `serve.sh start` — embedded Qdrant (local mode) holds an
+  exclusive flock for a client's lifetime, so serve and worker cannot run at
+  once; the operator had to know that. The status line now says exactly how:
+  "start with './serve.sh ingest [N]' (serve must be stopped)".
+- **New `./serve.sh ingest` / `ingest N`:** launches the worker detached
+  (`nohup`, log -> repo-root `worker.log`), refuses while serve is up or a
+  worker already runs, and reports the pid. `N` (positive int) maps to
+  `library-rag ingest --max-books N`.
+- **`--max-books N` semantics ("Option B"):** at most N distinct NEW books are
+  STARTED (extract jobs, keyed on rev_id); their full downstream pipeline is
+  drained end-to-end and the worker then exits on its own — no `once`, no
+  stop_event. Out-of-budget extracts are parked with a new `Jobs.release()`
+  (`retryable_failed` + `error_detail = BOOK_BUDGET_PARKED`) that RESTORES the
+  claim's attempt increment (plain `defer()` does not), so repeated bounded
+  runs never exhaust `max_attempts`. Fenced like every other write.
+- **Bounded drain-exit:** a plain *once*-style exit on first empty claim would
+  leave in-budget work behind when a job is parked in a short deferral gap
+  (chunk waiting on OCR, `_DEFER_DELAY` 15 s). The bounded run instead waits
+  out gaps up to `BOUNDED_DRAIN_GRACE = 30 s`; budget-parked jobs are EXCLUDED
+  from the wait — each release re-arms one, so waiting on them would hold the
+  run open forever.
+- **Epoch fan-out is part of "finishing a book":** in live stats mode,
+  publishing a genuinely new revision commits a NEW corpus-stats epoch and the
+  fan-out republishes earlier books under it (BM25 space shift). So N=2 on an
+  empty corpus completes 9 jobs, not 8: extract/chunk/embed/publish x2 plus A's
+  convergence republish after B publishes. The test asserts exactly that.
+- **`serve.sh status` now reports every configured root** (source roots +
+  archive/artifact/state/qdrant/model/scratch[/backup]) against the filesystem:
+  OK with device, EMPTY, or MISSING. An unmounted drive is surfaced via an
+  empty-directory-on-the-root-filesystem heuristic ("(on <dir> — drive
+  unmounted?)") — relevant because the SATA SSD is mounted by
+  `/etc/init.d/pcirestart.sh`, not fstab, so a plain mount check misses it.
+  `start` pre-checks the same paths and dies on missing source roots (writable
+  roots are auto-created, so only warned).
+- Tests: `test_release_parks_without_consuming_attempt` (jobs) + three worker
+  tests — bounded run completes 9 jobs with the parked extract at attempts=0;
+  drain-exit waits out a 0.3 s deferral gap and still finishes the book; a
+  budget-parked job alone does not hold a new run open (exits <2 s, 0 done).
+- Gate: ruff clean (`bash -n serve.sh` OK), mypy 12 pre-existing test_browse
+  errors only, pytest full suite green — 599 passed.
+- Full-library launch still HELD on explicit operator approval.

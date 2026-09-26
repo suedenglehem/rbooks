@@ -10,6 +10,7 @@ import fcntl
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -26,9 +27,9 @@ from library_rag.embeddings import (
 )
 from library_rag.identity import make_task_key
 from library_rag.indexing import FakeQdrant, RealQdrantOps
-from library_rag.jobs import Claimed, Jobs
+from library_rag.jobs import BOOK_BUDGET_PARKED, Claimed, Jobs
 from library_rag.log import JobLogCapture, log_event, prune_job_logs
-from library_rag.scan import scan_roots
+from library_rag.scan import STAGE_EXTRACT, scan_roots
 from library_rag.worker import run_worker
 
 
@@ -442,3 +443,84 @@ def test_job_log_flushed_on_deferral(state_db: Database, base_config: Config) ->
     d = _job_logs_dir(base_config)
     if d.exists():
         assert list(d.iterdir()) == []
+
+
+# --- bounded runs (--max-books) -------------------------------------------------
+
+
+def test_max_books_bounded_run(state_db: Database, base_config: Config, src: Path) -> None:
+    # Three books, budget of two: A and B run end-to-end (extract + chunk +
+    # embed + publish each). In live stats mode publishing B commits a NEW
+    # corpus-stats epoch, so the fan-out re-publishes A under it — that
+    # convergence job is part of finishing B. C's extract is parked without
+    # consuming an attempt and must not hold the run open.
+    for name in ("A.pdf", "B.pdf", "C.pdf"):
+        make_pdf(src / name, [f"{name} page of text " * 5])
+    jobs = Jobs(state_db)
+    report = scan_roots(state_db, base_config, jobs)[0]
+    assert report.new_documents == 3
+
+    base_config.embedding.fake = True
+    q = FakeQdrant(base_config.embedding.dimensions)
+    emb = FakeEmbedder(base_config.embedding.dimensions)
+    completed = run_worker(
+        state_db, base_config, poll_delay=0, max_books=2, qdrant=q, embedder=emb
+    )
+
+    assert completed == 9  # 4 + 4 + A's epoch fan-out republish after B publishes
+    assert jobs.counts() == {"succeeded": 9, "retryable_failed": 1}
+
+    parked = state_db.query_one(
+        "SELECT * FROM jobs WHERE error_detail = ?", (BOOK_BUDGET_PARKED,)
+    )
+    assert parked is not None
+    assert parked["stage"] == STAGE_EXTRACT
+    assert int(parked["attempts"]) == 0  # release restored the claim's increment
+
+
+def test_max_books_waits_out_deferral_gap(
+    state_db: Database, base_config: Config, src: Path
+) -> None:
+    # The drain-exit waits out short deferral gaps: an in-budget extract that
+    # is not yet due keeps the run open until it becomes claimable and then
+    # finishes end-to-end. A plain *once*-style exit on the first empty claim
+    # would leave the book unstarted.
+    make_pdf(src / "A.pdf", ["a page of text " * 5])
+    jobs = Jobs(state_db)
+    scan_roots(state_db, base_config, jobs)[0]
+
+    state_db.execute(
+        "UPDATE jobs SET state = 'retryable_failed', next_attempt_at = ? WHERE stage = ?",
+        (time.time() + 0.3, STAGE_EXTRACT),
+    )
+
+    base_config.embedding.fake = True
+    q = FakeQdrant(base_config.embedding.dimensions)
+    emb = FakeEmbedder(base_config.embedding.dimensions)
+    assert run_worker(
+        state_db, base_config, poll_delay=0, max_books=1, qdrant=q, embedder=emb
+    ) == 4
+    assert jobs.counts() == {"succeeded": 4}
+
+
+def test_max_books_ignores_parked_budget_jobs(state_db: Database, base_config: Config) -> None:
+    # A budget-parked extract from a previous bounded run must not hold the new
+    # run open: it is excluded from the drain-exit wait (each release re-arms
+    # one — waiting on them would loop forever). With nothing else in the queue
+    # the run exits immediately, having processed nothing.
+    jobs = Jobs(state_db)
+    jobs.enqueue(
+        make_task_key(STAGE_EXTRACT, "rev-parked", "v1"),
+        STAGE_EXTRACT,
+        input_id="rev-parked",
+        input_version="v1",
+    )
+    state_db.execute(
+        "UPDATE jobs SET state = 'retryable_failed', next_attempt_at = ?, error_detail = ?"
+        " WHERE stage = ?",
+        (time.time() + 30.0, BOOK_BUDGET_PARKED, STAGE_EXTRACT),
+    )
+
+    started = time.monotonic()
+    assert run_worker(state_db, base_config, poll_delay=0, max_books=1) == 0
+    assert time.monotonic() - started < 2.0

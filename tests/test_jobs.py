@@ -16,7 +16,7 @@ import pytest
 from library_rag.artifacts import commit_bytes
 from library_rag.db import Database
 from library_rag.identity import make_task_key
-from library_rag.jobs import Jobs, StaleLeaseError
+from library_rag.jobs import BOOK_BUDGET_PARKED, Jobs, StaleLeaseError
 
 MANIFEST = '{"logical_output": true}'
 
@@ -154,6 +154,43 @@ def test_transient_failure_backs_off_then_retries(
     row = jobs.get(j.job_id)
     assert row is not None
     assert row["state"] == "succeeded"
+
+
+def test_release_parks_without_consuming_attempt(state_db: Database) -> None:
+    # Bounded-run budget gate: a claimed-but-unprocessed job is put back with
+    # its attempt restored (unlike defer, which leaves the claim's increment).
+    jobs = Jobs(state_db)
+    jobs.enqueue(make_task_key("extract", "d", "v"), "extract", input_id="d", input_version="v",
+                 max_attempts=3, now=1000.0)
+
+    j = jobs.claim("w", ttl=10.0, now=1000.0)
+    assert j is not None and j.attempts == 1
+    jobs.release(j, delay=30.0, now=1000.0)
+    row = jobs.get(j.job_id)
+    assert row is not None
+    assert row["state"] == "retryable_failed"
+    assert int(row["attempts"]) == 0  # the claim's increment was restored
+    assert row["error_category"] is None
+    assert row["error_detail"] == BOOK_BUDGET_PARKED
+
+    # Not claimable before the delay elapses; fresh (one attempt) afterwards.
+    assert jobs.claim("w", ttl=10.0, now=1029.0) is None
+    due = jobs.claim("w", ttl=10.0, now=1031.0)
+    assert due is not None and due.attempts == 1
+
+    # Repeated park/claim cycles (bounded re-runs) must not exhaust the budget:
+    for release_at in (1031.0, 1062.0):
+        jobs.release(due, delay=30.0, now=release_at)
+        due = jobs.claim("w", ttl=10.0, now=release_at + 31.0)
+        assert due is not None and due.attempts == 1
+    jobs.release(due, delay=30.0, now=1093.0)
+    row = jobs.get(j.job_id)
+    assert row is not None
+    assert int(row["attempts"]) == 0
+
+    # Fenced like every other write: the old token no longer parks it.
+    with pytest.raises(StaleLeaseError):
+        jobs.release(j, delay=30.0, now=1125.0)
 
 
 def test_attempts_exhausted_become_permanent(state_db: Database, roots: dict[str, Path]) -> None:

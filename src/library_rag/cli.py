@@ -412,6 +412,9 @@ def _scan(args: argparse.Namespace) -> int:
 
 def _ingest(args: argparse.Namespace) -> int:
     setup_logging(args.log_level, args.log_format)
+    if args.max_books is not None and args.max_books < 1:
+        print("error: --max-books must be >= 1", file=sys.stderr)
+        return EXIT_ERROR
     cfg = _require_config(args)
     db = _open_state(cfg)
     stop = False
@@ -461,7 +464,12 @@ def _ingest(args: argparse.Namespace) -> int:
             signal.signal(signal.SIGINT, _graceful_stop)
         try:
             completed = run_worker(
-                db, cfg, once=args.once, lease_ttl=args.lease_ttl, stop_event=lambda: stop
+                db,
+                cfg,
+                once=args.once,
+                max_books=args.max_books,
+                lease_ttl=args.lease_ttl,
+                stop_event=lambda: stop,
             )
         finally:
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
@@ -1533,6 +1541,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--once",
         action="store_true",
         help="drain the queue and exit (default: run until SIGTERM/SIGINT)",
+    )
+    ingest.add_argument(
+        "--max-books",
+        type=int,
+        default=None,
+        metavar="N",
+        help="bounded run: start extraction for at most N new books (source "
+        "revisions), complete their full pipeline end-to-end, then exit on its "
+        "own; out-of-budget books are parked without consuming an attempt and "
+        "picked up by a later run",
     )
     ingest.add_argument(
         "--lease-ttl",
