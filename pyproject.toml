@@ -2,7 +2,7 @@
 name = "library-rag"
 version = "0.0.1"
 description = "Local-first RAG research application for a large personal book library (PDF + EPUB)."
-readme = "doc/README.md"
+readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Proprietary" }
 authors = [{ name = "andrei" }]

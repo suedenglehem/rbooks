@@ -12,19 +12,19 @@ paths:
   source_roots:
     - /mnt/models_sas_ssd/books
 
-  # Writable roots. archive_root + artifact_root on the big disk; state_root and
-  # qdrant_root on SSD; scratch_root on SSD (hard-capped at 50 GB by default).
+  # Writable roots, all on the big disk; scratch_root is hard-capped at
+  # 50 GB by default.
   archive_root: /mnt/models_sas_ssd/library-rag/archive
   artifact_root: /mnt/models_sas_ssd/library-rag/artifacts
-  state_root: /mnt/models_sata_ssd/library-rag/state
-  qdrant_root: /mnt/models_sata_ssd/library-rag/qdrant
+  state_root: /mnt/models_sas_ssd/library-rag/state
+  qdrant_root: /mnt/models_sas_ssd/library-rag/qdrant
   model_root: /mnt/models_sas_ssd/library-rag/models
-  scratch_root: /mnt/models_sata_ssd/library-rag/scratch
+  scratch_root: /mnt/models_sas_ssd/library-rag/scratch
 
 services:
   # Either a remote Qdrant server (host/port) or a LOCAL embedded instance.
   # qdrant_path is preferred when no server is installed (M6 pilot runs local).
-  qdrant_path: /mnt/models_sata_ssd/library-rag/qdrant
+  qdrant_path: /mnt/models_sas_ssd/library-rag/qdrant
   qdrant_host: 127.0.0.1
   qdrant_port: 6333
   # llama.cpp answer-model server (OpenAI-compatible /v1/chat/completions).

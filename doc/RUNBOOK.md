@@ -16,10 +16,10 @@ All paths from the live `config.yaml` (gitignored):
 | Source mount sentinel    | `/mnt/models_sas_ssd/books/.library-rag-sentinel` |
 | Source archive (SHA-256 content store) | `/mnt/models_sas_ssd/library-rag/archive` |
 | Artifacts (vectors, OCR images, logs)  | `/mnt/models_sas_ssd/library-rag/artifacts` |
-| State (SQLite `library.db`, job logs)  | `/mnt/models_sata_ssd/library-rag/state` |
-| Qdrant (local embedded)  | `/mnt/models_sata_ssd/library-rag/qdrant` |
+| State (SQLite `library.db`, job logs)  | `/mnt/models_sas_ssd/library-rag/state` |
+| Qdrant (local embedded)  | `/mnt/models_sas_ssd/library-rag/qdrant` |
 | Models                   | `/mnt/models_sas_ssd/library-rag/models`    |
-| Scratch (hard-capped 50 GB) | `/mnt/models_sata_ssd/library-rag/scratch` |
+| Scratch (hard-capped 50 GB) | `/mnt/models_sas_ssd/library-rag/scratch` |
 | Backups (M7)             | `/mnt/models_sas_ssd/library-rag/backups`   |
 
 Services: embedding fleet = 8 llama-server instances (bge-m3 Q8_0,
@@ -46,7 +46,7 @@ for p in 8081 8082 8083 8084 8085 8086 8087 8088 8091; do
   printf "%s %s\n" "$p" \
     "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:$p/health)"
 done
-df -h /mnt/models_sas_ssd /mnt/models_sata_ssd          # capacity
+df -h /mnt/models_sas_ssd                               # capacity
 ```
 
 Step 1 — discover, register, enqueue (fast check makes a re-scan of
@@ -59,13 +59,13 @@ uv run library-rag scan --config config.yaml
 Step 2 — start the worker detached:
 
 ```bash
-mkdir -p /mnt/models_sata_ssd/library-rag/scratch
+mkdir -p /mnt/models_sas_ssd/library-rag/scratch
 nohup uv run library-rag ingest --config config.yaml \
-  >> /mnt/models_sata_ssd/library-rag/scratch/ingest_run.log 2>&1 &
+  >> /mnt/models_sas_ssd/library-rag/scratch/ingest_run.log 2>&1 &
 ```
 
 The worker writes its own pidfile
-(`/mnt/models_sata_ssd/library-rag/scratch/ingest_worker.pid`) on start and
+(`/mnt/models_sas_ssd/library-rag/scratch/ingest_worker.pid`) on start and
 removes it on clean exit — do not create it by hand (a pidfile naming the
 `nohup`/`uv` wrapper predates slice 10; `stop` still resolves through it, but
 the worker's own file is authoritative).
@@ -74,7 +74,7 @@ Step 3 — verify it took:
 
 ```bash
 uv run library-rag status --config config.yaml          # jobs: pending > 0, then running appears
-tail -20 /mnt/models_sata_ssd/library-rag/scratch/ingest_run.log
+tail -20 /mnt/models_sas_ssd/library-rag/scratch/ingest_run.log
 ```
 
 The worker runs an automatic reconcile pass on start (chunks, index,
@@ -111,7 +111,7 @@ still reported; point counts are live after the worker stops.
 
 Logs: the short per-job line goes to `ingest_run.log`. In addition, while
 a job runs, a verbose log is captured to
-`/mnt/models_sata_ssd/library-rag/state/job_logs/<job_id>.attempt<N>.log`
+`/mnt/models_sas_ssd/library-rag/state/job_logs/<job_id>.attempt<N>.log`
 and **kept only if the job failed** (flushed on success, deferral, or a
 lost lease) — so a failure always has its debug trail on disk.
 
@@ -170,7 +170,7 @@ the Qdrant local lock is held.
   `uv run library-rag retry --config config.yaml`.
 - **Stuck worker, or skipping the 300 s lease TTL:** start with
   `nohup uv run library-rag ingest --force --config config.yaml
-  >> /mnt/models_sata_ssd/library-rag/scratch/ingest_run.log 2>&1 &`
+  >> /mnt/models_sas_ssd/library-rag/scratch/ingest_run.log 2>&1 &`
   instead of the plain step-2 command. `--force` runs before the version
   gate and normal startup work, and does three things: kills a *stuck
   ingest worker* that still holds the Qdrant local lock (refusing — not
@@ -215,7 +215,7 @@ so existing books are not recomputed), `retry`, and `discover`
 (the same scan repeated on an interval as a *second* detached
 process, so new books land without re-running `scan` by hand —
 `nohup uv run library-rag discover --config config.yaml
->> /mnt/models_sata_ssd/library-rag/scratch/discover.log 2>&1 &` —
+>> /mnt/models_sas_ssd/library-rag/scratch/discover.log 2>&1 &` —
 SIGTERM stops it after the in-flight pass, like the worker; it
 never deletes catalog content, a vanished file is only reported),
 and `migrate` (generation-migration planner: which runs need

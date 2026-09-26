@@ -3205,3 +3205,27 @@ end and breaks once N complete lines are present.
 - Gate: ruff clean (`bash -n serve.sh` OK), mypy 12 pre-existing test_browse
   errors only, pytest full suite green — 599 passed.
 - Full-library launch still HELD on explicit operator approval.
+
+### Addendum (2026-09-26 ~20:30) — documentation reorganization + SATA drive dropped
+- **Moves:** `doc/README.md` → repo-root `README.md`; `doc/project/README.md`
+  → `doc/README.md`; `doc/project/RUNBOOK.md` → `doc/RUNBOOK.md`.
+  `doc/project/` now holds only the PRD, the pilot report and this log.
+  `pyproject.toml` readme pointer updated to root `README.md`.
+- **Root README refreshed:** doc-location table matches the new layout; the
+  serve.sh block documents `ingest [N]`; Operations summarizes what
+  `doc/RUNBOOK.md` contains (pre-flight, scan→launch sequence, monitoring,
+  three-level stop, crash recovery + version gate, triage); the storage-layout
+  table now matches the LIVE sandbox config exactly (all roots on
+  `/mnt/models_sas_ssd`, state/qdrant/scratch under `pilot-sandbox/`; no
+  backup_root configured in the sandbox — backups are a full-run concern per
+  the runbook).
+- **SATA drive dropped everywhere current** (operator decision: the project
+  uses `/mnt/models_sas_ssd` only; the SATA disk is not even detected by
+  blkid, per pcirestart.log): `config.example.yaml` state/qdrant/scratch +
+  qdrant_path → SAS; RUNBOOK layout table, log/pidfile/job_logs paths and the
+  pre-flight `df -h` → SAS. Historical entries in this log and the APPROVED
+  M6_PILOT_REPORT still name models_sata_ssd — they record what actually ran
+  at the time and were left untouched.
+- The M0-era README (now `doc/README.md`) got a frozen-artifact header note
+  pointing to the root README; its CLAUDE_PRD/PROGRESS references are now
+  `project/-`prefixed.
