@@ -383,10 +383,13 @@ def _resumes(args: argparse.Namespace) -> int:
 # --- M2 pipeline commands ----------------------------------------------------
 def _scan(args: argparse.Namespace) -> int:
     setup_logging(args.log_level, args.log_format)
+    if args.limit is not None and args.limit < 1:
+        print("error: --limit must be >= 1", file=sys.stderr)
+        return EXIT_ERROR
     cfg = _require_config(args)
     db = _open_state(cfg)
     try:
-        reports = scan_roots(db, cfg, Jobs(db))
+        reports = scan_roots(db, cfg, Jobs(db), max_enqueue=args.limit)
     finally:
         db.close()
     if args.json:
@@ -399,7 +402,7 @@ def _scan(args: argparse.Namespace) -> int:
             print(
                 f"{r.root}: discovered={r.discovered} unchanged={r.unchanged} "
                 f"new_documents={r.new_documents} new_revisions={r.new_revisions} "
-                f"aliases={r.aliases} jobs={r.jobs_enqueued}"
+                f"aliases={r.aliases} jobs={r.jobs_enqueued} deferred={r.deferred}"
             )
             if r.invalid:
                 print(f"  invalid (content mismatch): {', '.join(r.invalid)}")
@@ -1531,6 +1534,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     scan.add_argument("--config", help="path to config YAML")
     scan.add_argument("--json", action="store_true", help="emit the scan reports as JSON")
+    scan.add_argument(
+        "--limit",
+        type=int,
+        metavar="N",
+        help="register + enqueue at most N new books' extract jobs across all roots; "
+        "new books past the limit are deferred (left unregistered, so the next "
+        "scan picks them up)",
+    )
     scan.set_defaults(_func=_scan)
 
     ingest = sub.add_parser(

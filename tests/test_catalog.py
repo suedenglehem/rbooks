@@ -15,6 +15,7 @@ from library_rag.catalog import (
     get_active_revision,
     list_aliases,
     register_source,
+    registration_status,
     source_file_count,
 )
 from library_rag.db import Database
@@ -37,6 +38,23 @@ def test_new_document(state_db: Database) -> None:
     assert reg.rev_id == revision_id(reg.doc_id, H1)
     assert len(_revs(state_db, reg.doc_id)) == 1
     assert source_file_count(state_db) == 1
+
+
+def test_registration_status_mirrors_register_source(state_db: Database) -> None:
+    """The read-only peek agrees with register_source for all four statuses
+    and mutates nothing."""
+    assert registration_status(state_db, "/books/A.pdf", H1) is RegistrationStatus.NEW_DOCUMENT
+    assert source_file_count(state_db) == 0  # the peek wrote nothing
+
+    reg = register_source(state_db, "/books/A.pdf", H1, 100, Format.PDF)
+    assert reg.status is RegistrationStatus.NEW_DOCUMENT
+    assert registration_status(state_db, "/books/A.pdf", H1) is RegistrationStatus.UNCHANGED
+
+    assert registration_status(state_db, "/books/B.pdf", H1) is RegistrationStatus.ALIAS
+    assert registration_status(state_db, "/books/C.pdf", H2) is RegistrationStatus.NEW_DOCUMENT
+    reg2 = register_source(state_db, "/books/C.pdf", H2, 100, Format.PDF)
+    assert reg2.status is RegistrationStatus.NEW_DOCUMENT
+    assert registration_status(state_db, "/books/C.pdf", "33" * 32) is RegistrationStatus.NEW_REVISION
 
 
 def test_unchanged_is_idempotent(state_db: Database) -> None:

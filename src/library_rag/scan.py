@@ -16,6 +16,12 @@ The scan is a *report*, not a mutation of catalog state it cannot stand behind:
 
 New and changed revisions get an ``extract`` job enqueued (idempotent on the
 task key, so a crashed re-scan cannot double-enqueue).
+
+An enqueue budget (``scan_roots(..., max_enqueue=N)``) caps how many of those
+jobs one run registers and enqueues: new documents/revisions past the budget
+are reported as ``deferred`` — NOT archived, NOT registered, and their
+``scan_state`` row untouched — so the next scan discovers them as new again
+and they stay enqueuable. Aliases (no job needed) are never deferred.
 """
 
 from __future__ import annotations
@@ -28,7 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .archive import ingest_source, stream_hash
-from .catalog import Format, RegistrationStatus, register_source
+from .catalog import Format, RegistrationStatus, register_source, registration_status
 from .config import Config
 from .db import Database
 from .identity import make_task_key, normalize_path
@@ -72,6 +78,27 @@ class ScanReport:
     missing: list[str] = field(default_factory=list)
     changed_during_scan: list[str] = field(default_factory=list)
     jobs_enqueued: int = 0
+    # New books past the run's enqueue budget: discovered but left
+    # unregistered (no archive, no scan_state), so the next scan enqueuses them.
+    deferred: int = 0
+
+
+@dataclass
+class _EnqueueBudget:
+    """How many new books' extract jobs a run may still register + enqueue.
+
+    One instance is shared by every root of a run, so ``max_enqueue`` bounds
+    the run, not a single root. ``take()`` is the only mutator and is called
+    only from the single scan thread.
+    """
+
+    remaining: int
+
+    def take(self) -> bool:
+        if self.remaining <= 0:
+            return False
+        self.remaining -= 1
+        return True
 
 
 def iter_candidate_paths(
@@ -148,7 +175,14 @@ def _upsert_scan_state(
         )
 
 
-def _process_file(db: Database, cfg: Config, jobs: Jobs | None, path: Path, report: ScanReport) -> None:
+def _process_file(
+    db: Database,
+    cfg: Config,
+    jobs: Jobs | None,
+    path: Path,
+    report: ScanReport,
+    budget: _EnqueueBudget | None = None,
+) -> None:
     report.discovered += 1
     norm = normalize_path(path)
     try:
@@ -180,6 +214,19 @@ def _process_file(db: Database, cfg: Config, jobs: Jobs | None, path: Path, repo
     if fmt is None:
         report.invalid.append(norm)
         return
+    if budget is not None and jobs is not None:
+        status = registration_status(db, norm, sha)
+        if (
+            status in (RegistrationStatus.NEW_DOCUMENT, RegistrationStatus.NEW_REVISION)
+            and not budget.take()
+        ):
+            # Out of budget: defer WITHOUT archiving, registering, or touching
+            # scan_state — the fast check will not pass next scan, so this
+            # file is discovered as new again and stays enqueuable.
+            # (register_source would poison it: a registered revision is
+            # UNCHANGED on the next pass and never enqueued.)
+            report.deferred += 1
+            return
     ingest = ingest_source(cfg.paths.archive_root, path, expect_sha=sha)
     reg = register_source(db, norm, ingest.sha256, ingest.size_bytes, fmt)
     _upsert_scan_state(db, norm, st_after.st_size, st_after.st_mtime, ingest.sha256, fmt, reg.rev_id)
@@ -199,8 +246,18 @@ def _process_file(db: Database, cfg: Config, jobs: Jobs | None, path: Path, repo
         report.jobs_enqueued += 1
 
 
-def scan_root(db: Database, cfg: Config, root: Path, jobs: Jobs | None = None) -> ScanReport:
-    """Scan one source root; return its report. Never deletes catalog content."""
+def scan_root(
+    db: Database,
+    cfg: Config,
+    root: Path,
+    jobs: Jobs | None = None,
+    budget: _EnqueueBudget | None = None,
+) -> ScanReport:
+    """Scan one source root; return its report. Never deletes catalog content.
+
+    *budget* is the run-shared enqueue budget; ``scan_roots`` builds it from
+    ``max_enqueue`` so the cap spans every root of the run.
+    """
     report = ScanReport(root=normalize_path(root))
     sentinel = cfg.mount_sentinels.get(str(root))
     if sentinel is not None and not Path(sentinel).exists():
@@ -216,7 +273,7 @@ def scan_root(db: Database, cfg: Config, root: Path, jobs: Jobs | None = None) -
     ):
         norm = normalize_path(p)
         visible.add(norm)
-        _process_file(db, cfg, jobs, p, report)
+        _process_file(db, cfg, jobs, p, report, budget)
 
     # Known aliases under this root that are no longer visible: report only.
     prefix = normalize_path(root) + "/"
@@ -226,9 +283,16 @@ def scan_root(db: Database, cfg: Config, root: Path, jobs: Jobs | None = None) -
     return report
 
 
-def scan_roots(db: Database, cfg: Config, jobs: Jobs | None = None) -> list[ScanReport]:
-    """Scan every configured source root; one report each (JSON-friendly)."""
-    return [scan_root(db, cfg, root, jobs) for root in cfg.paths.source_roots]
+def scan_roots(
+    db: Database, cfg: Config, jobs: Jobs | None = None, max_enqueue: int | None = None
+) -> list[ScanReport]:
+    """Scan every configured source root; one report each (JSON-friendly).
+
+    *max_enqueue* caps the run at N new books' extract jobs across all roots;
+    new books past the cap are deferred (see :class:`ScanReport.deferred`).
+    """
+    budget = _EnqueueBudget(max_enqueue) if max_enqueue is not None else None
+    return [scan_root(db, cfg, root, jobs, budget) for root in cfg.paths.source_roots]
 
 
 def process_paths(db: Database, cfg: Config, jobs: Jobs | None, paths: Iterable[Path]) -> ScanReport:

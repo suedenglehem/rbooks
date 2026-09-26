@@ -39,6 +39,7 @@ __all__ = [
     "get_document",
     "list_aliases",
     "register_source",
+    "registration_status",
     "source_file_count",
 ]
 
@@ -167,6 +168,32 @@ def register_source(
         rev_id = _create_revision(db, doc_id, sha256, size_bytes, fmt, norm, ts)
         _upsert_alias(db, norm, doc_id, rev_id, ts)
         return Registration(doc_id, rev_id, RegistrationStatus.NEW_DOCUMENT)
+
+
+def registration_status(db: Database, path: str, sha256: str) -> RegistrationStatus:
+    """Resolve *path* holding *sha256* against the catalog without writing.
+
+    Read-only mirror of :func:`register_source`'s resolution rules: the same
+    content under a known path is ``UNCHANGED``, changed content under a known
+    path is ``NEW_REVISION``, known content under a new path is ``ALIAS``, and
+    unseen content is ``NEW_DOCUMENT``. Callers that must not mutate the
+    catalog use this to ask "would registering need a job?" — e.g. a scan with
+    an enqueue budget deferring what it will not register.
+    """
+    norm = normalize_path(path)
+    alias = db.query_one("SELECT rev_id FROM path_aliases WHERE path = ?", (norm,))
+    if alias is not None:
+        active = db.query_one(
+            "SELECT sha256 FROM source_revisions WHERE rev_id = ?", (alias["rev_id"],)
+        )
+        active_sha = active["sha256"] if active is not None else None
+        return (
+            RegistrationStatus.UNCHANGED
+            if active_sha == sha256
+            else RegistrationStatus.NEW_REVISION
+        )
+    known = db.query_one("SELECT 1 FROM source_revisions WHERE sha256 = ?", (sha256,))
+    return RegistrationStatus.ALIAS if known is not None else RegistrationStatus.NEW_DOCUMENT
 
 
 def get_document(db: Database, doc_id: str) -> dict[str, Any] | None:

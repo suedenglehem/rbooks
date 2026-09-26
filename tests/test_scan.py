@@ -16,6 +16,7 @@ import pytest
 from fixtures import make_pdf
 from library_rag.archive import stream_hash
 from library_rag.catalog import get_active_revision
+from library_rag.cli import EXIT_ERROR, EXIT_OK, main
 from library_rag.config import Config, Paths
 from library_rag.db import Database
 from library_rag.identity import normalize_path
@@ -211,6 +212,108 @@ def test_mount_unavailable_sentinel_and_missing_root(
     )
     cfg3 = Config(paths=paths, services=base_config.services)
     assert scan_roots(state_db, cfg3, jobs)[0].mount_unavailable is True
+
+
+def test_scan_limit_defers_beyond_budget(
+    state_db: Database, base_config: Config, src: Path
+) -> None:
+    """max_enqueue caps the run at N new books: the rest are deferred — not
+    archived, not registered, no scan_state row — and the next scan discovers
+    them as new again and enqueues them."""
+    for name in ("A.pdf", "B.pdf", "C.pdf"):
+        make_pdf(src / name, [f"page of {name} " * 5])
+    jobs = Jobs(state_db)
+
+    report = scan_roots(state_db, base_config, jobs, max_enqueue=2)[0]
+
+    assert report.new_documents == 2
+    assert report.jobs_enqueued == 2
+    assert report.deferred == 1
+    assert jobs.counts() == {"pending": 2}
+    # Only the two enqueued books were registered / archived / fast-checked.
+    assert _one(state_db, "SELECT COUNT(*) AS n FROM documents")["n"] == 2
+    assert _one(state_db, "SELECT COUNT(*) AS n FROM source_revisions")["n"] == 2
+    assert _one(state_db, "SELECT COUNT(*) AS n FROM path_aliases")["n"] == 2
+    assert _one(state_db, "SELECT COUNT(*) AS n FROM scan_state")["n"] == 2
+
+    # The next scan (no budget) picks the deferred book up as new.
+    report2 = _scan(state_db, base_config, jobs)
+    assert report2.new_documents == 1
+    assert report2.deferred == 0
+    assert jobs.counts() == {"pending": 3}
+    assert _one(state_db, "SELECT COUNT(*) AS n FROM scan_state")["n"] == 3
+
+
+def test_scan_limit_counts_new_revisions(
+    state_db: Database, base_config: Config, src: Path
+) -> None:
+    """A budget slot is consumed by a new revision exactly like a new
+    document."""
+    a = src / "A.pdf"
+    make_pdf(a, ["first edition page"])
+    jobs = Jobs(state_db)
+    assert _scan(state_db, base_config, jobs).new_documents == 1
+
+    make_pdf(a, ["second edition page one", "second edition page two"])
+    make_pdf(src / "B.pdf", ["another book page"])
+    report = scan_roots(state_db, base_config, jobs, max_enqueue=1)[0]
+
+    assert report.jobs_enqueued == 1
+    assert report.deferred == 1
+    assert report.new_documents + report.new_revisions == 1
+    assert jobs.counts() == {"pending": 2}  # the original job plus one more
+
+
+def test_scan_limit_does_not_defer_aliases(
+    state_db: Database, base_config: Config, src: Path
+) -> None:
+    """An alias needs no job, so it is registered even when the budget is
+    exhausted (a budget of 0 defers everything that would enqueue)."""
+    a = src / "A.pdf"
+    make_pdf(a, ["a page of text " * 5])
+    jobs = Jobs(state_db)
+    assert _scan(state_db, base_config, jobs).new_documents == 1
+
+    data = a.read_bytes()
+    a.unlink()
+    (src / "B.pdf").write_bytes(data)
+    report = scan_roots(state_db, base_config, jobs, max_enqueue=0)[0]
+
+    assert report.aliases == 1
+    assert report.deferred == 0
+    assert report.jobs_enqueued == 0
+    # The alias row was written despite the exhausted budget.
+    assert _one(state_db, "SELECT COUNT(*) AS n FROM path_aliases")["n"] == 2
+
+
+def test_cli_scan_limit_validation(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    rc = main(["scan", "--config", "/nonexistent/config.yaml", "--limit", "0"])
+
+    assert rc == EXIT_ERROR
+    assert "--limit must be >= 1" in capsys.readouterr().err
+
+
+def test_cli_scan_limit_wiring(
+    state_db: Database,
+    base_config: Config,
+    src: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`library-rag scan --limit N` wires the cap through to scan_roots and
+    reports the deferred count."""
+    for name in ("A.pdf", "B.pdf"):
+        make_pdf(src / name, [f"page of {name} " * 5])
+    monkeypatch.setattr("library_rag.cli.load_config", lambda _path=None: base_config)
+
+    rc = main(["scan", "--config", "ignored", "--limit", "1"])
+
+    assert rc == EXIT_OK
+    out = capsys.readouterr().out
+    assert "jobs=1" in out
+    assert "deferred=1" in out
 
 
 def test_changed_during_scan_deferred(
