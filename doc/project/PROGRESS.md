@@ -3229,3 +3229,14 @@ end and breaks once N complete lines are present.
 - The M0-era README (now `doc/README.md`) got a frozen-artifact header note
   pointing to the root README; its CLAUDE_PRD/PROGRESS references are now
   `project/-`prefixed.
+- **Open items flagged to operator (unresolved):**
+  - Historical `models_sata_ssd` mentions remain in M6_PILOT_REPORT.md and this
+    log's dated entries — left deliberately; the operator may still want them
+    scrubbed ("at all").
+  - RUNBOOK + config.example now point state/qdrant/scratch at
+    `/mnt/models_sas_ssd/library-rag/{state,qdrant,scratch}` (non-pilot-sandbox);
+    confirm that is where the full-library launch will live, or switch to the
+    pilot-sandbox roots.
+  - RUNBOOK §8 still assumes `stats_epoch: frozen`; the sandbox runs `live`.
+- **Next unfinished task:** none in flight — awaiting operator answers on the
+  three open items above; if any lands, re-run the quality gate and commit.
