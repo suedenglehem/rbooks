@@ -230,6 +230,23 @@ export interface BrowseProcessResponse {
   total: number; // unique files accounted for (processed or reported missing)
 }
 
+// GET /manual-selections: the manual-selection ledger (M10) — the final set
+// of books the operator ticked in Browse and submitted, newest first, each
+// joined with its live pipeline status (see manual_selection.py).
+export interface ManualSelection {
+  path: string; // normalized absolute path — the ledger's identity
+  title: string; // file-name stem of the registered revision
+  outcome: BrowseProcessOutcome; // the submission's per-file outcome
+  submitted_at: number; // last submission, epoch seconds
+  rev_id: string | null; // null = the file never registered (missing/invalid/…)
+  doc_id: string | null;
+  format: string | null;
+  size_bytes: number | null;
+  status: "queued" | "processing" | "published" | "failed" | "parked" | "superseded" | "unknown";
+  stage: string | null; // the running/failed stage, when known
+  error: string | null; // failure detail, when failed
+}
+
 // --- system diagnostics (Rag page Diagnostics block) -------------------------
 
 export interface SystemCatalog {
@@ -462,6 +479,8 @@ export const api = {
       post("/browse/process", { paths }),
     ),
   ingestStatus: () => request<IngestStatus>("/ingest/status"),
+  manualSelections: () =>
+    request<{ selections: ManualSelection[] }>("/manual-selections"),
   scan: () => request<{ reports: ScanReport[] }>("/scan", post("/scan", {})),
   ingestPause: (reason: string) =>
     request<{ paused: boolean }>("/ingest/pause", post("/ingest/pause", { reason })),

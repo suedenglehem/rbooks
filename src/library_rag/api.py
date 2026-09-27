@@ -32,6 +32,7 @@ substitute the fakes; ``serve`` wires the real implementations.
 
 from __future__ import annotations
 
+import logging
 import os
 import signal
 from collections.abc import Awaitable, Callable
@@ -51,9 +52,11 @@ from .browse import BrowseError, BrowseNotFound, list_browse_dir, resolve_browse
 from .config import Config
 from .db import Database
 from .embeddings import Embedder
+from .identity import normalize_path
 from .indexing import QdrantOps
 from .jobs import Jobs
 from .llm import AnswerModel
+from .manual_selection import manual_selection_status, record_submission
 from .reader import active_run
 from .reader import create_app as create_reader_app
 from .resumes import get_resume, search_resumes
@@ -61,6 +64,8 @@ from .retrieval import IndexUnavailableError, Passage, search
 from .scan import ProcessStatus, process_explicit_paths, scan_roots
 
 __all__ = ["create_app", "find_web_dist"]
+
+logger = logging.getLogger(__name__)
 
 # Content-Security-Policy for the bundled, fully-local UI.
 _CSP = (
@@ -410,6 +415,22 @@ def create_app(
             for s in outcomes.values()
             if s in (ProcessStatus.NEW_DOCUMENT, ProcessStatus.NEW_REVISION)
         )
+        # Manual-selection ledger (M10): the final set of operator-submitted
+        # books, so the Rag page can show it with live pipeline status. A
+        # ledger hiccup must never undo the processing that just happened.
+        try:
+            record_submission(
+                db,
+                {
+                    **outcomes,
+                    **{
+                        normalize_path(abs_p): str(ProcessStatus.MISSING)
+                        for abs_p in missing_by_abs
+                    },
+                },
+            )
+        except Exception:  # the ledger is advisory, the processing is done
+            logger.exception("manual selection: could not record submission")
         return {
             "results": results,
             "enqueued": enqueued,
@@ -436,6 +457,17 @@ def create_app(
     @app.get("/ingest/status")
     def ingest_status() -> dict[str, Any]:
         return _status_data()
+
+    @app.get("/manual-selections")
+    def manual_selections(limit: int = Query(default=200, ge=1, le=1000)) -> dict[str, Any]:
+        """The books the operator submitted from the Browse view, newest
+        first, each joined with its live pipeline status (Rag page).
+
+        Deliberately not gated on ``browse_available``: the ledger is state
+        in the database, and a pulled browse mount must not hide books that
+        were already selected and processed.
+        """
+        return {"selections": manual_selection_status(db, limit=limit)}
 
     @app.post("/scan")
     def do_scan() -> dict[str, Any]:

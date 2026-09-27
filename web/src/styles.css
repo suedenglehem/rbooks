@@ -297,6 +297,15 @@ main > section[hidden] { display: none; }
 .pill-abstained { color: var(--warn); border-color: var(--warn); }
 .pill-failed { color: var(--err); border-color: var(--err); }
 
+/* Manual-selection ledger (M10): pipeline status pills. queued/processing
+   share the accent; parked/superseded are "on hold" warnings; unknown stays
+   the base .pill (muted); failed reuses .pill-failed. */
+.pill-published { color: var(--ok); border-color: var(--ok); }
+.pill-processing,
+.pill-queued { color: var(--accent); border-color: var(--accent); }
+.pill-parked,
+.pill-superseded { color: var(--warn); border-color: var(--warn); }
+
 .answer-card {
   border: 1px solid var(--line);
   border-radius: 10px;
@@ -495,6 +504,43 @@ table.jobs td {
 }
 
 table.jobs td.num { text-align: right; font-variant-numeric: tabular-nums; }
+
+table.manual-sel {
+  border-collapse: collapse;
+  width: 100%;
+  max-width: 860px;
+  font-size: 13px;
+}
+
+table.manual-sel th {
+  text-align: left;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  border-bottom: 1px solid var(--line);
+  padding: 4px 8px;
+}
+
+table.manual-sel td {
+  border-bottom: 1px solid var(--line);
+  padding: 4px 8px;
+  vertical-align: middle;
+}
+
+table.manual-sel tr.clickable { cursor: pointer; }
+table.manual-sel tr.clickable:hover td { background: var(--pane); }
+
+table.manual-sel td.mnsel-book { font-weight: 600; }
+
+table.manual-sel td.mnsel-path {
+  max-width: 340px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 12px;
+}
 
 .scan-report {
   background: var(--pane);

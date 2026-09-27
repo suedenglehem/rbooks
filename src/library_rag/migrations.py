@@ -10,9 +10,11 @@ M2 adds the pipeline slice it needs: ``scan_state`` (scan fast-check cache),
 ``embedding_batches``, ``index_generations``, ``sparse_corpus_stats`` and
 ``publications``; M5 adds ``answers`` (cited answers with frozen evidence
 manifests); M8 adds ``book_resumes`` (extended per-book summaries) with a
-standalone ``resumes_fts`` FTS5 table for ranked keyword search. The point of
-the runner is that the schema *evolves*, so each milestone stays a minimal,
-independently-testable slice.
+standalone ``resumes_fts`` FTS5 table for ranked keyword search; M10 adds
+``manual_selections``, the ledger of the books an operator ticked in the
+Browse view for immediate processing. The point of the runner is that the
+schema *evolves*, so each milestone stays a minimal, independently-testable
+slice.
 """
 
 from __future__ import annotations
@@ -365,6 +367,28 @@ _MIGRATION_0008: tuple[str, ...] = (
 )
 
 
+# M10: the manual-selection ledger. One row per path the operator ticked in
+# the Browse view and submitted for immediate processing; the normalized
+# absolute path is the identity and a resubmission refreshes the row, so the
+# table is the *final* set of manually selected books, not a submission log.
+# ``rev_id``/``doc_id`` link the file to what it registered (NULL for files
+# that never registered — missing/invalid/deferred) so the Rag page can join
+# live pipeline status onto each one.
+_MIGRATION_0009: tuple[str, ...] = (
+    """
+    CREATE TABLE manual_selections (
+        path         TEXT PRIMARY KEY,
+        outcome      TEXT NOT NULL,
+        sha256       TEXT,
+        rev_id       TEXT,
+        doc_id       TEXT,
+        submitted_at REAL NOT NULL
+    )
+    """,
+    "CREATE INDEX idx_manual_sel_rev ON manual_selections(rev_id)",
+)
+
+
 MIGRATIONS: list[Migration] = [
     Migration(1, "catalog_and_jobs", _MIGRATION_0001),
     Migration(2, "pipeline_tables", _MIGRATION_0002),
@@ -374,6 +398,7 @@ MIGRATIONS: list[Migration] = [
     Migration(6, "publications_superseded_at", _MIGRATION_0006),
     Migration(7, "jobs_created_by_version", _MIGRATION_0007),
     Migration(8, "book_resumes", _MIGRATION_0008),
+    Migration(9, "manual_selections", _MIGRATION_0009),
 ]
 
 

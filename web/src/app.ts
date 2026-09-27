@@ -26,6 +26,7 @@ import type {
   EvidenceLocation,
   GpuStatus,
   JobLogEntry,
+  ManualSelection,
   Passage,
   PassageSpan,
   ResumeSummary,
@@ -117,6 +118,9 @@ export class App {
   // Browse (M10): root-relative paths of unprocessed files the user ticked
   // for processing. Cleared on every directory listing and after a submit.
   private browseSelected = new Set<string>();
+  // Manual-selection ledger panel on the Rag page: open/closed, so
+  // loadIngest() can refresh it while the operator is watching.
+  private manualSelOpen = false;
   // The view on screen, so a /ready poll can react when Browse becomes
   // unavailable (mount pulled) while its tab is open.
   private currentView: "research" | "ingest" | "resumes" | "browse" = "research";
@@ -320,6 +324,7 @@ export class App {
     );
     const actions = el("div", { class: "ingest-actions" },
       button("Scan folders", "btn primary", () => this.ingestScan()),
+      button("Manual selection", "btn", () => this.toggleManualSelections()),
       button("Pause", "btn", () => this.ingestPause()),
       button("Resume", "btn", () => this.ingestResume()),
       button("Retry failed", "btn", () => this.ingestRetry(false)),
@@ -333,6 +338,10 @@ export class App {
         this.buildTokenWidget(),
         el("h3", { class: "section-h" }, "Jobs"),
         el("table", { class: "jobs", id: "i-jobs" }),
+        el("div", { id: "i-manual-sel", hidden: "true" },
+          el("h3", { class: "section-h" }, "Manual selection"),
+          el("table", { class: "manual-sel", id: "i-manual-sel-table" }),
+        ),
         el("h3", { class: "section-h" }, "Last scan"),
         el("pre", { class: "scan-report", id: "i-scan-report" }, "No scan yet in this session."),
         el("h3", { class: "section-h" }, "Diagnostics"),
@@ -1020,10 +1029,72 @@ export class App {
       // Diagnostics refresh on the same view-switch; each section degrades
       // independently, so this is fire-and-forget.
       void this.loadDiagnostics();
+      if (this.manualSelOpen) void this.loadManualSelections();
     } catch (e) {
       this.handleApiError(e);
       this.set("i-msg", errText(e));
     }
+  }
+
+  // --- manual-selection ledger (M10) ----------------------------------------------------------------------------
+
+  /** Toggle the manual-selection ledger panel; load it on first open. */
+  private toggleManualSelections(): void {
+    this.manualSelOpen = !this.manualSelOpen;
+    this.root.querySelector<HTMLElement>("#i-manual-sel")!.hidden = !this.manualSelOpen;
+    if (this.manualSelOpen) void this.loadManualSelections();
+  }
+
+  /** Rebuild the ledger table: the final set of operator-submitted books,
+   *  newest first, each with its live pipeline status. A row whose book
+   *  registered opens the book in the reader. */
+  private async loadManualSelections(): Promise<void> {
+    const table = this.root.querySelector<HTMLTableElement>("#i-manual-sel-table")!;
+    try {
+      const { selections } = await api.manualSelections();
+      table.innerHTML = "";
+      table.append(el("tr", {},
+        el("th", {}, "Book"),
+        el("th", {}, "Path"),
+        el("th", {}, "Submitted"),
+        el("th", {}, "Status"),
+      ));
+      if (selections.length === 0) {
+        table.append(el("tr", {}, el("td", { colspan: "4", class: "muted" },
+          "No manually selected books yet — tick books in the Browse view and press “Process selected”.")));
+        return;
+      }
+      for (const s of selections) table.append(this.manualSelRow(s));
+    } catch (e) {
+      this.handleApiError(e);
+      this.set("i-msg", errText(e));
+    }
+  }
+
+  private manualSelRow(s: ManualSelection): HTMLTableRowElement {
+    const label = s.status === "processing" && s.stage !== null ? `${s.status} · ${s.stage}` : s.status;
+    const pill = el("span", { class: `pill pill-${s.status}` }, label);
+    if (s.error !== null) pill.setAttribute("title", s.error);
+    const row = el("tr", {},
+      el("td", { class: "mnsel-book" }, s.title,
+        s.format !== null ? el("span", { class: "muted" }, ` · ${s.format}`) : null),
+      el("td", { class: "mnsel-path", title: s.path }, s.path),
+      el("td", { class: "muted" }, timeAgo(s.submitted_at)),
+      el("td", {}, pill),
+    );
+    if (s.rev_id !== null) {
+      row.classList.add("clickable");
+      row.addEventListener("click", () => { void this.openManualSelBook(s); });
+    }
+    return row;
+  }
+
+  private async openManualSelBook(s: ManualSelection): Promise<void> {
+    if (s.rev_id === null) return;
+    this.showView("research");
+    this.showReaderPane();
+    this.readerStatus(`Opening "${s.title}" …`);
+    if (await this.openReaderFor(s.rev_id)) void this.reader.refresh();
   }
 
   private async ingestScan(): Promise<void> {
