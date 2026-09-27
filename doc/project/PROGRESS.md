@@ -3240,3 +3240,68 @@ end and breaks once N complete lines are present.
   - RUNBOOK §8 still assumes `stats_epoch: frozen`; the sandbox runs `live`.
 - **Next unfinished task:** none in flight — awaiting operator answers on the
   three open items above; if any lands, re-run the quality gate and commit.
+
+### Addendum (2026-09-27 ~01:50) — ingest.sh batch launcher (scan --limit N)
+- Operator ask: "create ingest.sh, which will have optional argument
+  --batch N, it will scan and schedule books for processing, --batch N will
+  schedule max N books", refined to: N limits **what the scan enqueues**
+  ("not to enqueue everything"), then renamed to `--limit` with the
+  semantics explained in `--help`.
+- New `ingest.sh` (repo root, mode 100755) — batch launcher:
+  - `./ingest.sh` — scans all configured source roots in the foreground
+    (discover, register, enqueue extract jobs for every new book — the
+    per-root report is the scheduling result), then starts the ingest
+    worker detached and **unbounded** (log: worker.log); stop with
+    `kill -TERM <pid>` (graceful) or `library-rag stop`.
+  - `./ingest.sh --limit N` — the scan registers + enqueues at most N new
+    books' extract jobs across all roots; new books past N are **deferred**
+    (see below), and the worker is started with `--max-books N` (the M11
+    bounded-run semantics) so the run self-exits when its books are done
+    and cannot block the next batch on the "worker already running"
+    precondition. Re-run to continue with the next batch.
+  - Preconditions checked before the (potentially long) scan: config
+    exists, `uv` on PATH, no worker running (pgrep anchored at
+    `.venv/bin/` with a `[l]` char class so the script's own command line
+    never matches, and `uv run` wrappers don't), serve down (pidfile
+    + `/health` — embedded local-mode Qdrant is single-process, so serve
+    and worker never run simultaneously). A missing source root does not
+    abort: the scan reports it and the worker still drains the queue.
+- `scan.py` — run-shared enqueue budget: `scan_roots(..., max_enqueue=N)`
+  builds one `_EnqueueBudget` spanning every root of the run; in
+  `_process_file`, an out-of-budget new document/revision is deferred
+  **before** archiving, registration, or `scan_state` (peeked via a new
+  read-only `catalog.registration_status(db, path, sha)` — register_source
+  without enqueuing would poison the file into UNCHANGED so it would never
+  be enqueued again). Deferred files are left fully unregistered, so the
+  next scan's fast check fails and discovers them as new again. Aliases
+  need no job and are never deferred (registered even at budget 0).
+  `ScanReport.deferred` counts them.
+- `catalog.py` — `registration_status`: read-only mirror of
+  `register_source`'s four-way resolution (UNCHANGED / NEW_REVISION /
+  ALIAS / NEW_DOCUMENT); mutates nothing.
+- `cli.py` — `library-rag scan --limit N` (validated `>= 1`, else
+  `error: --limit must be >= 1`, exit 2); per-root report line now ends
+  `aliases=… jobs=… deferred=…`.
+- Tests (+6): budget defers beyond N for documents **and** new revisions,
+  the next scan re-discovers deferred books and enqueues them, aliases are
+  not deferred, CLI validation, CLI wiring (`jobs=1 deferred=1` in the
+  report), `registration_status` mirrors all four statuses with zero
+  writes.
+- Gate (2026-09-27, real output): `uv run ruff check .` — All checks
+  passed; `uv run mypy` — only the 12 accepted pre-existing
+  tests/test_browse.py errors; `uv run pytest` — exit 0, 605 tests
+  (599 baseline + 6 new), all-dot progress to [100%] (the "N passed"
+  summary line is suppressed by `-qq` — CLI `-q` stacks on pyproject's
+  `addopts = -q`; greenness = exit 0 + no F/E). `bash -n ingest.sh` clean;
+  smoke: `--help` exit 0, `--limit 0|abc|-1` → exit 1 with clear messages,
+  `--limit` with no value and `--bogus` → exit 2, bad config path → exit 1
+  "config not found". No real scan or worker was run against the live
+  system (safe, non-mutating checks only).
+- Committed **7548a16** ("ingest.sh: batch launcher with --limit N capping
+  scan enqueues"), pushed to origin/master.
+- Full-library launch remains **HELD on explicit operator approval** —
+  operator batches runs themselves via `./ingest.sh --limit N` (stop serve
+  first if it is up, then restart it after the bounded worker exits).
+- **Next unfinished task:** none in flight — ingest.sh is ready for
+  operator batch runs; the three open items from the 2026-09-26 ~20:30
+  addendum (sata scrub, full-run roots, stats_epoch) remain unanswered.
