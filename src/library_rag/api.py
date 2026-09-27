@@ -47,7 +47,7 @@ from starlette.requests import ClientDisconnect
 
 from . import __version__, system_info
 from .answers import answer_query, get_answer, list_answers, resolve_citation
-from .browse import BrowseError, BrowseNotFound, list_browse_dir
+from .browse import BrowseError, BrowseNotFound, list_browse_dir, resolve_browse_path
 from .config import Config
 from .db import Database
 from .embeddings import Embedder
@@ -58,7 +58,7 @@ from .reader import active_run
 from .reader import create_app as create_reader_app
 from .resumes import get_resume, search_resumes
 from .retrieval import IndexUnavailableError, Passage, search
-from .scan import scan_roots
+from .scan import ProcessStatus, process_explicit_paths, scan_roots
 
 __all__ = ["create_app", "find_web_dist"]
 
@@ -114,6 +114,12 @@ class RetryRequest(BaseModel):
 class ResumeSearchRequest(BaseModel):
     query: str = Field(min_length=1, max_length=400)
     limit: int = Field(default=20, ge=1, le=50)
+
+
+class BrowseProcessRequest(BaseModel):
+    # Relative paths (as /browse/dir returns them), each a book file the
+    # caller selected for immediate registration + extract-job enqueue.
+    paths: list[str] = Field(min_length=1, max_length=500)
 
 
 def find_web_dist() -> Path | None:
@@ -351,6 +357,64 @@ def create_app(
             raise HTTPException(404, str(exc)) from exc
         except BrowseError as exc:
             raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/browse/process")
+    def browse_process(body: BrowseProcessRequest) -> dict[str, Any]:
+        """Register + enqueue the selected unprocessed books now.
+
+        The selective-processing counterpart of ``POST /scan``: each
+        selected path is re-validated (containment, regular non-symlink
+        file, configured book type) and runs the same per-file pipeline a
+        scan pass would (content hash, archive, registration, extract-job
+        enqueue). A path that has vanished since the listing is reported
+        ``missing`` per file — a race, not a batch error. The response maps every submitted relative path to its
+        outcome so the UI can show per-file results. The jobs are queued,
+        not run here — the embedded Qdrant lock means the ingest worker is
+        what executes them (same contract as ``/scan``).
+        """
+        if not browse_available or browse_root is None:
+            raise HTTPException(404, "browse is not available")
+        suffixes = {s.lower() for s in cfg.file_types}
+        # Dedupe on the resolved absolute path (e.g. "a.pdf" and "./a.pdf");
+        # every submitted spelling gets the one outcome.
+        rels_by_abs: dict[str, list[str]] = {}
+        missing_by_abs: dict[str, list[str]] = {}
+        for rel in body.paths:
+            try:
+                abs_p = resolve_browse_path(browse_root, rel)
+            except BrowseError as exc:
+                raise HTTPException(400, f"{rel!r}: {exc}") from exc
+            p = Path(abs_p)
+            if p.is_symlink() or (p.exists() and not p.is_file()):
+                raise HTTPException(400, f"{rel!r}: not a regular file")
+            if not p.exists():
+                missing_by_abs.setdefault(abs_p, []).append(rel)
+                continue
+            if p.suffix.lower() not in suffixes:
+                raise HTTPException(400, f"{rel!r}: not a supported book type")
+            rels_by_abs.setdefault(abs_p, []).append(rel)
+        try:
+            outcomes = process_explicit_paths(
+                db, cfg, Jobs(db), (Path(abs_p) for abs_p in rels_by_abs)
+            )
+        except Exception as exc:  # a batch failure must not 500-opaquely
+            raise HTTPException(500, f"process failed: {exc}") from exc
+        results = {
+            rel: str(outcomes[abs_p]) for abs_p, rels in rels_by_abs.items() for rel in rels
+        }
+        results.update(
+            {rel: str(ProcessStatus.MISSING) for rels in missing_by_abs.values() for rel in rels}
+        )
+        enqueued = sum(
+            1
+            for s in outcomes.values()
+            if s in (ProcessStatus.NEW_DOCUMENT, ProcessStatus.NEW_REVISION)
+        )
+        return {
+            "results": results,
+            "enqueued": enqueued,
+            "total": len(outcomes) + len(missing_by_abs),
+        }
 
     # --- ingestion dashboard ------------------------------------------------------
 

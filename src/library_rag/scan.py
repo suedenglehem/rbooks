@@ -31,6 +31,7 @@ import time
 import zipfile
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 
 from .archive import ingest_source, stream_hash
@@ -47,9 +48,11 @@ __all__ = [
     "STAGE_OCR",
     "STAGE_PUBLISH",
     "STAGE_RESUME",
+    "ProcessStatus",
     "ScanReport",
     "detect_format",
     "iter_candidate_paths",
+    "process_explicit_paths",
     "process_paths",
     "scan_root",
     "scan_roots",
@@ -61,6 +64,25 @@ STAGE_CHUNK = "chunk"
 STAGE_EMBED = "embed"
 STAGE_PUBLISH = "publish"
 STAGE_RESUME = "resume"
+
+
+class ProcessStatus(StrEnum):
+    """Per-file outcome of the scan pipeline (see :func:`process_explicit_paths`).
+
+    The ``new_document`` / ``new_revision`` / ``alias`` values mirror
+    :class:`~library_rag.catalog.RegistrationStatus`; the rest are the scan's
+    skip buckets.
+    """
+
+    NEW_DOCUMENT = "new_document"
+    NEW_REVISION = "new_revision"
+    ALIAS = "alias"
+    UNCHANGED = "unchanged"
+    MISSING = "missing"
+    CHANGED_DURING_SCAN = "changed_during_scan"
+    INVALID = "invalid"
+    DEFERRED = "deferred"
+    ERROR = "error"
 
 
 @dataclass
@@ -182,14 +204,20 @@ def _process_file(
     path: Path,
     report: ScanReport,
     budget: _EnqueueBudget | None = None,
-) -> None:
+) -> ProcessStatus:
+    """Run the per-file pipeline, updating *report*; return the outcome.
+
+    The return value is the same fact as the report mutation it accompanies
+    (report keeps the aggregate counts the CLI/scan surface reads); the
+    full-scan callers ignore it, :func:`process_explicit_paths` records it.
+    """
     report.discovered += 1
     norm = normalize_path(path)
     try:
         st = path.stat()
     except OSError:
         report.missing.append(norm)
-        return
+        return ProcessStatus.MISSING
     # Fast check: unchanged size+mtime since the last verified hash => skip.
     state = db.query_one("SELECT sha256, size_bytes, mtime FROM scan_state WHERE path = ?", (norm,))
     if (
@@ -199,25 +227,25 @@ def _process_file(
         and float(state["mtime"]) == st.st_mtime
     ):
         report.unchanged += 1
-        return
+        return ProcessStatus.UNCHANGED
     try:
         sha, _size = stream_hash(path)
     except OSError:
         report.missing.append(norm)
-        return
+        return ProcessStatus.MISSING
     # Detect files that changed *during* hashing: skip this pass, retry next scan.
     st_after = path.stat()
     if (st_after.st_size, st_after.st_mtime) != (st.st_size, st.st_mtime):
         report.changed_during_scan.append(norm)
-        return
+        return ProcessStatus.CHANGED_DURING_SCAN
     fmt = detect_format(path)
     if fmt is None:
         report.invalid.append(norm)
-        return
+        return ProcessStatus.INVALID
     if budget is not None and jobs is not None:
-        status = registration_status(db, norm, sha)
+        reg_status = registration_status(db, norm, sha)
         if (
-            status in (RegistrationStatus.NEW_DOCUMENT, RegistrationStatus.NEW_REVISION)
+            reg_status in (RegistrationStatus.NEW_DOCUMENT, RegistrationStatus.NEW_REVISION)
             and not budget.take()
         ):
             # Out of budget: defer WITHOUT archiving, registering, or touching
@@ -226,16 +254,19 @@ def _process_file(
             # (register_source would poison it: a registered revision is
             # UNCHANGED on the next pass and never enqueued.)
             report.deferred += 1
-            return
+            return ProcessStatus.DEFERRED
     ingest = ingest_source(cfg.paths.archive_root, path, expect_sha=sha)
     reg = register_source(db, norm, ingest.sha256, ingest.size_bytes, fmt)
     _upsert_scan_state(db, norm, st_after.st_size, st_after.st_mtime, ingest.sha256, fmt, reg.rev_id)
     if reg.status is RegistrationStatus.NEW_DOCUMENT:
         report.new_documents += 1
+        status = ProcessStatus.NEW_DOCUMENT
     elif reg.status is RegistrationStatus.NEW_REVISION:
         report.new_revisions += 1
+        status = ProcessStatus.NEW_REVISION
     else:
         report.aliases += 1
+        status = ProcessStatus.ALIAS
     if reg.status in (RegistrationStatus.NEW_DOCUMENT, RegistrationStatus.NEW_REVISION) and jobs is not None:
         jobs.enqueue(
             make_task_key(STAGE_EXTRACT, reg.rev_id, ingest.sha256),
@@ -244,6 +275,7 @@ def _process_file(
             input_version=ingest.sha256,
         )
         report.jobs_enqueued += 1
+    return status
 
 
 def scan_root(
@@ -307,3 +339,30 @@ def process_paths(db: Database, cfg: Config, jobs: Jobs | None, paths: Iterable[
     for path in paths:
         _process_file(db, cfg, jobs, path, report)
     return report
+
+
+def process_explicit_paths(
+    db: Database, cfg: Config, jobs: Jobs | None, paths: Iterable[Path]
+) -> dict[str, ProcessStatus]:
+    """Run the scan pipeline on an explicit set of candidate paths.
+
+    The selective-processing entry point (``POST /browse/process``): the
+    caller has already resolved the paths to regular, in-root files of a
+    configured type; this applies the same per-file rules as a full scan
+    (fast check, content hash, magic-byte format validation, archive,
+    registration, extract-job enqueue) and returns the outcome per path,
+    keyed by the catalog's normalized absolute path.
+
+    Unlike a full scan, one bad file cannot abort the batch: an unexpected
+    failure is reported as :attr:`ProcessStatus.ERROR` for that path only
+    and the remaining paths still proceed.
+    """
+    report = ScanReport(root="(explicit paths)")
+    results: dict[str, ProcessStatus] = {}
+    for path in paths:
+        norm = normalize_path(path)
+        try:
+            results[norm] = _process_file(db, cfg, jobs, path, report)
+        except Exception:  # isolate per file so the batch still completes
+            results[norm] = ProcessStatus.ERROR
+    return results

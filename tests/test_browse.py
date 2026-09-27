@@ -280,3 +280,100 @@ def test_route_missing_root_degrades(
     client = _client(base_config, state_db)
     assert client.get("/ready").json()["browse"] is False
     assert client.get("/browse/dir").status_code == 404
+
+
+# --- POST /browse/process -------------------------------------------------------
+
+
+@pytest.fixture
+def process_client(
+    state_db: Database, base_config: Config, tmp_path: Path
+) -> tuple[TestClient, Path]:
+    """Browse root whose books carry valid magic bytes (the listing fixture's
+    do not — `detect_format` needs the full `%PDF-` prefix)."""
+    root = tmp_path / "procbooks"
+    (root / "sub").mkdir(parents=True)
+    (root / "a.pdf").write_bytes(b"%PDF-1.4 a\n%%EOF")
+    (root / "sub" / "b.pdf").write_bytes(b"%PDF-1.4 b\n%%EOF")
+    (root / "c.txt").write_bytes(b"not a book")
+    base_config.browse = BrowseSettings(enabled=True, root=root)
+    return _client(base_config, state_db), root
+
+
+def test_process_new_file_enqueues(process_client: tuple[TestClient, Path]) -> None:
+    client, _ = process_client
+    res = client.post("/browse/process", json={"paths": ["a.pdf"]})
+    assert res.status_code == 200
+    body: dict[str, Any] = res.json()
+    assert body == {"results": {"a.pdf": "new_document"}, "enqueued": 1, "total": 1}
+
+
+def test_process_mixed_outcomes(process_client: tuple[TestClient, Path]) -> None:
+    client, _ = process_client
+    res = client.post("/browse/process", json={"paths": ["sub/b.pdf", "a.pdf", "nope.pdf"]})
+    assert res.status_code == 200
+    body = res.json()
+    assert body["total"] == 3
+    assert body["enqueued"] == 2
+    assert body["results"]["sub/b.pdf"] == "new_document"
+    assert body["results"]["a.pdf"] == "new_document"
+    assert body["results"]["nope.pdf"] == "missing"
+
+
+def test_process_dedupes_equivalent_paths(process_client: tuple[TestClient, Path]) -> None:
+    """'a.pdf' and './a.pdf' are the same file: one pipeline run, both
+    submitted spellings get the one outcome."""
+    client, _ = process_client
+    res = client.post("/browse/process", json={"paths": ["a.pdf", "./a.pdf"]})
+    assert res.status_code == 200
+    body = res.json()
+    assert body["total"] == 1
+    assert body["enqueued"] == 1
+    assert body["results"]["a.pdf"] == body["results"]["./a.pdf"] == "new_document"
+
+
+def test_process_second_submit_unchanged(process_client: tuple[TestClient, Path]) -> None:
+    client, _ = process_client
+    first = client.post("/browse/process", json={"paths": ["a.pdf"]})
+    assert first.json()["enqueued"] == 1
+
+    res = client.post("/browse/process", json={"paths": ["a.pdf"]})
+    assert res.status_code == 200
+    assert res.json() == {"results": {"a.pdf": "unchanged"}, "enqueued": 0, "total": 1}
+
+
+def test_process_alias_content(process_client: tuple[TestClient, Path]) -> None:
+    """A second file with identical content is registered as an alias:
+    no extract job for it (paths are processed in submitted order, so the
+    original registers first and the copy aliases it)."""
+    client, root = process_client
+    (root / "a-copy.pdf").write_bytes((root / "a.pdf").read_bytes())
+    res = client.post("/browse/process", json={"paths": ["a.pdf", "a-copy.pdf"]})
+    assert res.status_code == 200
+    assert res.json() == {
+        "results": {"a.pdf": "new_document", "a-copy.pdf": "alias"},
+        "enqueued": 1,
+        "total": 2,
+    }
+
+
+def test_process_rejects_bad_paths_whole_batch(process_client: tuple[TestClient, Path]) -> None:
+    """Any invalid path rejects the whole batch (400) before any file is
+    processed — and nothing is half-registered."""
+    client, _ = process_client
+    for bad in (["../x.pdf"], ["/etc/passwd"], ["a.pdf", "sub"], ["c.txt"]):
+        res = client.post("/browse/process", json={"paths": bad})
+        assert res.status_code == 400, bad
+    # The rejected batches registered nothing: a.pdf is still processable.
+    assert client.post("/browse/process", json={"paths": ["a.pdf"]}).json()["enqueued"] == 1
+
+
+def test_process_empty_paths_rejected(process_client: tuple[TestClient, Path]) -> None:
+    client, _ = process_client
+    assert client.post("/browse/process", json={"paths": []}).status_code == 422
+
+
+def test_process_disabled_404(state_db: Database, base_config: Config) -> None:
+    """No browse section at all: the endpoint is not mounted."""
+    client = _client(base_config, state_db)
+    assert client.post("/browse/process", json={"paths": ["a.pdf"]}).status_code == 404

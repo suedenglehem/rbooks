@@ -210,6 +210,26 @@ export interface BrowseEntry {
   title: string | null;
 }
 
+// POST /browse/process: per-file outcome of the selective scan pipeline.
+// new_document / new_revision => an extract job was enqueued; alias => the
+// content is already in the index under another path; the rest are skips.
+export type BrowseProcessOutcome =
+  | "new_document"
+  | "new_revision"
+  | "alias"
+  | "unchanged"
+  | "missing"
+  | "changed_during_scan"
+  | "invalid"
+  | "deferred"
+  | "error";
+
+export interface BrowseProcessResponse {
+  results: Record<string, BrowseProcessOutcome>; // keyed by submitted relative path
+  enqueued: number; // files that got an extract job
+  total: number; // unique files accounted for (processed or reported missing)
+}
+
 // --- system diagnostics (Rag page Diagnostics block) -------------------------
 
 export interface SystemCatalog {
@@ -435,6 +455,11 @@ export const api = {
   browseDir: (path: string) =>
     request<{ path: string; entries: BrowseEntry[] }>(
       `/browse/dir?path=${encodeURIComponent(path)}`,
+    ),
+  browseProcess: (paths: string[]) =>
+    request<BrowseProcessResponse>(
+      "/browse/process",
+      post("/browse/process", { paths }),
     ),
   ingestStatus: () => request<IngestStatus>("/ingest/status"),
   scan: () => request<{ reports: ScanReport[] }>("/scan", post("/scan", {})),

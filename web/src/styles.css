@@ -608,6 +608,8 @@ table.diag-table td.num { text-align: right; font-variant-numeric: tabular-nums;
   max-width: 860px;
 }
 
+.browse-bar { display: flex; align-items: center; gap: 8px; }
+
 .browse-crumbs { display: flex; align-items: center; flex-wrap: wrap; gap: 2px; }
 
 .browse-crumb {
@@ -646,6 +648,20 @@ table.diag-table td.num { text-align: right; font-variant-numeric: tabular-nums;
 .browse-row:hover { background: var(--bg); }
 .browse-row.dir .browse-name { font-weight: 600; }
 .browse-row.not-indexed { color: var(--muted); }
+
+.browse-check {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  flex: none;
+  align-self: center;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.browse-row.queued .browse-name,
+.browse-row.queued .browse-hint { color: var(--accent); }
+.browse-row.failed .browse-hint { color: var(--err); }
 
 .browse-name {
   overflow: hidden;

@@ -21,7 +21,7 @@ from library_rag.config import Config, Paths
 from library_rag.db import Database
 from library_rag.identity import normalize_path
 from library_rag.jobs import Jobs
-from library_rag.scan import ScanReport, scan_roots
+from library_rag.scan import ProcessStatus, ScanReport, process_explicit_paths, scan_roots
 
 
 @pytest.fixture
@@ -339,4 +339,112 @@ def test_changed_during_scan_deferred(
     monkeypatch.setattr("library_rag.scan.stream_hash", real_hash)
     report2 = _scan(state_db, base_config, jobs)
     assert report2.new_documents == 1
+    assert jobs.counts() == {"pending": 1}
+
+
+# --- process_explicit_paths (selective processing from the web UI) -------------
+
+
+def test_process_explicit_new_file_enqueues(
+    state_db: Database, base_config: Config, src: Path
+) -> None:
+    """One ticked book: hash, archive, register, fast-check row, extract job."""
+    make_pdf(src / "A.pdf", ["a page of text " * 5])
+    jobs = Jobs(state_db)
+
+    outcomes = process_explicit_paths(state_db, base_config, jobs, [src / "A.pdf"])
+
+    assert outcomes == {normalize_path(src / "A.pdf"): ProcessStatus.NEW_DOCUMENT}
+    assert jobs.counts() == {"pending": 1}
+    row = state_db.query_one("SELECT sha256 FROM source_revisions")
+    assert row is not None
+    archived = base_config.paths.archive_root / row["sha256"][:2] / row["sha256"]
+    assert archived.is_file()
+    assert state_db.query_one("SELECT path FROM scan_state") is not None
+
+
+def test_process_explicit_second_call_unchanged(
+    state_db: Database, base_config: Config, src: Path
+) -> None:
+    a = src / "A.pdf"
+    make_pdf(a, ["a page of text " * 5])
+    jobs = Jobs(state_db)
+    process_explicit_paths(state_db, base_config, jobs, [a])
+
+    outcomes = process_explicit_paths(state_db, base_config, jobs, [a])
+
+    assert outcomes == {normalize_path(a): ProcessStatus.UNCHANGED}
+    assert jobs.counts() == {"pending": 1}  # no double enqueue
+
+
+def test_process_explicit_content_change_new_revision(
+    state_db: Database, base_config: Config, src: Path
+) -> None:
+    a = src / "A.pdf"
+    make_pdf(a, ["first edition page"])
+    jobs = Jobs(state_db)
+    process_explicit_paths(state_db, base_config, jobs, [a])
+
+    make_pdf(a, ["second edition page one"])
+    outcomes = process_explicit_paths(state_db, base_config, jobs, [a])
+
+    assert outcomes == {normalize_path(a): ProcessStatus.NEW_REVISION}
+    assert jobs.counts() == {"pending": 2}
+
+
+def test_process_explicit_invalid_and_missing(
+    state_db: Database, base_config: Config, src: Path
+) -> None:
+    (src / "bad.pdf").write_bytes(b"hello")
+    jobs = Jobs(state_db)
+
+    outcomes = process_explicit_paths(state_db, base_config, jobs, [src / "bad.pdf", src / "gone.pdf"])
+
+    assert outcomes[normalize_path(src / "bad.pdf")] is ProcessStatus.INVALID
+    assert outcomes[normalize_path(src / "gone.pdf")] is ProcessStatus.MISSING
+    assert _one(state_db, "SELECT COUNT(*) AS n FROM documents")["n"] == 0
+    assert jobs.counts() == {}
+
+
+def test_process_explicit_alias_content(
+    state_db: Database, base_config: Config, src: Path
+) -> None:
+    """A second file with identical content is an alias: registered, no job."""
+    a = src / "A.pdf"
+    make_pdf(a, ["a page of text " * 5])
+    jobs = Jobs(state_db)
+    process_explicit_paths(state_db, base_config, jobs, [a])
+
+    b = src / "B.pdf"
+    b.write_bytes(a.read_bytes())
+    outcomes = process_explicit_paths(state_db, base_config, jobs, [b])
+
+    assert outcomes == {normalize_path(b): ProcessStatus.ALIAS}
+    assert jobs.counts() == {"pending": 1}
+    assert _one(state_db, "SELECT COUNT(*) AS n FROM source_revisions")["n"] == 1
+
+
+def test_process_explicit_isolates_failures(
+    state_db: Database, base_config: Config, src: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A per-file exception is reported as `error` for that file only; the
+    rest of the batch still processes."""
+    from library_rag import scan as scan_mod
+    from library_rag.archive import IngestResult, ingest_source
+
+    make_pdf(src / "A.pdf", ["a page of text " * 5])
+    make_pdf(src / "B.pdf", ["another book page " * 5])
+
+    def flaky(root: Path, path: Path, expect_sha: str | None = None) -> IngestResult:
+        if path.name == "A.pdf":
+            raise OSError("archive failed")
+        return ingest_source(root, path, expect_sha=expect_sha)
+
+    monkeypatch.setattr(scan_mod, "ingest_source", flaky)
+    jobs = Jobs(state_db)
+
+    outcomes = process_explicit_paths(state_db, base_config, jobs, [src / "A.pdf", src / "B.pdf"])
+
+    assert outcomes[normalize_path(src / "A.pdf")] is ProcessStatus.ERROR
+    assert outcomes[normalize_path(src / "B.pdf")] is ProcessStatus.NEW_DOCUMENT
     assert jobs.counts() == {"pending": 1}

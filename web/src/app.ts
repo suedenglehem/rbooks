@@ -19,6 +19,7 @@ import type {
   Book,
   BookManifest,
   BrowseEntry,
+  BrowseProcessOutcome,
   CpuStatus,
   EndpointStatus,
   Evidence,
@@ -113,6 +114,9 @@ export class App {
   private resumeState: { rev: string; title: string } | null = null;
   // Browse (M10): the relative directory currently listed ("" = the root).
   private browsePath = "";
+  // Browse (M10): root-relative paths of unprocessed files the user ticked
+  // for processing. Cleared on every directory listing and after a submit.
+  private browseSelected = new Set<string>();
   // The view on screen, so a /ready poll can react when Browse becomes
   // unavailable (mount pulled) while its tab is open.
   private currentView: "research" | "ingest" | "resumes" | "browse" = "research";
@@ -406,10 +410,15 @@ export class App {
   }
 
   private buildBrowseView(): HTMLElement {
+    const processBtn = button("Process selected", "btn small primary", () => this.processBrowseSelected());
+    processBtn.id = "browse-process-btn";
+    processBtn.hidden = true; // shown while at least one file is ticked
     return el("section", { id: "view-browse", hidden: "true" },
       el("div", { class: "browse" },
         el("div", { class: "browse-bar" },
-          el("div", { class: "browse-crumbs", id: "browse-crumbs" })),
+          el("div", { class: "browse-crumbs", id: "browse-crumbs" }),
+          el("span", { class: "spacer" }),
+          processBtn),
         el("div", { class: "muted small" },
           "Click a file to open it in the reader · right-click a file for its stored summary."),
         el("div", { class: "ingest-msg", id: "browse-msg" }),
@@ -1348,6 +1357,8 @@ export class App {
       this.browsePath = path; // server-normalized
       this.renderBrowseCrumbs();
       box.innerHTML = "";
+      this.browseSelected.clear();
+      this.updateBrowseProcessBtn();
       if (entries.length === 0) {
         box.append(el("div", { class: "muted" }, "Empty directory."));
       }
@@ -1384,6 +1395,7 @@ export class App {
   private browseEntryRow(e: BrowseEntry): HTMLElement {
     const name = e.is_dir ? `${e.name}/` : e.name;
     const size = e.size_bytes !== null ? formatBytes(e.size_bytes) : null;
+    const unprocessed = !e.is_dir && e.rev_id === null;
     const hint = e.is_dir
       ? "folder"
       : e.rev_id
@@ -1393,12 +1405,14 @@ export class App {
       "div",
       {
         class: e.is_dir ? "browse-row dir" : e.rev_id ? "browse-row file" : "browse-row file not-indexed",
+        "data-path": e.path,
         title: e.is_dir
           ? "Open folder"
           : e.rev_id
             ? "Click: open in the reader · right-click: stored summary"
-            : "Not in the index yet — the next scan will pick it up",
+            : "Not in the index yet — tick the checkbox to queue it for processing",
       },
+      unprocessed ? this.browseCheckbox(e) : null,
       el("span", { class: "browse-name" }, name),
       el("span", { class: "spacer" }),
       size ? el("span", { class: "muted small" }, size) : null,
@@ -1428,6 +1442,24 @@ export class App {
     return row;
   }
 
+  /** Tick-box on an unprocessed file row: feeds the "Process selected"
+   *  submit. A click on the box must not fall through to the row's note. */
+  private browseCheckbox(e: BrowseEntry): HTMLInputElement {
+    const cb = el("input", {
+      type: "checkbox",
+      class: "browse-check",
+      title: "Select for processing",
+    });
+    cb.checked = this.browseSelected.has(e.path);
+    cb.addEventListener("change", () => {
+      if (cb.checked) this.browseSelected.add(e.path);
+      else this.browseSelected.delete(e.path);
+      this.updateBrowseProcessBtn();
+    });
+    cb.addEventListener("click", (ev) => ev.stopPropagation());
+    return cb;
+  }
+
   private async openBrowseFile(e: BrowseEntry): Promise<void> {
     if (e.rev_id === null) {
       this.setBrowseMsg(`"${e.name}" is not in the index yet — it will appear after the next scan.`);
@@ -1442,5 +1474,77 @@ export class App {
   private setBrowseMsg(msg: string): void {
     const m = this.root.querySelector<HTMLElement>("#browse-msg");
     if (m) m.textContent = msg;
+  }
+
+  /** Show / hide the process button and count the ticked files. */
+  private updateBrowseProcessBtn(): void {
+    const b = this.root.querySelector<HTMLButtonElement>("#browse-process-btn")!;
+    const n = this.browseSelected.size;
+    b.hidden = n === 0;
+    b.textContent = n === 0 ? "Process selected" : `Process selected (${n})`;
+  }
+
+  /** Submit the ticked unprocessed files: the server re-validates each path,
+   *  then hashes, archives, registers and enqueues an extract job per file.
+   *  The jobs run in the ingest worker — "immediate" means "queued now": the
+   *  worker cannot run while this web service holds the single-process index
+   *  lock, so start the worker to begin. */
+  private async processBrowseSelected(): Promise<void> {
+    const paths = [...this.browseSelected];
+    if (paths.length === 0) return;
+    const b = this.root.querySelector<HTMLButtonElement>("#browse-process-btn")!;
+    b.disabled = true;
+    this.setBrowseMsg(`Processing ${paths.length} file(s) — hashing each one, this can take a while…`);
+    try {
+      const { results } = await api.browseProcess(paths);
+      let queued = 0;
+      let already = 0;
+      let retryable = 0;
+      let failed = 0;
+      for (const row of Array.from(this.root.querySelectorAll<HTMLElement>(".browse-row"))) {
+        const p = row.dataset.path;
+        if (p === undefined) continue;
+        const st: BrowseProcessOutcome | undefined = results[p];
+        if (st === undefined) continue;
+        const hint = row.querySelector<HTMLElement>(".browse-hint");
+        if (st === "changed_during_scan") {
+          // Still unprocessed and still selectable: keep the tick, re-label.
+          if (hint) hint.textContent = "changed during scan — tick again to retry";
+          retryable += 1;
+          continue;
+        }
+        row.querySelector<HTMLInputElement>(".browse-check")?.remove();
+        row.classList.remove("not-indexed");
+        if (st === "new_document" || st === "new_revision") {
+          queued += 1;
+          row.classList.add("queued");
+          if (hint) hint.textContent = "queued";
+        } else if (st === "alias" || st === "unchanged") {
+          already += 1;
+          if (hint) hint.textContent = "already in the index";
+        } else {
+          failed += 1;
+          row.classList.add("failed");
+          if (hint) hint.textContent = st === "invalid" ? "invalid file" : st;
+        }
+      }
+      this.browseSelected.clear();
+      this.updateBrowseProcessBtn();
+      const parts: string[] = [];
+      if (queued) parts.push(`${queued} queued`);
+      if (already) parts.push(`${already} already in the index`);
+      if (retryable) parts.push(`${retryable} changed during scan (still ticked)`);
+      if (failed) parts.push(`${failed} failed`);
+      let msg = `Processed ${paths.length} file(s): ${parts.join(", ")}.`;
+      if (queued > 0) {
+        msg += " Queued jobs run in the ingest worker, which cannot run while this web service holds the index lock — start the worker to begin.";
+      }
+      this.setBrowseMsg(msg);
+    } catch (e) {
+      this.handleApiError(e);
+      this.setBrowseMsg(errText(e));
+    } finally {
+      b.disabled = false;
+    }
   }
 }
